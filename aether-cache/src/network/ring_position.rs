@@ -13,7 +13,9 @@ impl RingPosition {
     pub fn random() -> Self {
         use rand::Rng;
         let mut rng = rand::thread_rng();
-        Self { value: rng.gen::<f64>() }
+        Self {
+            value: rng.gen::<f64>(),
+        }
     }
 
     pub fn distance(a: f64, b: f64) -> f64 {

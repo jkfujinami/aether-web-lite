@@ -10,13 +10,9 @@ pub enum P2PMessage {
         position: f64,
     },
     #[serde(rename = "ring-info")]
-    RingInfo {
-        neighbors: Vec<PeerInfo>,
-    },
+    RingInfo { neighbors: Vec<PeerInfo> },
     #[serde(rename = "gossip")]
-    Gossip {
-        packet: GossipPacket,
-    },
+    Gossip { packet: GossipPacket },
     #[serde(rename = "stem")]
     Stem {
         #[serde(rename = "zoneId")]
@@ -87,7 +83,7 @@ impl JsonBytes {
             JsonBytes::Raw(vec) => vec,
         }
     }
-    
+
     pub fn from_vec(vec: Vec<u8>) -> Self {
         JsonBytes::Tagged {
             _type: "Uint8Array".to_string(),

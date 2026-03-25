@@ -1,17 +1,17 @@
+mod mailbox;
 mod network;
 mod storage;
-mod mailbox;
 
 use anyhow::Result;
-use network::signaling_client::{SignalingClient, PeerInfo as SignalingPeerInfo};
-use network::webrtc_peer::WebRTCPeer;
+use mailbox::dht_mailbox::DHTMailbox;
 use network::messages::P2PMessage;
 use network::ring_position::RingPosition;
-use storage::sqlite_store::SqliteStore;
-use mailbox::dht_mailbox::DHTMailbox;
-use tokio::sync::mpsc;
+use network::signaling_client::{PeerInfo as SignalingPeerInfo, SignalingClient};
+use network::webrtc_peer::WebRTCPeer;
 use std::collections::HashMap;
 use std::sync::Arc;
+use storage::sqlite_store::SqliteStore;
+use tokio::sync::mpsc;
 use tracing::info;
 
 #[tokio::main]
@@ -19,7 +19,10 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let tracker_url = "ws://localhost:3000";
-    let my_peer_id = format!("cache_{}", uuid::Uuid::new_v4().to_string()[..8].to_string());
+    let my_peer_id = format!(
+        "cache_{}",
+        uuid::Uuid::new_v4().to_string()[..8].to_string()
+    );
     let ring_pos = RingPosition::random(); // Use RingPosition properly
 
     let store = Arc::new(SqliteStore::new("./mailbox.db")?);
@@ -29,17 +32,23 @@ async fn main() -> Result<()> {
     let (signal_rx_tx, mut signal_rx_rx) = mpsc::unbounded_channel::<serde_json::Value>();
     let (data_tx, mut data_rx) = mpsc::unbounded_channel::<(String, String)>();
 
-    let signaling = Arc::new(SignalingClient::connect(
-        tracker_url,
-        my_peer_id.clone(),
-        ring_pos.value,
-        peers_tx,
-        signal_rx_tx,
-    ).await?);
+    let signaling = Arc::new(
+        SignalingClient::connect(
+            tracker_url,
+            my_peer_id.clone(),
+            ring_pos.value,
+            peers_tx,
+            signal_rx_tx,
+        )
+        .await?,
+    );
 
     let mut peers: HashMap<String, Arc<WebRTCPeer>> = HashMap::new();
 
-    info!("[CacheNode] Started as {} at pos {}", my_peer_id, ring_pos.value);
+    info!(
+        "[CacheNode] Started as {} at pos {}",
+        my_peer_id, ring_pos.value
+    );
 
     loop {
         tokio::select! {
@@ -110,6 +119,6 @@ async fn main() -> Result<()> {
             else => break,
         }
     }
-    
+
     Ok(())
 }

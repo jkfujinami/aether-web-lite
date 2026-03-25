@@ -3,7 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use tracing::{warn, error};
+use tracing::{error, warn};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -16,9 +16,7 @@ pub enum TrackerMessage {
         zones: Vec<u32>,
     },
     #[serde(rename = "peers")]
-    Peers {
-        peers: Vec<PeerInfo>,
-    },
+    Peers { peers: Vec<PeerInfo> },
     #[serde(rename = "relay")]
     Relay {
         #[serde(rename = "targetPeerId")]
@@ -26,9 +24,7 @@ pub enum TrackerMessage {
         payload: serde_json::Value,
     },
     #[serde(rename = "error")]
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -61,7 +57,9 @@ impl SignalingClient {
             position,
             zones: vec![0], // Default zone 0
         };
-        ws_tx.send(Message::Text(serde_json::to_string(&join)?)).await?;
+        ws_tx
+            .send(Message::Text(serde_json::to_string(&join)?))
+            .await?;
 
         // WS Receiver + Sender loops
         tokio::spawn(async move {

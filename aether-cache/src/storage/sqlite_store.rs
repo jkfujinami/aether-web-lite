@@ -10,7 +10,7 @@ pub struct SqliteStore {
 impl SqliteStore {
     pub fn new(db_path: &str) -> Result<Self> {
         let conn = Connection::open(db_path)?;
-        
+
         // Initialize tables
         conn.execute(
             "CREATE TABLE IF NOT EXISTS mailbox_entries (
@@ -28,7 +28,7 @@ impl SqliteStore {
         )?;
 
         info!("[Storage] SQLite initialized at {}", db_path);
-        
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -51,7 +51,9 @@ impl SqliteStore {
 
     pub fn get(&self, topic_hash: &str) -> Result<Vec<Vec<u8>>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT entry_blob FROM mailbox_entries WHERE topic_hash = ?1 ORDER BY timestamp ASC")?;
+        let mut stmt = conn.prepare(
+            "SELECT entry_blob FROM mailbox_entries WHERE topic_hash = ?1 ORDER BY timestamp ASC",
+        )?;
         let rows = stmt.query_map(params![topic_hash], |row| row.get(0))?;
 
         let mut entries = Vec::new();
