@@ -1,0 +1,9 @@
+/Users/fujinami/github/aether-web-lite/aether-cache/target/debug/deps/unicode_segmentation-dde861d6b6cc5426.d: /Users/fujinami/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-segmentation-1.13.1/src/lib.rs /Users/fujinami/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-segmentation-1.13.1/src/grapheme.rs /Users/fujinami/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-segmentation-1.13.1/src/sentence.rs /Users/fujinami/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-segmentation-1.13.1/src/word.rs /Users/fujinami/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-segmentation-1.13.1/src/tables.rs
+
+/Users/fujinami/github/aether-web-lite/aether-cache/target/debug/deps/libunicode_segmentation-dde861d6b6cc5426.rmeta: /Users/fujinami/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-segmentation-1.13.1/src/lib.rs /Users/fujinami/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-segmentation-1.13.1/src/grapheme.rs /Users/fujinami/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-segmentation-1.13.1/src/sentence.rs /Users/fujinami/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-segmentation-1.13.1/src/word.rs /Users/fujinami/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-segmentation-1.13.1/src/tables.rs
+
+/Users/fujinami/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-segmentation-1.13.1/src/lib.rs:
+/Users/fujinami/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-segmentation-1.13.1/src/grapheme.rs:
+/Users/fujinami/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-segmentation-1.13.1/src/sentence.rs:
+/Users/fujinami/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-segmentation-1.13.1/src/word.rs:
+/Users/fujinami/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-segmentation-1.13.1/src/tables.rs:
