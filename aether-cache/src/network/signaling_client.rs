@@ -14,6 +14,10 @@ pub enum TrackerMessage {
         peer_id: String,
         position: f64,
         zones: Vec<u32>,
+        #[serde(rename = "isSeed")]
+        is_seed: bool,
+        #[serde(rename = "isCache")]
+        is_cache: bool,
     },
     #[serde(rename = "peers")]
     Peers { peers: Vec<PeerInfo> },
@@ -44,6 +48,8 @@ impl SignalingClient {
         url: &str,
         peer_id: String,
         position: f64,
+        is_seed: bool,
+        is_cache: bool,
         on_peers: mpsc::UnboundedSender<Vec<PeerInfo>>,
         on_signal: mpsc::UnboundedSender<serde_json::Value>,
     ) -> Result<Self> {
@@ -56,6 +62,8 @@ impl SignalingClient {
             peer_id: peer_id.clone(),
             position,
             zones: vec![0], // Default zone 0
+            is_seed,
+            is_cache,
         };
         ws_tx
             .send(Message::Text(serde_json::to_string(&join)?))

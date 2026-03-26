@@ -63,5 +63,35 @@ impl SqliteStore {
         Ok(entries)
     }
 
-    // Additional methods for eviction...
+    pub fn topic_count(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count: usize = conn.query_row(
+            "SELECT COUNT(DISTINCT topic_hash) FROM mailbox_entries",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// 24時間以上経過した古いエントリを削除する (Ikioiベースの管理)
+    pub fn cleanup(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as u64;
+        
+        // 24時間 (86,400,000 ms) 以上前のデータを削除
+        let ttl = 86_400_000;
+        let threshold = now.saturating_sub(ttl);
+        
+        let deleted = conn.execute(
+            "DELETE FROM mailbox_entries WHERE timestamp < ?1",
+            params![threshold],
+        )?;
+        
+        if deleted > 0 {
+            info!("[Storage] Cleaned up {} old mailbox entries", deleted);
+        }
+        Ok(deleted)
+    }
 }

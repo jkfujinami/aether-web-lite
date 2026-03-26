@@ -9,6 +9,14 @@ pub enum P2PMessage {
         peer_id: String,
         position: f64,
     },
+    #[serde(rename = "ping")]
+    Ping { ts: f64 },
+    #[serde(rename = "pong")]
+    Pong {
+        ts: f64,
+        #[serde(rename = "echoTs")]
+        echo_ts: f64,
+    },
     #[serde(rename = "ring-info")]
     RingInfo { neighbors: Vec<PeerInfo> },
     #[serde(rename = "gossip")]
@@ -42,12 +50,40 @@ pub enum P2PMessage {
         req_id: String,
         entries: Vec<JsonBytes>,
     },
+    #[serde(rename = "pex-request")]
+    PexRequest {
+        #[serde(rename = "minDistance")]
+        min_distance: f64,
+    },
+    #[serde(rename = "pex-response")]
+    PexResponse { peers: Vec<PeerInfo> },
+    #[serde(rename = "sdp-relay")]
+    SdpRelay {
+        #[serde(rename = "targetPeerId")]
+        target_peer_id: String,
+        #[serde(rename = "senderId")]
+        sender_id: Option<String>,
+        position: Option<f64>,
+        zones: Option<Vec<u32>>,
+        sdp: serde_json::Value,
+    },
+    #[serde(rename = "ice-relay")]
+    IceRelay {
+        #[serde(rename = "targetPeerId")]
+        target_peer_id: String,
+        #[serde(rename = "senderId")]
+        sender_id: Option<String>,
+        candidate: serde_json::Value,
+    },
+    #[serde(other)]
+    Ignored,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PeerInfo {
     pub id: String,
     pub position: f64,
+    pub zones: Vec<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

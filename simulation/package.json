@@ -1,0 +1,11 @@
+{
+  "name": "aether-mesh-simulation",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "sim": "npx tsx src/run.ts"
+  },
+  "dependencies": {
+    "tsx": "^4.19.0"
+  }
+}

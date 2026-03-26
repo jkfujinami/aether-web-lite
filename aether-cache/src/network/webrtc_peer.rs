@@ -65,10 +65,18 @@ impl WebRTCPeer {
         }));
 
         let rid_c2 = Arc::clone(&rid);
+        let disconnect_tx = data_tx.clone();
         pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
             let rid = Arc::clone(&rid_c2);
+            let dtx = disconnect_tx.clone();
             Box::pin(async move {
                 info!("[WebRTC {}] State changed: {}", *rid, s);
+                if s == RTCPeerConnectionState::Disconnected
+                    || s == RTCPeerConnectionState::Failed
+                    || s == RTCPeerConnectionState::Closed
+                {
+                    let _ = dtx.send(((*rid).clone(), "__disconnected".to_string()));
+                }
             })
         }));
 
