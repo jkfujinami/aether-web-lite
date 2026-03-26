@@ -55,28 +55,64 @@ export class ThreadDAGManager {
    * 3. 時刻 (created_at) が早い方を優先
    * 4. ID (packet_id) の辞書順でタイブレーク
    */
+  /**
+   * 決定論的なトポロジカルソート済みリストを取得する
+   * Kahn's Algorithm を使用して因果関係を保証しつつ、タイブレーカーを適用。
+   */
   public getSortedPosts(): DAGPost[] {
     const all = Array.from(this.nodes.values());
+    if (all.length === 0) return [];
 
-    // 単純なトポロジカルソートをベースにタイブレーカーを適用
-    return all.sort((a, b) => {
-      // 親子関係の直接チェック
-      if (b.parents.includes(a.packet_id)) return -1; // aはbの親なので前
-      if (a.parents.includes(b.packet_id)) return 1;  // bはaの親なので後
+    // 1. 各ノードの入次数 (親の数) を計算
+    const inDegree = new Map<string, number>();
+    const childrenMap = new Map<string, string[]>();
 
-      // 累積重み (熱量)
-      if (a.cumulative_pow !== b.cumulative_pow) {
-        return b.cumulative_pow - a.cumulative_pow; 
+    for (const node of all) {
+      // 親が存在し、かつこのDAGに登録されているもののみカウント
+      const validParents = node.parents.filter(p => this.nodes.has(p));
+      inDegree.set(node.packet_id, validParents.length);
+      
+      validParents.forEach(p => {
+        if (!childrenMap.get(p)) childrenMap.set(p, []);
+        childrenMap.get(p)!.push(node.packet_id);
+      });
+    }
+
+    // 2. タイブレーカー: [時刻] -> [ID順] で一意の文字列を生成
+    const getTieBreakerValue = (id: string) => {
+        const n = this.nodes.get(id)!;
+        return `${n.created_at.toString().padStart(15, '0')}_${n.packet_id}`;
+    };
+
+    // 入次数 0 (親が既に処理された/存在しない) のノードを抽出
+    let queue = all
+      .filter(n => (inDegree.get(n.packet_id) || 0) === 0)
+      .map(n => n.packet_id)
+      .sort((a, b) => getTieBreakerValue(a).localeCompare(getTieBreakerValue(b)));
+
+    const result: DAGPost[] = [];
+
+    // 3. 処理
+    while (queue.length > 0) {
+      const currentId = queue.shift()!;
+      const currentNode = this.nodes.get(currentId)!;
+      result.push(currentNode);
+
+      // 子ノードの入次数を減らす
+      const children = childrenMap.get(currentId) || [];
+      for (const childId of children) {
+        const newDegree = (inDegree.get(childId) || 0) - 1;
+        inDegree.set(childId, newDegree);
+
+        if (newDegree === 0) {
+          queue.push(childId);
+          // キューを常に入るたびに再ソート (決定論的順序の維持)
+          queue.sort((a, b) => getTieBreakerValue(a).localeCompare(getTieBreakerValue(b)));
+        }
       }
+    }
 
-      // 時刻
-      if (a.created_at !== b.created_at) {
-        return a.created_at - b.created_at;
-      }
-
-      // 最終タイブレーカー (ハッシュ辞書順)
-      return a.packet_id.localeCompare(b.packet_id);
-    });
+    return result;
   }
 
   /**
