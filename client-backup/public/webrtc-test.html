@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>WebRTC Direct Test</title>
+  <style>
+    body { background: #121212; color: #e0e0e0; font-family: monospace; padding: 2rem; }
+    #log { white-space: pre-wrap; font-size: 13px; }
+    .ok { color: #03dac6; }
+    .err { color: #cf6679; }
+  </style>
+</head>
+<body>
+  <h2>WebRTC Direct Test (with STUN)</h2>
+  <div id="log"></div>
+  <script>
+    const logEl = document.getElementById('log');
+    function log(msg, ok = true) {
+      const line = document.createElement('div');
+      line.className = ok ? 'ok' : 'err';
+      line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      logEl.appendChild(line);
+      console.log(msg);
+    }
+
+    async function runTest() {
+      log('=== WebRTC Direct Test (with STUN) ===');
+
+      const config = {
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      };
+
+      const pc1 = new RTCPeerConnection(config);
+      const pc2 = new RTCPeerConnection(config);
+
+      // ICE候補を直接相手に渡す
+      pc1.onicecandidate = e => {
+        if (e.candidate) {
+          log(`PC1 → ICE: ${e.candidate.candidate.substring(0, 80)}...`);
+          pc2.addIceCandidate(e.candidate).catch(err => log(`PC2 addIce err: ${err}`, false));
+        } else {
+          log('PC1 → ICE gathering complete');
+        }
+      };
+      pc2.onicecandidate = e => {
+        if (e.candidate) {
+          log(`PC2 → ICE: ${e.candidate.candidate.substring(0, 80)}...`);
+          pc1.addIceCandidate(e.candidate).catch(err => log(`PC1 addIce err: ${err}`, false));
+        } else {
+          log('PC2 → ICE gathering complete');
+        }
+      };
+
+      pc1.oniceconnectionstatechange = () => log(`PC1 iceState: ${pc1.iceConnectionState}`);
+      pc2.oniceconnectionstatechange = () => log(`PC2 iceState: ${pc2.iceConnectionState}`);
+
+      const channel1 = pc1.createDataChannel('test');
+      channel1.onopen = () => {
+        log('✅ PC1 DataChannel OPEN! Sending "hello"');
+        channel1.send('hello from PC1');
+      };
+
+      pc2.ondatachannel = (event) => {
+        log('PC2 ondatachannel fired');
+        const channel2 = event.channel;
+        channel2.onmessage = (e) => {
+          log(`✅ PC2 received: "${e.data}"`);
+          channel2.send('hello from PC2');
+        };
+      };
+
+      channel1.onmessage = (e) => {
+        log(`✅ PC1 received: "${e.data}"`);
+        log('=== TEST PASSED: WebRTC works! ===');
+      };
+
+      log('Creating offer...');
+      const offer = await pc1.createOffer();
+      await pc1.setLocalDescription(offer);
+      log(`PC1 offer created`);
+
+      await pc2.setRemoteDescription(offer);
+      log('PC2 setRemoteDescription(offer) OK');
+
+      const answer = await pc2.createAnswer();
+      await pc2.setLocalDescription(answer);
+      log(`PC2 answer created`);
+
+      await pc1.setRemoteDescription(answer);
+      log('PC1 setRemoteDescription(answer) OK');
+
+      setTimeout(() => {
+        if (pc1.iceConnectionState !== 'connected' && pc1.iceConnectionState !== 'completed') {
+          log(`❌ FAILED: PC1 iceState=${pc1.iceConnectionState}`, false);
+        }
+      }, 15000);
+    }
+
+    runTest().catch(e => log(`Fatal: ${e}`, false));
+  </script>
+</body>
+</html>

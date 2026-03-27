@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let tracker_url = std::env::var("SIGNALING_URL").unwrap_or_else(|_| "ws://localhost:3000".to_string());
+    let tracker_url = std::env::var("SIGNALING_URL").unwrap_or_else(|_| "ws://localhost:3000/ws".to_string());
     let my_peer_id = format!("cache_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let ring_pos = RingPosition::random();
 

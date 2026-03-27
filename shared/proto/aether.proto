@@ -1,0 +1,135 @@
+syntax = "proto3";
+
+package aether;
+
+// ── 共通モデル ──
+
+message PeerInfo {
+  string peer_id = 1;
+  double position = 2;
+  repeated uint32 zones = 3;
+}
+
+message GossipPacket {
+  string packet_id = 1;
+  uint32 hop_count = 2;
+  uint64 pow_nonce = 3;
+  uint32 pow_difficulty = 4;
+  double timestamp = 5;
+  uint32 zone_id = 6;
+  bytes nonce = 7;
+  bytes payload = 8;
+}
+
+message StemPacket {
+  uint32 zone_id = 1;
+  uint32 stem_ttl = 2;
+  GossipPacket packet = 3;
+}
+
+// ── P2P 通信用の各種メッセージ ──
+
+message Join {
+  string peer_id = 1;
+  double position = 2;
+}
+
+message RingInfo {
+  repeated PeerInfo neighbors = 1;
+}
+
+message LocalLinkRequest {
+  string peer_id = 1;
+  double position = 2;
+  repeated uint32 zones = 3;
+}
+
+message LocalLinkAccept {
+  string peer_id = 1;
+}
+
+message LocalLinkReject {
+  string reason = 1; // "max-degree" | "not-neighbor"
+}
+
+message Ping {
+  double ts = 1;
+}
+
+message Pong {
+  double ts = 1;
+  double echo_ts = 2;
+}
+
+message PexRequest {
+  double min_distance = 1;
+}
+
+message PexResponse {
+  repeated PeerInfo peers = 1;
+}
+
+message SdpRelay {
+  string target_peer_id = 1;
+  string sender_id = 2;
+  double position = 3;
+  repeated uint32 zones = 4;
+  
+  enum SdpType {
+    OFFER = 0;
+    ANSWER = 1;
+    PRANSWER = 2;
+    ROLLBACK = 3;
+  }
+  SdpType type = 5;
+  string sdp = 6;
+}
+
+message IceRelay {
+  string target_peer_id = 1;
+  string sender_id = 2;
+  
+  string candidate = 3;
+  string sdp_mid = 4;
+  uint32 sdp_m_line_index = 5;
+  string username_fragment = 6;
+}
+
+message DhtPut {
+  string topic_hash = 1;
+  repeated bytes entries = 2;
+}
+
+message DhtGet {
+  string topic_hash = 1;
+  string req_id = 2;
+}
+
+message DhtRes {
+  string topic_hash = 1;
+  string req_id = 2;
+  repeated bytes entries = 3;
+}
+
+// ── 最上位 P2P メッセージ通信フレーム ──
+
+message P2PMessage {
+  oneof payload {
+    Join join = 1;
+    RingInfo ring_info = 2;
+    LocalLinkRequest local_link_request = 3;
+    LocalLinkAccept local_link_accept = 4;
+    LocalLinkReject local_link_reject = 5;
+    Ping ping = 6;
+    Pong pong = 7;
+    PexRequest pex_request = 8;
+    PexResponse pex_response = 9;
+    SdpRelay sdp_relay = 10;
+    IceRelay ice_relay = 11;
+    GossipPacket gossip = 12;
+    StemPacket stem = 13;
+    DhtPut dht_put = 14;
+    DhtGet dht_get = 15;
+    DhtRes dht_res = 16;
+  }
+}
