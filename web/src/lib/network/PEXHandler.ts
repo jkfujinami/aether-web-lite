@@ -1,13 +1,14 @@
-import { PeerManager } from './PeerManager';
-import type { P2PMessage, PeerId } from '../types';
+import type { P2PMessage, PeerId, IPeerManager, IMessageDispatcher } from '../types';
 import { RING_MESH } from '../constants';
+import { WireType } from './wire/WireTypes';
 
 export class PEXHandler {
-  private peerManager: PeerManager;
+  private peerManager: IPeerManager;
 
-  constructor(peerManager: PeerManager) {
+  constructor(peerManager: IPeerManager, dispatcher: IMessageDispatcher) {
     this.peerManager = peerManager;
-    this.peerManager.on('peer:data', (peerId, data) => this.handleData(peerId, data));
+    dispatcher.register(WireType.PEX_REQUEST, (peerId, msg) => this.handlePexRequest(peerId, msg));
+    dispatcher.register(WireType.PEX_RESPONSE, (peerId, msg) => this.handlePexResponse(peerId, msg));
   }
 
   /**
@@ -15,58 +16,65 @@ export class PEXHandler {
    * トラッカーに頼らず、既存の隣人から新たなピア情報を取得する。
    */
   public requestPeers(targetPeerId?: PeerId) {
-    const msg: P2PMessage = { type: 'pex-request', minDistance: 0 };
-    const payload = JSON.stringify(msg);
+    const payload = { minDistance: 0 };
 
     if (targetPeerId) {
-      const peer = this.peerManager.peers.get(targetPeerId);
-      if (peer) peer.send(payload);
+      this.peerManager.sendMessage(targetPeerId, WireType.PEX_REQUEST, payload);
     } else {
       // 指定がなければ全隣人に一斉送信
-      for (const peer of this.peerManager.peers.values()) {
-        peer.send(payload);
+      for (const peerId of this.peerManager.peers.keys()) {
+        this.peerManager.sendMessage(peerId, WireType.PEX_REQUEST, payload);
       }
     }
   }
 
-  private handleData(senderPeerId: PeerId, data: Uint8Array | string) {
-    if (typeof data !== 'string') return;
+  /** ── Dispatcher Handlers ── */
 
-    try {
-      const msg = JSON.parse(data) as P2PMessage;
+  private handlePexRequest(senderPeerId: PeerId, _msg: any) {
+    const peers = Array.from(this.peerManager.peers.values())
+      .filter(p => p.peerId !== senderPeerId)
+      .map(p => ({
+        id: p.peerId,
+        position: p.position,
+        zones: Array.from(p.zones)
+      }));
       
-      if (msg.type === 'pex-request') {
-        // リクエストを受け取ったら、自分が現在接続しているピアのリストを返す
-         // ※ ただし要求元(senderPeerId)自身は除外する
-        const peers = Array.from(this.peerManager.peers.values())
-          .filter(p => p.peerId !== senderPeerId)
-          .map(p => ({
-            id: p.peerId,
-            position: p.position,
-            zones: Array.from(p.zones)
-          }));
-          
-        const res: P2PMessage = { type: 'pex-response', peers };
-        this.peerManager.peers.get(senderPeerId)?.send(JSON.stringify(res));
-        
-      } else if (msg.type === 'pex-response') {
-        // 新たなピア情報を取得した！
-        for (const p of msg.peers) {
-          // 自分自身ではなく、まだ接続していないノードであれば
-          if (p.id !== this.peerManager.myPeerId && !this.peerManager.peers.has(p.id)) {
-            
-            // リングの上限に達していなければ接続を試みる
-            if (this.peerManager.degree < RING_MESH.MAX_DEGREE) {
-              console.log(`[PEXHandler] Found new peer ${p.id.substring(0,8)} via ${senderPeerId.substring(0,8)}. Initiating PEX-based connection!`);
-              // peerManager の拡張 connect を呼び、viaPeerId (経路) を指定する。
-              // トラッカーサーバーではなく、senderPeerId を中継点 (relay) として SDP を飛ばす。
-              this.peerManager.connect(p.id, p.position, p.zones, true, senderPeerId);
-            }
-          }
+    this.peerManager.sendMessage(senderPeerId, WireType.PEX_RESPONSE, { peers });
+  }
+
+  private handlePexResponse(senderPeerId: PeerId, msg: any) {
+    console.log(`[PEXHandler] <<< [PEX_RESPONSE] received from ${senderPeerId.substring(0,8)}`, {
+      fullMsg: msg,
+      hasPeers: !!msg?.peers,
+      peerCount: msg?.peers?.length
+    });
+
+    if (!msg || !msg.peers || !Array.isArray(msg.peers)) {
+      console.warn(`[PEXHandler] Invalid PEX_RESPONSE format: msg.peers is not an array. keys:`, Object.keys(msg || {}));
+      return;
+    }
+
+    for (const p of msg.peers) {
+      const idType = typeof p.id;
+      const isUint8 = p.id instanceof Uint8Array;
+      const existingPeer = this.peerManager.peers.get(p.id) as any;
+      const isAlive = existingPeer && (existingPeer.isConnected || existingPeer.isConnecting);
+
+      console.log(`[PEXHandler]   - Peer in list: ${isUint8 ? '[Binary]' : p.id.substring(0,8)}`, {
+        type: idType,
+        isAlive,
+        isConnected: existingPeer?.isConnected,
+        isConnecting: existingPeer?.isConnecting
+      });
+
+      if (p.id !== this.peerManager.myPeerId && !isAlive) {
+        if (this.peerManager.degree < RING_MESH.MAX_DEGREE) {
+          console.log(`[PEXHandler]   -> DISCOVERED PEER! Initiating connect to: ${isUint8 ? '[Binary]' : p.id.substring(0,8)} (via ${senderPeerId.substring(0,8)})`);
+          this.peerManager.connect(p.id, p.position, p.zones, true, senderPeerId);
+        } else {
+          console.log(`[PEXHandler]   -> Max degree reached (${this.peerManager.degree}), skipping connection.`);
         }
       }
-    } catch (e) {
-      // not JSON or not PEX msg
     }
   }
 }

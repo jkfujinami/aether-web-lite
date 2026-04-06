@@ -14,6 +14,7 @@ use network::messages::P2PMessage;
 use network::ring_position::RingPosition;
 use network::signaling_client::{PeerInfo as SignalingPeerInfo, SignalingClient};
 use network::webrtc_peer::WebRTCPeer;
+use crate::network::wire::WireCodec;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::collections::HashMap;
 use std::io;
@@ -63,7 +64,7 @@ async fn main() -> Result<()> {
     
     let (peers_tx, mut peers_rx) = mpsc::unbounded_channel::<Vec<SignalingPeerInfo>>();
     let (signal_rx_tx, mut signal_rx_rx) = mpsc::unbounded_channel::<serde_json::Value>();
-    let (data_tx, mut data_rx) = mpsc::unbounded_channel::<(String, String)>();
+    let (data_tx, mut data_rx) = mpsc::unbounded_channel::<(String, Vec<u8>)>();
 
     let is_seed = true; // Set to true for this node to act as an entry point
     let is_cache = true;
@@ -179,7 +180,7 @@ async fn main() -> Result<()> {
             }
             Some((peer_id, data)) = data_rx.recv() => {
                 // Handle disconnection sentinel
-                if data == "__disconnected" {
+                if data == b"__disconnected" {
                     let mut p_map = peers.lock().await;
                     if p_map.remove(&peer_id).is_some() {
                         app.log(format!("[DC] Peer {} disconnected", &peer_id[..8.min(peer_id.len())]));
@@ -187,7 +188,7 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                if let Ok(msg) = serde_json::from_str::<P2PMessage>(&data) {
+                if let Ok(msg) = WireCodec::decode_v2(&data) {
                     match msg {
                         P2PMessage::Join { peer_id: pid, position } => {
                             let mut p_map = peers.lock().await;
@@ -204,8 +205,8 @@ async fn main() -> Result<()> {
                                 for (pid, m) in p_map.iter() {
                                     if pid != &peer_id { // Exclude sender from relay
                                         let relay_msg = P2PMessage::Gossip { packet: packet.clone() };
-                                        if let Ok(json) = serde_json::to_string(&relay_msg) {
-                                            let _ = m.rtc.send(&json).await;
+                                        if let Ok(bin_data) = WireCodec::encode_v2(&relay_msg) {
+                                            let _ = m.rtc.send(&bin_data).await;
                                         }
                                     }
                                 }
@@ -222,8 +223,8 @@ async fn main() -> Result<()> {
                                 for (pid, m) in p_map.iter() {
                                     if pid != &peer_id { // Exclude sender from relay
                                         let relay_msg = P2PMessage::Gossip { packet: packet.clone() };
-                                        if let Ok(json) = serde_json::to_string(&relay_msg) {
-                                            let _ = m.rtc.send(&json).await;
+                                        if let Ok(bin_data) = WireCodec::encode_v2(&relay_msg) {
+                                            let _ = m.rtc.send(&bin_data).await;
                                         }
                                     }
                                 }
@@ -237,16 +238,16 @@ async fn main() -> Result<()> {
                                 if let Some(target) = neighbors.choose(&mut rng) {
                                     app.log(format!("[STEM] Forwarding {} -> {}", &packet.packet_id[..8], &target.peer_id[..8]));
                                     let relay_msg = P2PMessage::Stem { stem_ttl, packet, zone_id };
-                                    if let Ok(json) = serde_json::to_string(&relay_msg) {
-                                        let _ = target.rtc.send(&json).await;
+                                    if let Ok(bin_data) = WireCodec::encode_v2(&relay_msg) {
+                                        let _ = target.rtc.send(&bin_data).await;
                                     }
                                 } else {
                                     // No other neighbors to forward to, forced fluff
                                     app.log(format!("[STEM->FLUFF] No neighbors for {}. Forced fluff.", &packet.packet_id[..8]));
                                     let relay_msg = P2PMessage::Gossip { packet: packet.clone() };
-                                    if let Ok(json) = serde_json::to_string(&relay_msg) {
+                                    if let Ok(bin_data) = WireCodec::encode_v2(&relay_msg) {
                                         for (pid, m) in p_map.iter() {
-                                            if pid != &peer_id { let _ = m.rtc.send(&json).await; }
+                                            if pid != &peer_id { let _ = m.rtc.send(&bin_data).await; }
                                         }
                                     }
                                 }
@@ -267,39 +268,47 @@ async fn main() -> Result<()> {
                                 .collect();
                             
                             // Shuffle and limit to 6 to prevent hotspot formation
-                            use rand::seq::SliceRandom;
                             let mut rng = rand::thread_rng();
                             info_list.shuffle(&mut rng);
                             info_list.truncate(6);
                             
                             let resp = P2PMessage::PexResponse { peers: info_list };
-                            if let Ok(json) = serde_json::to_string(&resp) {
+                            if let Ok(bin_data) = WireCodec::encode_v2(&resp) {
                                 if let Some(m) = p_map.get(&peer_id) {
-                                    let _ = m.rtc.send(&json).await;
+                                    let _ = m.rtc.send(&bin_data).await;
                                 }
                             }
                         }
                         P2PMessage::SdpRelay { target_peer_id, .. } | P2PMessage::IceRelay { target_peer_id, .. } => {
                             let p_map = peers.lock().await;
                             if let Some(target) = p_map.get(&target_peer_id) {
-                                // app.log(format!("[RELAY] {} -> {}", &peer_id[..8.min(peer_id.len())], &target_peer_id[..8.min(target_peer_id.len())])); // Removed as per diff
                                 let _ = target.rtc.send(&data).await;
                             }
                         }
-                        P2PMessage::Ping { .. } => {}
+                        P2PMessage::Ping { ts } => {
+                            // Automatically respond to Ping with Pong
+                            let resp = P2PMessage::Pong { ts, echo_ts: ts };
+                            if let Ok(bin_data) = WireCodec::encode_v2(&resp) {
+                                let p_map = peers.lock().await;
+                                if let Some(m) = p_map.get(&peer_id) {
+                                    let _ = m.rtc.send(&bin_data).await;
+                                }
+                            }
+                        }
                         _ => {
                             let response = mailbox.handle_message(msg, &peer_id).await?;
                             if let Some(resp) = response {
-                                if let Ok(json_resp) = serde_json::to_string(&resp) {
+                                if let Ok(bin_data) = WireCodec::encode_v2(&resp) {
                                    let p_map = peers.lock().await;
                                    if let Some(m) = p_map.get(&peer_id) {
-                                       let _ = m.rtc.send(&json_resp).await;
+                                       let _ = m.rtc.send(&bin_data).await;
                                    }
                                 }
                             }
                         }
                     }
                 }
+
             }
             else => break,
         }

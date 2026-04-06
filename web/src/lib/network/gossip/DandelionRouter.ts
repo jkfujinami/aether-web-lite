@@ -1,4 +1,5 @@
 import type { IPeerManager, PeerId, GossipPacket, StemPacket } from '../../types';
+import { JsonBinary } from '../../common/JsonBinary';
 
 export const DANDELION_CONFIG = {
   FLUFF_PROBABILITY: 0.1,
@@ -141,10 +142,7 @@ export class DandelionRouter {
   private sendToPeer(targetId: PeerId, msg: any) {
     const peer = this.peerManager.peers.get(targetId);
     if (peer && peer.isConnected) {
-      peer.send(JSON.stringify(msg, (_key, value) => {
-        if (value instanceof Uint8Array) return { _type: 'Uint8Array', data: Array.from(value) };
-        return value;
-      }));
+      peer.send(JsonBinary.stringify(msg));
     }
   }
 }

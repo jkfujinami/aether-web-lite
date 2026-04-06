@@ -1,6 +1,10 @@
-import type { IPeerManager, PeerId, P2PMessage, IMailbox } from '../../types';
+import type { IPeerManager, PeerId, P2PMessage, IMailbox, IMessageDispatcher } from '../../types';
 import { RingPosition } from '../RingPosition';
 import { IndexedDBStore } from '../../storage/IndexedDBStore';
+import { Encoding } from '../../common/Encoding';
+import { JsonBinary } from '../../common/JsonBinary';
+import { CryptoUtils } from '../../common/CryptoUtils';
+import { WireType } from '../wire/WireTypes';
 
 // K=5（自分と最も近い5人）にデータを保存する
 const K_NEAREST = 5;
@@ -13,11 +17,16 @@ export class DHTMailbox implements IMailbox {
 
   constructor(
     peerManager: IPeerManager,
+    dispatcher: IMessageDispatcher,
     store: IndexedDBStore
   ) {
     this.peerManager = peerManager;
     this.store = store;
-    this.peerManager.on('peer:data', (peerId, data) => this.handleData(peerId, data));
+
+    // Dispatcher への各ハンドラの登録
+    dispatcher.register(WireType.DHT_PUT, (peerId, msg) => this.handlePut(peerId, msg));
+    dispatcher.register(WireType.DHT_GET, (peerId, msg) => this.handleGet(peerId, msg));
+    dispatcher.register(WireType.DHT_RES, (peerId, msg) => this.handleRes(peerId, msg));
   }
 
   /**
@@ -94,8 +103,7 @@ export class DHTMailbox implements IMailbox {
     const localEntries = await this.store.get(topicHashHex).catch(() => []) || [];
     const uniquePackets = new Map<string, Uint8Array>();
     localEntries.forEach(p => {
-       const hex = Array.from(p).map(b => b.toString(16).padStart(2, '0')).join('');
-       uniquePackets.set(hex, p);
+       uniquePackets.set(Encoding.toHex(p), p);
     });
 
     // 他に誰もいなければ、ローカル分だけで即座に返す
@@ -120,15 +128,14 @@ export class DHTMailbox implements IMailbox {
       const timer = setTimeout(finalize, 4000); // 最大4秒
 
       nearest.forEach(targetId => {
-        const reqId = `fetch_${Math.random().toString(36).slice(2)}`;
+        const reqId = `fetch_${CryptoUtils.generateId()}`;
         requestIds.push(reqId);
 
         this.pendingRequests.set(reqId, {
           resolve: (packets: Uint8Array[]) => {
             responsesReceived++;
             packets.forEach(p => {
-              const hex = Array.from(p).map(b => b.toString(16).padStart(2, '0')).join('');
-              uniquePackets.set(hex, p);
+              uniquePackets.set(Encoding.toHex(p), p);
             });
             if (responsesReceived >= expectedResponses) finalize();
           },
@@ -140,67 +147,42 @@ export class DHTMailbox implements IMailbox {
     });
   }
 
-  /**
-   * ピアから DHT 系メッセージを受け取った際の処理
-   */
-  private handleData(peerId: PeerId, data: Uint8Array | string) {
-    if (typeof data !== 'string') return;
-    try {
-      // Uint8Array のデシリアライズ
-      const msg = JSON.parse(data, (_key, value) => {
-        if (value && value._type === 'Uint8Array') return new Uint8Array(value.data);
-        return value;
-      }) as P2PMessage;
+  /** ── Dispatcher Handlers ── */
 
-      if (msg.type === 'dht-put') {
-        console.log(`[DHTMailbox] Received dht-put for ${msg.topicHash.substring(0,8)} (${msg.entries.length} items)`);
-        // 一旦自分が担当じゃなくても強制キャッシュ（後ほどのGCで刈り取るためとりあえず保存）
-        this.store.put(msg.topicHash, msg.entries).catch(e => console.error(e));
-      } 
-      else if (msg.type === 'dht-get') {
-        console.log(`[DHTMailbox] Received dht-get for ${msg.topicHash.substring(0,8)} from ${peerId.substring(0,8)}`);
-        // 持っていれば返す
-        this.store.get(msg.topicHash).then(entries => {
-          this.sendDHTRes(peerId, msg.topicHash, msg.reqId, entries || []);
-        });
+  private handlePut(_peerId: PeerId, msg: any) {
+    console.log(`[DHTMailbox] Received dht-put for ${msg.topicHash.substring(0,8)} (${msg.entries.length} items)`);
+    this.store.put(msg.topicHash, msg.entries).catch(e => console.error(e));
+  }
+
+  private handleGet(peerId: PeerId, msg: any) {
+    console.log(`[DHTMailbox] Received dht-get for ${msg.topicHash.substring(0,8)} from ${peerId.substring(0,8)}`);
+    this.store.get(msg.topicHash).then(entries => {
+      this.sendDHTRes(peerId, msg.topicHash, msg.reqId, entries || []);
+    });
+  }
+
+  private handleRes(_peerId: PeerId, msg: any) {
+    const req = this.pendingRequests.get(msg.reqId);
+    if (req) {
+      req.resolve(msg.entries);
+      this.pendingRequests.delete(msg.reqId);
+      console.log(`[DHTMailbox] Received DHT response: ${msg.entries.length} items!`);
+      
+      if (msg.entries.length > 0) {
+        this.store.put(msg.topicHash, msg.entries);
       }
-      else if (msg.type === 'dht-res') {
-        const req = this.pendingRequests.get(msg.reqId);
-        if (req) {
-          clearTimeout(req.timeout);
-          req.resolve(msg.entries);
-          this.pendingRequests.delete(msg.reqId);
-          console.log(`[DHTMailbox] Received DHT response: ${msg.entries.length} items!`);
-          
-          // せっかく取得したので、ローカルの IndexedDB にもキャッシュしておく
-          if (msg.entries.length > 0) {
-             this.store.put(msg.topicHash, msg.entries);
-          }
-        }
-      }
-    } catch(e) {}
+    }
   }
 
   private sendDHTPut(targetPeerId: PeerId, topicHash: string, entries: Uint8Array[]) {
-    this.sendToPeer(targetPeerId, { type: 'dht-put', topicHash, entries });
+    this.peerManager.sendMessage(targetPeerId, WireType.DHT_PUT, { topicHash, entries });
   }
 
   private sendDHTGet(targetPeerId: PeerId, topicHash: string, reqId: string) {
-    this.sendToPeer(targetPeerId, { type: 'dht-get', topicHash, reqId });
+    this.peerManager.sendMessage(targetPeerId, WireType.DHT_GET, { topicHash, reqId });
   }
 
   private sendDHTRes(targetPeerId: PeerId, topicHash: string, reqId: string, entries: Uint8Array[]) {
-    this.sendToPeer(targetPeerId, { type: 'dht-res', topicHash, reqId, entries });
-  }
-
-  private sendToPeer(targetPeerId: PeerId, msg: any) {
-    const peer = this.peerManager.peers.get(targetPeerId);
-    if (peer && peer.isConnected) {
-      const payload = JSON.stringify(msg, (_key, value) => {
-        if (value instanceof Uint8Array) return { _type: 'Uint8Array', data: Array.from(value) };
-        return value;
-      });
-      peer.send(payload);
-    }
+    this.peerManager.sendMessage(targetPeerId, WireType.DHT_RES, { topicHash, reqId, entries });
   }
 }

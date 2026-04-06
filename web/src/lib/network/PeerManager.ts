@@ -1,15 +1,16 @@
-import type { IPeerConnection, IPeerManager, PeerId, P2PMessage } from '../types';
-import { SignalingClient } from './SignalingClient';
+import type { IPeerConnection, IPeerManager, PeerId, P2PMessage, IMessageDispatcher, ISignalingClient } from '../types';
 import { WebRTCPeer } from './WebRTCPeer';
 import { RingPosition } from './RingPosition';
 import { RING_MESH } from '../constants';
 import { ZoneManager } from './ZoneManager';
+import { WireCodec } from './wire/WireCodec';
+import { WireType } from './wire/WireTypes';
 
 type BasePeerInfo = { peerId: PeerId; position: number; zones: number[] };
 
 export class PeerManager implements IPeerManager {
   private _peers: Map<PeerId, WebRTCPeer> = new Map();
-  private signaling: SignalingClient;
+  private signaling: ISignalingClient;
   private eventListeners: Map<string, Array<(...args: any[]) => void>> = new Map();
   private pexRoutes: Map<PeerId, PeerId> = new Map();
   private pendingSignals: Map<PeerId, any[]> = new Map();
@@ -18,17 +19,51 @@ export class PeerManager implements IPeerManager {
   public readonly myPeerId: PeerId;
   public readonly myPosition: number;
   private zoneManager: ZoneManager | null = null;
+  private dispatcher: IMessageDispatcher;
 
   constructor(
     myPeerId: PeerId,
-    myPosition: number
+    myPosition: number,
+    dispatcher: IMessageDispatcher,
+    signaling: ISignalingClient
   ) {
     this.myPeerId = myPeerId;
     this.myPosition = myPosition;
-    this.signaling = new SignalingClient();
+    this.dispatcher = dispatcher;
+    this.signaling = signaling;
+
+    this.registerInternalHandlers();
 
     this.signaling.on('peers', (peers) => this.handleTrackerPeers(peers));
     this.signaling.on('relay', (senderId, payload) => this.handleRelay(senderId, payload));
+  }
+
+  private registerInternalHandlers() {
+    // P2P Relay (SDP/ICE) の処理をディスパッチャに登録
+    const handleRelay = (peerId: PeerId, msg: any, type: WireType) => {
+      if (msg.targetPeerId === this.myPeerId) {
+        const sender = msg.senderId;
+        if (sender) {
+          this.pexRoutes.set(sender, peerId);
+          this.handleRelay(sender, msg);
+        }
+      } else if (this._peers.has(msg.targetPeerId)) {
+        this.sendMessage(msg.targetPeerId, type, msg);
+      }
+    };
+
+    this.dispatcher.register(WireType.SDP_RELAY, (peerId, payload) => handleRelay(peerId, payload, WireType.SDP_RELAY));
+    this.dispatcher.register(WireType.ICE_RELAY, (peerId, payload) => handleRelay(peerId, payload, WireType.ICE_RELAY));
+
+    // JOIN ハンドラ: 相手の自己紹介メッセージを受けて座標情報を更新
+    this.dispatcher.register(WireType.JOIN, (peerId, msg) => {
+      const peer = this._peers.get(peerId);
+      if (peer) {
+        if (msg.position !== undefined) peer.updatePosition(msg.position);
+        if (msg.zones !== undefined) peer.updateZones(msg.zones);
+        console.log(`[PeerManager] Peer ${peerId.substring(0,8)} joined/updated (pos: ${msg.position}, zones: ${JSON.stringify(msg.zones)})`);
+      }
+    });
   }
 
   public setZoneManager(zm: ZoneManager) {
@@ -90,10 +125,11 @@ export class PeerManager implements IPeerManager {
 
     if (!peer) {
       // ── オファーを受け取った場合は新規接続を作成 ──
-      // msg.sdp?.type (ネスト) または msg.type (フラット) を確認
-      const isOffer = msg.sdp?.type === 'offer' || msg.type === 'offer';
+      // msg.sdp?.type (内部タグ) または msg.type (V1/フラット) を確認
+      const isOffer = msg.sdp?.type === 'offer' || msg.type === 'offer' || msg.type === 'sdp-relay';
       
       if (isOffer) {
+        console.log(`[PeerManager] Received Offer via relay from ${senderId.substring(0,8)}`);
         if (this.degree >= RING_MESH.MAX_DEGREE) {
           const evicted = this.evictLongRangeLink();
           if (!evicted) return;
@@ -105,7 +141,6 @@ export class PeerManager implements IPeerManager {
         peer = this.connect(senderId, remotePos, remoteZones, false, viaPeerId);
         
         if (!peer) return;
-        // WebRTCPeer.signal() は msg.sdp / msg.candidate を内部で処理する
         peer.signal(msg);
         
         const buffered = this.pendingSignals.get(senderId) || [];
@@ -127,8 +162,14 @@ export class PeerManager implements IPeerManager {
   }
 
   public connect(peerId: PeerId, position: number, zones: number[], initiator: boolean = true, viaPeerId?: PeerId): WebRTCPeer | undefined {
-    if (this._peers.has(peerId)) {
-      return this._peers.get(peerId)!;
+    const existing = this._peers.get(peerId);
+    if (existing) {
+      if (existing.isConnected || existing.isConnecting) {
+        return existing;
+      }
+      // ゾンビ排除: Mapに存在するが死んでいるエントリを破棄して再試行を許可する
+      console.log(`[PeerManager] Cleaning up zombie peer ${peerId.substring(0,8)} before reconnect`);
+      this.disconnect(peerId);
     }
 
     const lastEvicted = this.coolDowns.get(peerId);
@@ -151,20 +192,26 @@ export class PeerManager implements IPeerManager {
           
         let relayMsg: any;
         if (payload.renegotiate || payload.type === 'offer' || payload.type === 'answer' || payload.type === 'rollback') {
+          // RTCSessionDescription をプレーンオブジェクトに変換
+          const sdpPlain = (typeof payload.toJSON === 'function') ? payload.toJSON() : { type: payload.type, sdp: payload.sdp };
+          
           relayMsg = {
             type: 'sdp-relay',
             targetPeerId: peerId,
             senderId: this.myPeerId,
             position: this.myPosition,
             zones: myZones,
-            sdp: payload
+            sdp: sdpPlain
           };
         } else if (payload.candidate) {
+          // RTCIceCandidate をプレーンオブジェクトに変換
+          const icePlain = (typeof payload.toJSON === 'function') ? payload.toJSON() : payload;
+          
           relayMsg = {
             type: 'ice-relay',
             targetPeerId: peerId,
             senderId: this.myPeerId,
-            candidate: payload
+            candidate: icePlain
           };
         }
 
@@ -172,8 +219,8 @@ export class PeerManager implements IPeerManager {
 
         const via = this.pexRoutes.get(peerId);
         if (via && this._peers.has(via)) {
-          // P2P Relay (via existing neighbor)
-          this._peers.get(via)!.send(JSON.stringify(relayMsg));
+          // P2P Relay
+          this.sendMessage(via, relayMsg.type === 'sdp-relay' ? WireType.SDP_RELAY : WireType.ICE_RELAY, relayMsg);
         } else {
           // Tracker Relay
           this.signaling.sendRelay(peerId, relayMsg);
@@ -181,30 +228,28 @@ export class PeerManager implements IPeerManager {
       },
       onConnect: () => {
         this.emit('peer:connect', peer);
-        const msg: P2PMessage = { type: 'join', peerId: this.myPeerId, position: this.myPosition };
-        peer.send(JSON.stringify(msg));
+        // Wire V2 Join 送信
+        this.sendMessage(peerId, WireType.JOIN, { peerId: this.myPeerId, position: this.myPosition });
       },
       onDisconnect: () => {
         this.disconnect(peerId);
       },
       onData: (data) => {
-        if (typeof data === 'string') {
-          try {
-            const msg = JSON.parse(data) as P2PMessage;
-            if (msg.type === 'sdp-relay' || msg.type === 'ice-relay') {
-              if (msg.targetPeerId === this.myPeerId) {
-                const sender = msg.senderId;
-                if (sender) {
-                  this.pexRoutes.set(sender, peerId);
-                  this.handleRelay(sender, msg);
-                }
-              } else if (this._peers.has(msg.targetPeerId)) {
-                this._peers.get(msg.targetPeerId)!.send(data);
-              }
-              return;
-            }
-          } catch (e) { }
+        console.log(`[PeerManager] onData from ${peerId.substring(0,8)}: size=${data instanceof Uint8Array ? data.length : (data as any).byteLength}`);
+        // 1. WireCodec でのデコード試行
+        const decoded = (data instanceof Uint8Array) 
+          ? WireCodec.decode(data) 
+          : WireCodec.decode(new TextEncoder().encode(data)); // String 互換
+
+        if (decoded.type !== WireType.UNKNOWN) {
+          console.log(`[PeerManager] Routing message 0x${decoded.type.toString(16)} to dispatcher`);
+          // ── Dispatcher への配信 ──
+          this.dispatcher.dispatch(peerId, decoded.type, decoded.payload);
+        } else {
+          console.warn(`[PeerManager] Dropped unknown wire message from ${peerId.substring(0,8)}`);
         }
+
+        // 2. 既存の peer:data も継続して発火（後位互換）
         this.emit('peer:data', peerId, data);
       }
     });
@@ -219,6 +264,17 @@ export class PeerManager implements IPeerManager {
     }, 15_000);
 
     return peer;
+  }
+
+  /**
+   * 特定のピアにメッセージを送信する (Wire V2)
+   */
+  public sendMessage(peerId: PeerId, type: WireType, payload: any): void {
+    const peer = this._peers.get(peerId);
+    if (peer && peer.isConnected) {
+      const binary = WireCodec.encode(type, payload);
+      peer.send(binary);
+    }
   }
 
   private evictLongRangeLink(): boolean {

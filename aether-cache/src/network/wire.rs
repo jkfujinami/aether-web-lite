@@ -71,6 +71,7 @@ impl WireCodec {
             P2PMessage::PexResponse { .. } => WireType::PexResponse,
             P2PMessage::SdpRelay { .. } => WireType::SdpRelay,
             P2PMessage::IceRelay { .. } => WireType::IceRelay,
+            P2PMessage::Ignored => return Err(anyhow!("Cannot encode Ignored message")),
         };
 
         let mut buf = Vec::new();

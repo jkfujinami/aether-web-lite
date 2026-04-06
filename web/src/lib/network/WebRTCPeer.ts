@@ -17,15 +17,20 @@ export class WebRTCPeer implements IPeerConnection {
   private channel?: RTCDataChannel;
   
   public readonly peerId: PeerId;
-  public readonly position: number;
-  public readonly zones: ReadonlySet<number>;
+  public position: number;
+  public zones: Set<number>;
   public rtt: number = 0;
 
   private _connected = false;
+  private _connecting = true; // 新規追加: 接続試行中フラグ
   private opts: WebRTCPeerOptions;
 
   public get isConnected(): boolean {
     return this._connected;
+  }
+
+  public get isConnecting(): boolean {
+    return this._connecting;
   }
 
   constructor(opts: WebRTCPeerOptions) {
@@ -75,6 +80,7 @@ export class WebRTCPeer implements IPeerConnection {
       console.log(`[WebRTCPeer ${this.peerId}] iceConnectionState:`, state);
       if (state === 'disconnected' || state === 'failed') {
         this._connected = false;
+        this._connecting = false;
         this.opts.onDisconnect();
       }
     };
@@ -86,12 +92,14 @@ export class WebRTCPeer implements IPeerConnection {
     channel.onopen = () => {
       console.log(`[WebRTCPeer] DataChannel open with ${this.peerId}`);
       this._connected = true;
+      this._connecting = false;
       this.opts.onConnect();
     };
 
     channel.onclose = () => {
       console.log(`[WebRTCPeer] DataChannel closed with ${this.peerId}`);
       this._connected = false;
+      this._connecting = false;
       this.opts.onDisconnect();
     };
 
@@ -172,8 +180,17 @@ export class WebRTCPeer implements IPeerConnection {
     }
   }
 
+  public updatePosition(pos: number) {
+    this.position = pos;
+  }
+
+  public updateZones(zones: number[]) {
+    this.zones = new Set(zones);
+  }
+
   public close(): void {
     this._connected = false;
+    this._connecting = false;
     if (this.channel) this.channel.close();
     this.pc.close();
   }

@@ -1,6 +1,7 @@
 import type { IMailbox, ICryptoEngine, IPostStore, IKeyManager } from '../../types';
 import { KeyManager } from '../../crypto/KeyManager';
 import { PacketBuilder } from '../../crypto/PacketBuilder';
+import { JsonBinary } from '../../common/JsonBinary';
 
 /**
  * SyncProtocol
@@ -47,12 +48,9 @@ export class SyncProtocol {
     let count = 0;
     for (const binPacket of packets) {
       try {
-        // DHTMailboxはJSON.stringify(Uint8Arrayカスタム)で保存しているためパースが必要
+        // DHTMailboxはJsonBinary.stringifyで保存しているためパースが必要
         const packetStr = new TextDecoder().decode(binPacket);
-        const packetObj = JSON.parse(packetStr, (_key, value) => {
-          if (value && value._type === 'Uint8Array') return new Uint8Array(value.data);
-          return value;
-        });
+        const packetObj = JsonBinary.parse(packetStr);
 
         // PacketBuilder を使って 3層の検証（Magic -> AEAD -> Ed25519）を一気に行う
         const post = await PacketBuilder.verifyAndDecrypt(packetObj, threadKey, this.crypto);

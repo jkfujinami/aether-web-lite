@@ -1,4 +1,5 @@
-import type { IPeerManager, PeerId } from '../types';
+import type { IPeerManager, PeerId, IMessageDispatcher } from '../types';
+import { WireType } from './wire/WireTypes';
 
 /**
  * Heartbeat Module
@@ -9,11 +10,11 @@ export class Heartbeat {
   private interval: number = 15_000; // 15秒
   private timer: any = null;
 
-  constructor(peerManager: IPeerManager) {
+  constructor(peerManager: IPeerManager, dispatcher: IMessageDispatcher) {
     this.peerManager = peerManager;
 
-    // ピアからのデータ受信を監視し、ping/pong メッセージを処理する
-    this.peerManager.on('peer:data', (peerId, data) => this.handleData(peerId, data));
+    dispatcher.register(WireType.PING, (peerId, msg) => this.handlePing(peerId, msg));
+    dispatcher.register(WireType.PONG, (peerId, msg) => this.handlePong(peerId, msg));
   }
 
   /**
@@ -41,49 +42,22 @@ export class Heartbeat {
     const now = Date.now();
     for (const [peerId, peer] of this.peerManager.peers) {
       if (peer.isConnected) {
-        try {
-          peer.send(JSON.stringify({
-            type: 'ping',
-            ts: now
-          }));
-        } catch (e) {
-          console.warn(`[Heartbeat] Failed to ping ${peerId}:`, e);
-        }
+        this.peerManager.sendMessage(peerId, WireType.PING, { ts: now });
       }
     }
   }
 
-  /**
-   * 受信データを解析し、ping/pong であれば適切に処理する
-   */
-  private handleData(peerId: PeerId, data: Uint8Array | string): void {
-    // 文字列データ（JSON）のみを対象とする
-    if (typeof data !== 'string') return;
+  /** ── Dispatcher Handlers ── */
 
-    try {
-      const msg = JSON.parse(data);
-      if (!msg || typeof msg.type !== 'string') return;
+  private handlePing(peerId: PeerId, msg: any): void {
+    this.peerManager.sendMessage(peerId, WireType.PONG, { ts: msg.ts });
+  }
 
-      const peer = this.peerManager.peers.get(peerId);
-      if (!peer) return;
-
-      if (msg.type === 'ping') {
-        // Ping を受け取ったら Pong を返す
-        peer.send(JSON.stringify({
-          type: 'pong',
-          ts: msg.ts
-        }));
-      } 
-      else if (msg.type === 'pong') {
-        // Pong を受け取ったら RTT を計算し、ピア情報に反映する
-        if (typeof msg.ts === 'number') {
-          const rtt = Date.now() - msg.ts;
-          // IPeerConnection.rtt は readonly ではないため直接代入可能
-          (peer as any).rtt = rtt;
-        }
-      }
-    } catch (e) {
-      // JSON ではない通常のゴシップパケット等は無視
+  private handlePong(peerId: PeerId, msg: any): void {
+    const peer = this.peerManager.peers.get(peerId);
+    if (peer && typeof msg.ts === 'number') {
+      const rtt = Date.now() - msg.ts;
+      (peer as any).rtt = rtt;
     }
   }
 }

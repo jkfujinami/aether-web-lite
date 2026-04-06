@@ -4,6 +4,8 @@ import React, { createContext, useContext, useEffect, useState, useRef } from 'r
 import sodium from 'libsodium-wrappers';
 
 import { PeerManager } from '@/lib/network/PeerManager';
+import { SignalingClient } from '@/lib/network/SignalingClient';
+import { MessageDispatcher } from '@/lib/network/MessageDispatcher';
 import { RingPosition } from '@/lib/network/RingPosition';
 import { PEXHandler } from '@/lib/network/PEXHandler';
 import { RingMaintainer } from '@/lib/network/RingMaintainer';
@@ -18,6 +20,8 @@ import { CryptoEngine } from '@/lib/crypto/CryptoEngine';
 import { PoWEngine } from '@/lib/crypto/PoWEngine';
 import { Identity } from '@/lib/crypto/Identity';
 import { KeyManager } from '@/lib/crypto/KeyManager';
+import { Encoding } from '@/lib/common/Encoding';
+import { CryptoUtils } from '@/lib/common/CryptoUtils';
 import type { IPoWEngine, IKeyManager } from '@/lib/types';
 
 interface P2PContextState {
@@ -77,9 +81,7 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
       try {
         // 1. ノード情報の生成
         const ringPos = await RingPosition.loadOrCreate();
-        const myPeerId = Array.from(crypto.getRandomValues(new Uint8Array(16)))
-          .map(b => b.toString(16).padStart(2, '0'))
-          .join('');
+        const myPeerId = Encoding.toHex(CryptoUtils.randomBytes(16));
         
         console.log('Initializing AETHER Lite...', { myPeerId, pos: ringPos.value });
 
@@ -97,7 +99,9 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
         };
 
         // 3. ネットワーク・ストレージ基盤の初期化
-        const pm = new PeerManager(myPeerId, ringPos.value);
+        const dispatcher = new MessageDispatcher();
+        const signaling = new SignalingClient();
+        const pm = new PeerManager(myPeerId, ringPos.value, dispatcher, signaling);
         const zm = new ZoneManager(pm);
         pm.setZoneManager(zm); 
         
@@ -107,20 +111,20 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
         const identity = new Identity();
         await identity.initTrip(db);
         
-        const mailbox = new DHTMailbox(pm, db);
+        const mailbox = new DHTMailbox(pm, dispatcher, db);
         const replicationMgr = new ReplicationManager(mailbox, pm, db);
         const syncProtocol = new SyncProtocol(mailbox, cryptoEng, keyMgr, db);
 
-        const router = new ZoneGossipRouter(pm, zm);
-        const pex = new PEXHandler(pm);
+        const router = new ZoneGossipRouter(pm, dispatcher, zm);
+        const pex = new PEXHandler(pm, dispatcher);
         const maintainer = new RingMaintainer(pm, pex);
-        const heartbeat = new Heartbeat(pm);
+        const heartbeat = new Heartbeat(pm, dispatcher);
 
         // バックグラウンドプロセスを Ref に保持
         backgroundProcesses.current = [heartbeat, maintainer, replicationMgr];
 
         // デバッグ用に露出（オリジナル処理の維持）
-        Object.assign(window, { pm, pex, maintainer, router, db, mailbox, myIdentity: identity, syncProtocol, zm, KeyManager });
+        Object.assign(window, { pm, pex, maintainer, router, db, mailbox, myIdentity: identity, syncProtocol, zm, KeyManager, signaling });
 
         setState({
           pm,

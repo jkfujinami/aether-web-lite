@@ -1,4 +1,6 @@
 import sodium from 'libsodium-wrappers';
+import { Encoding } from '../common/Encoding';
+import { CryptoUtils } from '../common/CryptoUtils';
 
 export class KeyManager {
   /**
@@ -32,45 +34,35 @@ export class KeyManager {
    * URLフラグメントなどから取得したHex文字列をUint8Arrayに変換
    */
   static fromHex(hex: string): Uint8Array {
-    const bytes = new Uint8Array(Math.ceil(hex.length / 2));
-    for (let i = 0; i < bytes.length; i++) {
-      bytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
-    }
-    return bytes;
+    return Encoding.fromHex(hex);
   }
 
   /**
    * Uint8ArrayをHex文字列に変換
    */
   static toHex(bytes: Uint8Array): string {
-    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+    return Encoding.toHex(bytes);
   }
 
   /**
    * 新しい板の鍵を生成
    */
   static generateBoardKey(): Uint8Array {
-    return crypto.getRandomValues(new Uint8Array(32));
+    return CryptoUtils.randomBytes(32);
   }
 
   /**
    * Base64URLをUint8Arrayに変換
    */
   static fromBase64(b64: string): Uint8Array {
-    const binary = atob(b64.replace(/-/g, '+').replace(/_/g, '/'));
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes;
+    return Encoding.fromBase64(b64);
   }
 
   /**
    * Uint8ArrayをBase64URLに変換
    */
   static toBase64(bytes: Uint8Array): string {
-    const binary = String.fromCharCode(...bytes);
-    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    return Encoding.toBase64(bytes);
   }
 
   /**
@@ -80,3 +72,4 @@ export class KeyManager {
     return sodium.crypto_hash(data);
   }
 }
+

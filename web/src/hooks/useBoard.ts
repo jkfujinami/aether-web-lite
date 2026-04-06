@@ -6,6 +6,8 @@ import { KeyManager } from '@/lib/crypto/KeyManager';
 import { PacketBuilder } from '@/lib/crypto/PacketBuilder';
 import { ThreadRanker } from '@/lib/logic/ThreadRanker';
 import { useRouter } from 'next/navigation';
+import { JsonBinary } from '@/lib/common/JsonBinary';
+import { CryptoUtils } from '@/lib/common/CryptoUtils';
 
 export interface ThreadMeta {
   thread_id: string;
@@ -98,10 +100,7 @@ export function useBoard(boardId: string) {
         });
 
         if (!isFromDB && db) {
-          const dataToSave = rawData || new TextEncoder().encode(JSON.stringify(packet, (_k, v) => {
-            if (v instanceof Uint8Array) return { _type: 'Uint8Array', data: Array.from(v) };
-            return v;
-          }));
+          const dataToSave = rawData || new TextEncoder().encode(JsonBinary.stringify(packet));
           await db.save({
             boardId: boardId,
             threadId: '__board_meta__',
@@ -122,10 +121,7 @@ export function useBoard(boardId: string) {
 
   const handleRawPacket = useCallback(async (rawPacket: Uint8Array, isFromDB: boolean) => {
     try {
-      const packet = JSON.parse(new TextDecoder().decode(rawPacket), (_k, v) => {
-        if (v && v._type === 'Uint8Array') return new Uint8Array(v.data);
-        return v;
-      });
+      const packet = JsonBinary.parse(new TextDecoder().decode(rawPacket));
       await handlePacketObject(packet, isFromDB, rawPacket);
     } catch (e) {}
   }, [handlePacketObject]);
@@ -256,7 +252,7 @@ export function useBoard(boardId: string) {
     setPowProgress(30);
 
     try {
-      const threadId = Math.random().toString(36).substring(2, 12);
+      const threadId = CryptoUtils.generateId(10);
       const threadKey = KeyManager.deriveThreadKey(boardKey.current, threadId);
       const threadTopicHash = KeyManager.deriveTopicHash(threadKey);
       const currentZoneId = KeyManager.computeZoneId(threadTopicHash, zm.depth);
@@ -273,10 +269,7 @@ export function useBoard(boardId: string) {
       await router.broadcast(packet);
 
       const boardB64TopicHash = KeyManager.toHex(KeyManager.cryptoHash(boardKey.current));
-      const rawPacketData = new TextEncoder().encode(JSON.stringify(packet, (_k, v) => {
-          if (v instanceof Uint8Array) return { _type: 'Uint8Array', data: Array.from(v) };
-          return v;
-      }));
+      const rawPacketData = new TextEncoder().encode(JsonBinary.stringify(packet));
       
       mailbox.publish(boardB64TopicHash, rawPacketData).catch((e: any) => console.error(e));
       

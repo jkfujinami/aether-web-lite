@@ -1,4 +1,5 @@
 import { openDB, type IDBPDatabase } from 'idb';
+import { Encoding } from '../common/Encoding';
 
 export interface MailboxEntry {
   topicHash: string;
@@ -73,10 +74,10 @@ export class IndexedDBStore {
     let record = await store.get(topicHash) as MailboxEntry | undefined;
     
     if (record) {
-      const existingHexes = new Set(record.entries.map(e => this.toHex(e)));
+      const existingHexes = new Set(record.entries.map(e => Encoding.toHex(e)));
       let changed = false;
       for (const e of newEntries) {
-        if (!existingHexes.has(this.toHex(e))) {
+        if (!existingHexes.has(Encoding.toHex(e))) {
           record.entries.push(e);
           changed = true;
         }
@@ -187,9 +188,5 @@ export class IndexedDBStore {
   public async deleteTrip(): Promise<void> {
     if (!this.db) return;
     await this.db.delete('identity', 'primary');
-  }
-
-  private toHex(buf: Uint8Array): string {
-    return Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('');
   }
 }

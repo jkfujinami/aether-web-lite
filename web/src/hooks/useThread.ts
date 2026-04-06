@@ -6,6 +6,7 @@ import { KeyManager } from '@/lib/crypto/KeyManager';
 import { PacketBuilder } from '@/lib/crypto/PacketBuilder';
 import { ThreadDAGManager } from '@/lib/logic/ThreadDAGManager';
 import type { DAGPost } from '@/lib/logic/ThreadDAGManager';
+import { JsonBinary } from '@/lib/common/JsonBinary';
 
 export function useThread(boardId: string, threadId: string) {
   const { pm, mailbox, cryptoEng, db, syncProtocol, router, identity, powEng, keyMgr, zm, isReady } = useP2P();
@@ -78,10 +79,7 @@ export function useThread(boardId: string, threadId: string) {
           updatePostsFromDAG();
           
           if (!isFromDB) {
-              const rawPacketData = new TextEncoder().encode(JSON.stringify(packet, (_k, v) => {
-                 if (v instanceof Uint8Array) return { _type: 'Uint8Array', data: Array.from(v) };
-                 return v;
-              }));
+              const rawPacketData = new TextEncoder().encode(JsonBinary.stringify(packet));
               await db.save({ 
                 boardId: boardId, 
                 threadId: threadId, 
@@ -104,10 +102,7 @@ export function useThread(boardId: string, threadId: string) {
     const rawEntries = await db.getPosts(boardId, threadId).catch(() => []);
     for (const entry of rawEntries) {
       try {
-        const packet = JSON.parse(new TextDecoder().decode(entry.payload), (_k, v) => {
-          if (v && v._type === 'Uint8Array') return new Uint8Array(v.data);
-          return v;
-        });
+        const packet = JsonBinary.parse(new TextDecoder().decode(entry.payload));
         await handleIncomingPacket(packet, true);
       } catch (e) {}
     }
@@ -230,10 +225,7 @@ export function useThread(boardId: string, threadId: string) {
       });
       
       const globalTopic = KeyManager.toHex(threadTopicHash.current);
-      const rawPacketData = new TextEncoder().encode(JSON.stringify(packet, (_k, v) => {
-          if (v instanceof Uint8Array) return { _type: 'Uint8Array', data: Array.from(v) };
-          return v;
-      }));
+      const rawPacketData = new TextEncoder().encode(JsonBinary.stringify(packet));
       
       mailbox.publish(globalTopic, rawPacketData).catch((err: any) => {
         console.warn('[useThread] Mailbox publish failed in background:', err);

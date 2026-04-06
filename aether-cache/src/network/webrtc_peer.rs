@@ -13,6 +13,7 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
+use bytes::Bytes;
 
 pub struct WebRTCPeer {
     pc: Arc<RTCPeerConnection>,
@@ -24,7 +25,7 @@ impl WebRTCPeer {
         remote_id: String,
         initiator: bool,
         signal_tx: mpsc::UnboundedSender<TrackerMessage>,
-        data_tx: mpsc::UnboundedSender<(String, String)>,
+        data_tx: mpsc::UnboundedSender<(String, Vec<u8>)>,
     ) -> Result<Arc<Self>> {
         let mut m = webrtc::api::media_engine::MediaEngine::default();
         m.register_default_codecs()?;
@@ -75,7 +76,7 @@ impl WebRTCPeer {
                     || s == RTCPeerConnectionState::Failed
                     || s == RTCPeerConnectionState::Closed
                 {
-                    let _ = dtx.send(((*rid).clone(), "__disconnected".to_string()));
+                    let _ = dtx.send(((*rid).clone(), b"__disconnected".to_vec()));
                 }
             })
         }));
@@ -123,7 +124,7 @@ impl WebRTCPeer {
     async fn setup_data_channel(
         dc: Arc<RTCDataChannel>,
         remote_id: String,
-        data_tx: mpsc::UnboundedSender<(String, String)>,
+        data_tx: mpsc::UnboundedSender<(String, Vec<u8>)>,
         data_channel_slot: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     ) {
         let rid = Arc::new(remote_id);
@@ -139,7 +140,7 @@ impl WebRTCPeer {
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
             let rid = Arc::clone(&rid_c2);
             let data_tx = data_tx.clone();
-            let data = String::from_utf8_lossy(&msg.data).to_string();
+            let data = msg.data.to_vec();
             Box::pin(async move {
                 let _ = data_tx.send(((*rid).clone(), data));
             })
@@ -177,10 +178,10 @@ impl WebRTCPeer {
         Ok(())
     }
 
-    pub async fn send(&self, msg: &str) -> Result<()> {
+    pub async fn send(&self, msg: &[u8]) -> Result<()> {
         let slot = self.data_channel.lock().await;
         if let Some(dc) = &*slot {
-            dc.send_text(msg.to_string()).await?;
+            dc.send(&Bytes::copy_from_slice(msg)).await?;
         }
         Ok(())
     }

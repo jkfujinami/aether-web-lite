@@ -73,9 +73,26 @@ export interface IPeerManager {
   readonly degree: number;
   readonly myPeerId: PeerId;
   readonly myPosition: number;
-  connect(peerId: PeerId, position: number, zones: number[]): IPeerConnection | Promise<IPeerConnection> | undefined;
+  connect(peerId: PeerId, position: number, zones: number[], initiator?: boolean, viaPeerId?: PeerId): IPeerConnection | Promise<IPeerConnection> | undefined;
   disconnect(peerId: PeerId): void;
+  // 高レベルバイナリ送信 (Wire V2)
+  sendMessage(peerId: PeerId, type: number, payload: any): void;
   on(event: string, handler: (...args: any[]) => void): void;
+}
+
+// ── Message Dispatcher ──
+export interface IMessageDispatcher {
+  register(type: number, handler: (peerId: PeerId, payload: any) => void): void;
+  dispatch(peerId: PeerId, type: number, payload: any): void;
+}
+
+// ── Signaling Client ──
+export interface ISignalingClient {
+  connect(options: { peerId: PeerId; position: number; zones: number[]; turnstileToken?: string }): Promise<void>;
+  sendRelay(targetPeerId: PeerId, payload: any): void;
+  disconnect(): void;
+  on(event: 'peers', cb: (peers: Array<{ peerId: PeerId; position: number; zones: number[] }>) => void): void;
+  on(event: 'relay', cb: (senderId: PeerId, payload: any) => void): void;
 }
 
 // ── Mailbox (DHT) ──
