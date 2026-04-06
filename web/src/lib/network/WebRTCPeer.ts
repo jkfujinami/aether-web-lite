@@ -34,11 +34,13 @@ export class WebRTCPeer implements IPeerConnection {
     this.position = opts.position;
     this.zones = new Set(opts.zones);
 
-    // ★ 開発時（localhost）はSTUNサーバーを無効化する
-    // 同じPC内のタブ間で通信する際、STUNサーバーを指定すると
-    // ルーターの「NATヘアピン（ループバック）未対応」が原因で接続に失敗するケースが多いため。
-    const isLocalhost = typeof location !== 'undefined' && (location.hostname === 'localhost' || location.hostname === '127.0.0.1');
-    const iceServers = isLocalhost ? [] : [{ urls: 'stun:stun.l.google.com:19302' }];
+    const iceServers = [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun3.l.google.com:19302' },
+      { urls: 'stun:stun4.l.google.com:19302' }
+    ];
 
     this.pc = new RTCPeerConnection({ iceServers });
 
