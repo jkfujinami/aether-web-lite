@@ -5,6 +5,10 @@ import sodium from 'libsodium-wrappers';
 
 import { PeerManager } from '@/lib/network/PeerManager';
 import { SignalingClient } from '@/lib/network/SignalingClient';
+import { BoardOrchestrator } from '@/lib/logic/BoardOrchestrator';
+import { ThreadOrchestrator } from '@/lib/logic/ThreadOrchestrator';
+
+
 import { MessageDispatcher } from '@/lib/network/MessageDispatcher';
 import { RingPosition } from '@/lib/network/RingPosition';
 import { PEXHandler } from '@/lib/network/PEXHandler';
@@ -35,7 +39,10 @@ interface P2PContextState {
   syncProtocol: SyncProtocol | null;
   router: ZoneGossipRouter | null;
   zm: ZoneManager | null;
+  boardOrchestrator: BoardOrchestrator | null;
+  threadOrchestrator: ThreadOrchestrator | null;
   isReady: boolean;
+
 }
 
 const P2PContext = createContext<P2PContextState>({
@@ -49,7 +56,10 @@ const P2PContext = createContext<P2PContextState>({
   syncProtocol: null,
   router: null,
   zm: null,
+  boardOrchestrator: null,
+  threadOrchestrator: null,
   isReady: false,
+
 });
 
 export const useP2P = () => useContext(P2PContext);
@@ -66,7 +76,10 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
     syncProtocol: null,
     router: null,
     zm: null,
+    boardOrchestrator: null,
+    threadOrchestrator: null,
     isReady: false,
+
   });
 
   // Strict mode 対策。初期化が2回走らないようにガードする
@@ -119,12 +132,18 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
         const pex = new PEXHandler(pm, dispatcher);
         const maintainer = new RingMaintainer(pm, pex);
         const heartbeat = new Heartbeat(pm, dispatcher);
+        const boardOrchestrator = new BoardOrchestrator(pm, db, mailbox, router, cryptoEng, powEng, identity, zm, keyMgr);
+        const threadOrchestrator = new ThreadOrchestrator(pm, db, mailbox, router, cryptoEng, powEng, identity, zm, keyMgr, syncProtocol);
+
+
 
         // バックグラウンドプロセスを Ref に保持
         backgroundProcesses.current = [heartbeat, maintainer, replicationMgr];
 
         // デバッグ用に露出（オリジナル処理の維持）
-        Object.assign(window, { pm, pex, maintainer, router, db, mailbox, myIdentity: identity, syncProtocol, zm, KeyManager, signaling });
+        Object.assign(window, { pm, pex, maintainer, router, db, mailbox, myIdentity: identity, syncProtocol, zm, KeyManager, signaling, boardOrchestrator, threadOrchestrator });
+
+
 
         setState({
           pm,
@@ -136,8 +155,11 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
           keyMgr,
           syncProtocol,
           router,
-          zm,
+          zm: zm,
+          boardOrchestrator: boardOrchestrator,
+          threadOrchestrator: threadOrchestrator,
           isReady: true, // ここで UI 側がレンダリングを開始できる
+
         });
 
         // 4. バックグラウンドプロセスの開始

@@ -4,18 +4,18 @@ import { use, useState, KeyboardEvent } from "react";
 import { useThread } from "@/hooks/useThread";
 import { KeyManager } from "@/lib/crypto/KeyManager";
 
-export default function ThreadView({ 
+export default function ThreadView({
   boardId,
   threadId,
   boardKeyBase64
-}: { 
+}: {
   boardId: string;
   threadId: string;
   boardKeyBase64?: string;
 }) {
   const {
-    posts, status, submitReply, 
-    powProgress, isSubmitting, postStatus 
+    posts, status, submitReply,
+    powProgress, isSubmitting, postStatus
   } = useThread(boardId, threadId);
 
   const [replyInput, setReplyInput] = useState('');
@@ -26,7 +26,7 @@ export default function ThreadView({
     const sanitized = content
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     const withLinks = sanitized.replace(
-      /&gt;&gt;(\d+)/g, 
+      /&gt;&gt;(\d+)/g,
       '<span style="color:var(--accent-primary); cursor:pointer;">&gt;&gt;$1</span>'
     );
     return withLinks;
@@ -56,17 +56,17 @@ export default function ThreadView({
           ← 板に戻る
         </button>
         <h1 id="thread-title" style={{ marginTop: '10px', fontSize: '24px' }}>
-          スレッド: {threadId.substring(0,8)}
+          スレッド: {threadId.substring(0, 8)}
         </h1>
       </div>
 
       <div id="posts-container">
         {status && <div id="loading-status" style={{ color: 'var(--text-dim)', padding: '20px', textAlign: 'center' }}>{status}</div>}
-        
+
         {posts.map((p, index) => {
           const trip = p.trip_pubkey ? '◆' + KeyManager.toBase64(KeyManager.cryptoHash(p.trip_pubkey).slice(0, 5)) : '';
           const id = p.session_pubkey ? KeyManager.toBase64(KeyManager.cryptoHash(p.session_pubkey).slice(0, 4)) : '???';
-          
+
           return (
             <div className="post" key={p.packet_id || index}>
               <div className="post-header">
@@ -75,9 +75,9 @@ export default function ThreadView({
                 <span className="author-id">ID:{id}</span>
                 <span className="post-time">{new Date(p.created_at).toLocaleString()}</span>
               </div>
-              <div 
-                className="post-body" 
-                dangerouslySetInnerHTML={{ __html: formatContent(p.content || '') }} 
+              <div
+                className="post-body"
+                dangerouslySetInnerHTML={{ __html: formatContent(p.content || '') }}
               />
             </div>
           );
@@ -85,9 +85,9 @@ export default function ThreadView({
       </div>
 
       <div className="compose-box">
-        <textarea 
-          id="reply-input" 
-          placeholder=">>レスを入力... (Ctrl+Enterで送信)" 
+        <textarea
+          id="reply-input"
+          placeholder=">>レスを入力... (Ctrl+Enterで送信)"
           rows={3}
           value={replyInput}
           onChange={e => setReplyInput(e.target.value)}
@@ -98,9 +98,9 @@ export default function ThreadView({
           <div id="post-status" style={{ fontSize: '12px', color: 'var(--text-dim)' }}>
             {postStatus}
           </div>
-          <button 
-            className="btn" 
-            id="btn-send-reply" 
+          <button
+            className="btn"
+            id="btn-send-reply"
             onClick={handleSubmit}
             disabled={isSubmitting || !replyInput.trim()}
           >

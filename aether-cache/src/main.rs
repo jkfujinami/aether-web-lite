@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use storage::sqlite_store::SqliteStore;
+use storage::StorageBackend;
 use tokio::sync::{mpsc, Mutex};
 use tui::app::App;
 use mailbox::dht_mailbox::DHTMailbox;
@@ -57,7 +58,7 @@ async fn main() -> Result<()> {
     let my_peer_id = format!("cache_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let ring_pos = RingPosition::random();
 
-    let store = Arc::new(SqliteStore::new("./mailbox.db")?);
+    let store: Arc<dyn StorageBackend> = Arc::new(SqliteStore::new("./mailbox.db")?);
     let mailbox = Arc::new(DHTMailbox::new(Arc::clone(&store)));
 
     let mut app = App::new(my_peer_id.clone(), ring_pos.value);

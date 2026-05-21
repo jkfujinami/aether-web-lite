@@ -29,15 +29,15 @@ export function AppHeader() {
   return (
     <header>
       <div style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
-        <div 
-          className="nav-logo" 
-          style={{ cursor: 'pointer' }} 
+        <div
+          className="nav-logo"
+          style={{ cursor: 'pointer' }}
           onClick={() => { window.location.hash = '#board=vip'; }}
         >
           AETHER LITE
         </div>
-        <button 
-          className="btn" 
+        <button
+          className="btn"
           onClick={handleCreatePrivateBoard}
           style={{ padding: '2px 10px', fontSize: '11px' }}
         >

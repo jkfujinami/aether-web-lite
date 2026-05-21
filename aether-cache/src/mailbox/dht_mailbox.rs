@@ -1,15 +1,15 @@
 use crate::network::messages::{JsonBytes, P2PMessage};
-use crate::storage::sqlite_store::SqliteStore;
+use crate::storage::StorageBackend;
 use anyhow::Result;
 use std::sync::Arc;
 use tracing::info;
 
 pub struct DHTMailbox {
-    store: Arc<SqliteStore>,
+    store: Arc<dyn StorageBackend>,
 }
 
 impl DHTMailbox {
-    pub fn new(store: Arc<SqliteStore>) -> Self {
+    pub fn new(store: Arc<dyn StorageBackend>) -> Self {
         Self { store }
     }
 

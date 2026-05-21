@@ -30,6 +30,11 @@ export class ZoneGossipRouter {
     this.listeners.push(handler);
   }
 
+  public offMessage(handler: (packet: GossipPacket) => void) {
+    this.listeners = this.listeners.filter(h => h !== handler);
+  }
+
+
   /**
    * 自己発信またはUIからの手動再送
    */

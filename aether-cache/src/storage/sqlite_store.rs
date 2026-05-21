@@ -3,6 +3,8 @@ use rusqlite::{params, Connection};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
+use super::StorageBackend;
+
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
 }
@@ -33,8 +35,10 @@ impl SqliteStore {
             conn: Arc::new(Mutex::new(conn)),
         })
     }
+}
 
-    pub fn put(&self, topic_hash: &str, entries: Vec<Vec<u8>>) -> Result<()> {
+impl StorageBackend for SqliteStore {
+    fn put(&self, topic_hash: &str, entries: Vec<Vec<u8>>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -49,7 +53,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub fn get(&self, topic_hash: &str) -> Result<Vec<Vec<u8>>> {
+    fn get(&self, topic_hash: &str) -> Result<Vec<Vec<u8>>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT entry_blob FROM mailbox_entries WHERE topic_hash = ?1 ORDER BY timestamp ASC",
@@ -63,7 +67,7 @@ impl SqliteStore {
         Ok(entries)
     }
 
-    pub fn topic_count(&self) -> Result<usize> {
+    fn topic_count(&self) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let count: usize = conn.query_row(
             "SELECT COUNT(DISTINCT topic_hash) FROM mailbox_entries",
@@ -74,7 +78,7 @@ impl SqliteStore {
     }
 
     /// 24時間以上経過した古いエントリを削除する (Ikioiベースの管理)
-    pub fn cleanup(&self) -> Result<usize> {
+    fn cleanup(&self) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?

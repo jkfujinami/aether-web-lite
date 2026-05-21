@@ -78,6 +78,7 @@ export interface IPeerManager {
   // 高レベルバイナリ送信 (Wire V2)
   sendMessage(peerId: PeerId, type: number, payload: any): void;
   on(event: string, handler: (...args: any[]) => void): void;
+  off(event: string, handler: (...args: any[]) => void): void;
 }
 
 // ── Message Dispatcher ──

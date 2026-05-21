@@ -84,12 +84,12 @@ export class PeerManager implements IPeerManager {
 
   public async start(): Promise<void> {
     // ゾーン情報がまだ無い場合はデフォルト [0] で接続開始
-    const zones = this.zoneManager 
+    const zones = this.zoneManager
       ? Array.from(this.zoneManager.subscribedZones)
       : [0];
-      
+
     console.log(`[PeerManager] Starting as ${this.myPeerId} (pos: ${this.myPosition}) with ${zones.length} zones`);
-    
+
     await this.signaling.connect({
       peerId: this.myPeerId,
       position: this.myPosition,
@@ -104,7 +104,7 @@ export class PeerManager implements IPeerManager {
 
   private handleTrackerPeers(peers: BasePeerInfo[]): void {
     console.log(`[PeerManager] Received ${peers.length} peers from tracker`);
-    
+
     // 🌟 Zone-aware 接続選択 (§5.1) 🌟
     const myZones = this.zoneManager?.subscribedZones ?? new Set([0]);
     peers.sort((a, b) => {
@@ -127,22 +127,22 @@ export class PeerManager implements IPeerManager {
       // ── オファーを受け取った場合は新規接続を作成 ──
       // msg.sdp?.type (内部タグ) または msg.type (V1/フラット) を確認
       const isOffer = msg.sdp?.type === 'offer' || msg.type === 'offer' || msg.type === 'sdp-relay';
-      
+
       if (isOffer) {
         console.log(`[PeerManager] Received Offer via relay from ${senderId.substring(0,8)}`);
         if (this.degree >= RING_MESH.MAX_DEGREE) {
           const evicted = this.evictLongRangeLink();
           if (!evicted) return;
         }
-        
+
         const remotePos = msg.position ?? 0;
         const remoteZones = msg.zones ?? [];
         const viaPeerId = this.pexRoutes.get(senderId);
         peer = this.connect(senderId, remotePos, remoteZones, false, viaPeerId);
-        
+
         if (!peer) return;
         peer.signal(msg);
-        
+
         const buffered = this.pendingSignals.get(senderId) || [];
         for (const sig of buffered) {
           peer.signal(sig);
@@ -186,15 +186,15 @@ export class PeerManager implements IPeerManager {
       zones,
       initiator,
       onSignal: (payload) => {
-        const myZones = this.zoneManager 
-          ? Array.from(this.zoneManager.subscribedZones) 
+        const myZones = this.zoneManager
+          ? Array.from(this.zoneManager.subscribedZones)
           : [0];
-          
+
         let relayMsg: any;
         if (payload.renegotiate || payload.type === 'offer' || payload.type === 'answer' || payload.type === 'rollback') {
           // RTCSessionDescription をプレーンオブジェクトに変換
           const sdpPlain = (typeof payload.toJSON === 'function') ? payload.toJSON() : { type: payload.type, sdp: payload.sdp };
-          
+
           relayMsg = {
             type: 'sdp-relay',
             targetPeerId: peerId,
@@ -206,7 +206,7 @@ export class PeerManager implements IPeerManager {
         } else if (payload.candidate) {
           // RTCIceCandidate をプレーンオブジェクトに変換
           const icePlain = (typeof payload.toJSON === 'function') ? payload.toJSON() : payload;
-          
+
           relayMsg = {
             type: 'ice-relay',
             targetPeerId: peerId,
@@ -237,8 +237,8 @@ export class PeerManager implements IPeerManager {
       onData: (data) => {
         console.log(`[PeerManager] onData from ${peerId.substring(0,8)}: size=${data instanceof Uint8Array ? data.length : (data as any).byteLength}`);
         // 1. WireCodec でのデコード試行
-        const decoded = (data instanceof Uint8Array) 
-          ? WireCodec.decode(data) 
+        const decoded = (data instanceof Uint8Array)
+          ? WireCodec.decode(data)
           : WireCodec.decode(new TextEncoder().encode(data)); // String 互換
 
         if (decoded.type !== WireType.UNKNOWN) {
@@ -280,7 +280,7 @@ export class PeerManager implements IPeerManager {
   private evictLongRangeLink(): boolean {
     const connected = Array.from(this._peers.values()).filter(p => p.isConnected);
     if (connected.length === 0) return false;
-    
+
     connected.sort((a, b) => {
       const dA = RingPosition.distance(this.myPosition, a.position);
       const dB = RingPosition.distance(this.myPosition, b.position);
@@ -317,6 +317,14 @@ export class PeerManager implements IPeerManager {
     handlers.push(handler);
     this.eventListeners.set(event, handlers);
   }
+
+  public off(event: string, handler: (...args: any[]) => void): void {
+    const handlers = this.eventListeners.get(event);
+    if (handlers) {
+      this.eventListeners.set(event, handlers.filter(h => h !== handler));
+    }
+  }
+
 
   private emit(event: string, ...args: any[]): void {
     const handlers = this.eventListeners.get(event);
