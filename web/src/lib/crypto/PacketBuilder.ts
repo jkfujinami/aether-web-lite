@@ -3,6 +3,7 @@ import sodium from 'libsodium-wrappers';
 import type { ICryptoEngine, IIdentity, IPoWEngine, IKeyManager } from '../types';
 import { Identity } from './Identity';
 import { KeyManager } from './KeyManager';
+import { MagicFilter } from './MagicFilter';
 
 export class PacketBuilder {
   /**
@@ -88,22 +89,58 @@ export class PacketBuilder {
    * 受信時に外側部分から順序立てて展開・検証・デコードする。
    */
   static async verifyAndDecrypt(
-    packet: any, 
+    packet: any,
     threadKey: Uint8Array,
     cryptoEngine: ICryptoEngine
   ): Promise<any | null> {
     const ciphertext = new Uint8Array(packet.payload);
     const nonce = new Uint8Array(packet.nonce);
 
+    // 0. Broadcast Veil: 4バイト高速スクリーニング (~5ns)
+    // 自分宛てでないパケットをフルAEAD復号の前に弾く
+    let isMatch = false;
+    try {
+      isMatch = MagicFilter.quickCheck(threadKey, ciphertext, nonce);
+    } catch (e: any) {
+      console.error(`[PacketBuilder] QuickCheck threw exception for packet ${packet.packet_id}:`, e);
+      throw new Error(`QuickCheck failure: ${e.message}`);
+    }
+
+    if (!isMatch) {
+      return null;
+    }
+
     // 1. フルAEAD復号
-    const decPayloadBuf = cryptoEngine.decrypt(threadKey, { ciphertext, nonce });
-    if (!decPayloadBuf) return null;
+    let decPayloadBuf: Uint8Array | null = null;
+    try {
+      decPayloadBuf = cryptoEngine.decrypt(threadKey, { ciphertext, nonce });
+    } catch (e: any) {
+      console.error(`[PacketBuilder] AEAD decryption crashed for packet ${packet.packet_id}:`, e);
+      throw new Error(`AEAD decrypt crash: ${e.message}`);
+    }
+
+    if (!decPayloadBuf) {
+      console.warn(`[PacketBuilder] AEAD decryption failed (invalid key or tampered ciphertext) for packet ${packet.packet_id}`);
+      return null;
+    }
 
     // 2. 第一層のデシリアライズ
-    const encPayload = decode(decPayloadBuf) as any;
+    let encPayload: any;
+    try {
+      encPayload = decode(decPayloadBuf) as any;
+    } catch (e: any) {
+      console.error(`[PacketBuilder] Msgpack decode (layer 1) failed for packet ${packet.packet_id}:`, e);
+      return null;
+    }
 
     // 3. 第二層の展開
-    const innerPayload = decode(encPayload.inner_payload) as any;
+    let innerPayload: any;
+    try {
+      innerPayload = decode(encPayload.inner_payload) as any;
+    } catch (e: any) {
+      console.error(`[PacketBuilder] Msgpack decode (layer 2) failed for packet ${packet.packet_id}:`, e);
+      return null;
+    }
     
     // 4. Ed25519 署名検証 (後方互換性のために、存在するフィールドのみで構成)
     const originalPostDataObj: any = {
@@ -125,14 +162,20 @@ export class PacketBuilder {
     const signedData = encode(originalPostDataObj);
 
     // Identity.verify は static なのでそのまま呼び出し
-    const isValid = Identity.verify(
-      signedData, 
-      new Uint8Array(innerPayload.session_pubkey), 
-      new Uint8Array(innerPayload.session_sig)
-    );
+    let isValid = false;
+    try {
+      isValid = Identity.verify(
+        signedData, 
+        new Uint8Array(innerPayload.session_pubkey), 
+        new Uint8Array(innerPayload.session_sig)
+      );
+    } catch (e: any) {
+      console.error(`[PacketBuilder] Ed25519 signature verification crashed for packet ${packet.packet_id}:`, e);
+      return null;
+    }
 
     if (!isValid) {
-      console.warn("Signature Verification Failed for packet:", packet.packet_id);
+      console.warn(`[PacketBuilder] Signature Verification Failed for packet: ${packet.packet_id}`);
       return null;
     }
 

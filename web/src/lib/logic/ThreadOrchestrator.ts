@@ -3,15 +3,14 @@ import type { DHTMailbox } from '../network/mailbox/DHTMailbox';
 import type { ZoneGossipRouter } from '../network/gossip/ZoneGossipRouter';
 import type { CryptoEngine } from '../crypto/CryptoEngine';
 import type { Identity } from '../crypto/Identity';
-import type { ZoneManager } from '../network/ZoneManager';
 import type { SyncProtocol } from '../network/mailbox/SyncProtocol';
-import type { IPoWEngine, IKeyManager } from '../types';
-import type { PeerManager } from '../network/PeerManager';
+import type { IPeerManager, IZoneManager, IPoWEngine, IKeyManager } from '../types';
 import { ThreadDAGManager, type DAGPost } from './ThreadDAGManager';
 import { ThreadStatus } from './types';
 import { JsonBinary } from '../common/JsonBinary';
 import { PacketBuilder } from '../crypto/PacketBuilder';
 import { KeyManager } from '../crypto/KeyManager';
+import { DifficultyEstimator } from '../crypto/DifficultyEstimator';
 
 
 
@@ -37,14 +36,14 @@ export class ThreadOrchestrator {
 
 
   constructor(
-    private pm: PeerManager,
+    private pm: IPeerManager,
     private db: IndexedDBStore,
     private mailbox: DHTMailbox,
     private router: ZoneGossipRouter,
     private cryptoEng: CryptoEngine,
     private powEng: IPoWEngine,
     private identity: Identity,
-    private zm: ZoneManager,
+    private zm: IZoneManager,
     private keyMgr: IKeyManager,
     private syncProtocol: SyncProtocol
   ) {}
@@ -84,7 +83,12 @@ export class ThreadOrchestrator {
 
     try {
       const post = await PacketBuilder.verifyAndDecrypt(packet, threadKey, this.cryptoEng);
-      if (post && post.thread_id === threadId && post.post_type === 0) {
+      if (!post) {
+        console.warn(`[ThreadOrchestrator] Packet ${packet.packet_id} decrypted to null (failed quickCheck, AEAD, or signature)`);
+        return;
+      }
+
+      if (post.thread_id === threadId && post.post_type === 0) {
         
         const dagPost: DAGPost = {
           ...post,
@@ -110,11 +114,23 @@ export class ThreadOrchestrator {
                   thread_root: dagPost.thread_root,
                   created_at: dagPost.created_at
                 }
-              }).catch(() => {});
+              }).catch((err) => {
+                console.error(`[ThreadOrchestrator] DB Save failed for packet ${packet.packet_id}:`, err);
+              });
           }
+        } else {
+          console.log(`[ThreadOrchestrator] Packet ${packet.packet_id} already exists in DAG (skipped)`);
         }
+      } else {
+        console.warn(`[ThreadOrchestrator] Packet ${packet.packet_id} skipped: metadata mismatch.`, {
+          expectedThread: threadId,
+          actualThread: post.thread_id,
+          postType: post.post_type
+        });
       }
-    } catch (e) {}
+    } catch (e: any) {
+      console.error(`[ThreadOrchestrator] Error processing packet ${packet?.packet_id}:`, e);
+    }
   }
 
   /**
@@ -242,17 +258,47 @@ export class ThreadOrchestrator {
 
     try {
       const currentZoneId = this.keyMgr.computeZoneId(this.currentThreadTopicHash, this.zm.depth);
-      
+
+      const timestamps = await this.db.getRecentTimestamps(DifficultyEstimator.WINDOW);
+      const powDifficulty = DifficultyEstimator.compute(timestamps);
+
       const tips = this.dag.getTips();
       const currentWeight = this.dag.getMaxCumulativePow();
-      const nextWeight = currentWeight + 8; // 基底難易度を加算
+      const nextWeight = currentWeight + powDifficulty;
 
+      const postNumber = this.dag.getCount();
       const packet = await PacketBuilder.build(
         text, this.currentThreadKey, this.identity, this.cryptoEng,
         this.powEng, this.keyMgr, this.currentBoardId, this.currentThreadId,
-        this.dag.getCount(), null, 8, currentZoneId, 0,
+        postNumber, null, powDifficulty, currentZoneId, 0,
         tips, this.currentThreadId, nextWeight
       );
+
+      // Immediately reflect the reply in local state rather than waiting for
+      // the gossip loopback to come back through verifyAndDecrypt.
+      const now = Date.now();
+      const dagPost: DAGPost = {
+        packet_id: packet.packet_id,
+        content: text,
+        post_number: postNumber,
+        created_at: now,
+        board_id: this.currentBoardId!,
+        thread_id: this.currentThreadId!,
+        parents: tips,
+        cumulative_pow: nextWeight,
+        thread_root: this.currentThreadId!,
+      };
+      const rawPacketData = new TextEncoder().encode(JsonBinary.stringify(packet));
+      if (this.dag.addPost(dagPost)) {
+        this.seenPacketIds.add(packet.packet_id);
+        this.notify();
+        await this.db.save({
+          boardId: this.currentBoardId!,
+          threadId: this.currentThreadId!,
+          payload: rawPacketData,
+          dag: { parents: tips, cumulative_pow: nextWeight, thread_root: this.currentThreadId!, created_at: now }
+        }).catch(() => {});
+      }
 
       this.updateStatus('submitting', '送信完了 (配信待機中...)', true, 100);
 
@@ -260,10 +306,9 @@ export class ThreadOrchestrator {
       this.router.broadcast(packet).catch((err: any) => {
         console.error('ゴシップ送信に失敗:', err);
       });
-      
+
       const topicHex = KeyManager.toHex(this.currentThreadTopicHash);
-      const rawPacketData = new TextEncoder().encode(JsonBinary.stringify(packet));
-      
+
       this.mailbox.publish(topicHex, rawPacketData).catch((err: any) => {
         console.warn('[ThreadOrchestrator] Mailbox publish failed:', err);
       });

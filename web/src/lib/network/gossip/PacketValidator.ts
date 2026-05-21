@@ -2,7 +2,8 @@ import type { GossipPacket } from '../../types';
 import { PoWEngine } from '../../crypto/PoWEngine';
 
 export const GOSSIP_RULES = {
-  MAX_PAYLOAD_SIZE: 1024 * 1024,   // 1MB: 巨大なスパムパケットを落とす
+  MAX_PAYLOAD_SIZE: 1024 * 2,      // 2KB: 仕様書 §5.2 手順1
+  MAX_HOP_COUNT: 30,               // 無限ループ防止上限
   MAX_TIME_DRIFT: 15 * 60 * 1000,  // ±15分: これより未来・過去のパケットをネットワークから除外
 };
 
@@ -19,7 +20,13 @@ export class PacketValidator {
       return false;
     }
 
-    // 2. 時刻制約 (Replay攻撃と無限ループ防衛)
+    // 2. hop_count 上限 (無限ループ防止)
+    if (typeof packet.hop_count !== 'number' || packet.hop_count > GOSSIP_RULES.MAX_HOP_COUNT) {
+      console.warn(`[PacketValidator] Dropped ${packet.packet_id.substring(0,8)} (hop_count: ${packet.hop_count})`);
+      return false;
+    }
+
+    // 3. 時刻制約 (Replay攻撃と無限ループ防衛)
     // - あまりにも過去のパケットは「過去ログ」を装ったスパム（リプレイ）の可能性がある。
     // - 15分以上前の攻撃はネットワーク全員が拒否し、15分以内の再送は LRU(SeenCache) が防ぐ。
     const now = Date.now();

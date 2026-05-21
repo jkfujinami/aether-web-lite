@@ -113,6 +113,7 @@ export interface DAGMetadata {
 export interface IPostStore {
   save(post: { boardId: string; threadId: string; payload: Uint8Array; dag?: DAGMetadata }): Promise<void>;
   getPosts(boardId: string, threadId: string): Promise<any[]>;
+  getRecentTimestamps(count: number): Promise<number[]>;
 }
 
 // ── Key Management ──
@@ -132,6 +133,13 @@ export interface SignatureResult {
 
 export interface IIdentity {
   sign(data: Uint8Array): SignatureResult;
+}
+
+// ── Zone Manager ──
+export interface IZoneManager {
+  readonly depth: number;
+  readonly subscribedZones: ReadonlySet<number>;
+  isSubscribed(zoneId: number): boolean;
 }
 
 // ── Anti-Spam (PoW) ──

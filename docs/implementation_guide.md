@@ -751,3 +751,5 @@ test('2つのブラウザタブでリアルタイムチャットができる', a
 | MessagePack | JSON / Protobuf | スキーマレスで柔軟、JSONより30-50%小さい。Protobufほどの複雑さ不要 |
 | Vite | Webpack | 高速HMR。ESBuildベースで開発体験が良い |
 | ws (server) | Socket.io | 最軽量。Socket.ioの抽象化は不要（WebSocket標準だけで十分） |
+
+

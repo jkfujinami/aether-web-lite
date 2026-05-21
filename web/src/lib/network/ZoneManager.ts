@@ -11,11 +11,12 @@ export class ZoneManager {
   private _subscribedZones: Set<number> = new Set();
   private peerManager: IPeerManager;
   private networkSize: number = 10; // 初期推定値
+  private depthDecreaseTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(peerManager: IPeerManager) {
     this.peerManager = peerManager;
     this.initSubscribedZones();
-    
+
     // 1分ごとに depth を再計算 (§5.7)
     setInterval(() => this.recomputeDepth(), 60_000);
   }
@@ -57,14 +58,30 @@ export class ZoneManager {
     // 設計書 §3.2 の数式に従い depth を決定
     const targetDepth = this.calculateTargetDepth(this.networkSize);
 
-    // ヒステリシス (急激な変動を防ぐ)
+    // ヒステリシス: 上昇は即座、下降は5分待機 (仕様書 IMPORTANT #9 / zone §7.1)
     if (targetDepth > this._depth) {
-        this._depth = targetDepth; // 上がる時は即座
-        this.updateSubscriptionAfterScaleUp();
+      // 上昇時: 即座に適用 & 下降タイマーをキャンセル
+      if (this.depthDecreaseTimer) {
+        clearTimeout(this.depthDecreaseTimer);
+        this.depthDecreaseTimer = null;
+      }
+      this._depth = targetDepth;
+      this.updateSubscriptionAfterScaleUp();
     } else if (targetDepth < this._depth) {
-        // 下がる時はゆっくり（今回は簡易的に即時反映だが、本来は待機が必要）
-        this._depth = targetDepth;
-        this.initSubscribedZones();
+      // 下降時: 5分待機してから1段階だけ下げる（振動防止）
+      if (!this.depthDecreaseTimer) {
+        this.depthDecreaseTimer = setTimeout(() => {
+          this.depthDecreaseTimer = null;
+          this._depth = Math.max(0, this._depth - 1);
+          this.initSubscribedZones();
+        }, 5 * 60 * 1000);
+      }
+    } else {
+      // depth 変化なし: 保留中の下降タイマーをキャンセル
+      if (this.depthDecreaseTimer) {
+        clearTimeout(this.depthDecreaseTimer);
+        this.depthDecreaseTimer = null;
+      }
     }
   }
 

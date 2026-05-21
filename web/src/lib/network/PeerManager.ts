@@ -1,8 +1,7 @@
-import type { IPeerConnection, IPeerManager, PeerId, P2PMessage, IMessageDispatcher, ISignalingClient } from '../types';
+import type { IPeerConnection, IPeerManager, PeerId, P2PMessage, IMessageDispatcher, ISignalingClient, IZoneManager } from '../types';
 import { WebRTCPeer } from './WebRTCPeer';
 import { RingPosition } from './RingPosition';
 import { RING_MESH } from '../constants';
-import { ZoneManager } from './ZoneManager';
 import { WireCodec } from './wire/WireCodec';
 import { WireType } from './wire/WireTypes';
 
@@ -18,7 +17,7 @@ export class PeerManager implements IPeerManager {
 
   public readonly myPeerId: PeerId;
   public readonly myPosition: number;
-  private zoneManager: ZoneManager | null = null;
+  private zoneManager: IZoneManager | null = null;
   private dispatcher: IMessageDispatcher;
 
   constructor(
@@ -66,7 +65,7 @@ export class PeerManager implements IPeerManager {
     });
   }
 
-  public setZoneManager(zm: ZoneManager) {
+  public setZoneManager(zm: IZoneManager) {
     this.zoneManager = zm;
   }
 

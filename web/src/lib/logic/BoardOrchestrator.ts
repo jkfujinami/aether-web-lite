@@ -3,13 +3,11 @@ import type { DHTMailbox } from '../network/mailbox/DHTMailbox';
 import type { ZoneGossipRouter } from '../network/gossip/ZoneGossipRouter';
 import type { CryptoEngine } from '../crypto/CryptoEngine';
 import type { Identity } from '../crypto/Identity';
-import type { ZoneManager } from '../network/ZoneManager';
-import type { IPoWEngine, IKeyManager } from '../types';
+import type { IPeerManager, IZoneManager, IPoWEngine, IKeyManager } from '../types';
 import type { ThreadMeta } from './types';
-import type { PeerManager } from '../network/PeerManager';
 import { PacketBuilder } from '../crypto/PacketBuilder';
-
 import { KeyManager } from '../crypto/KeyManager';
+import { DifficultyEstimator } from '../crypto/DifficultyEstimator';
 import { BOARD_META_THREAD_ID, BoardStatus } from './types';
 
 
@@ -34,14 +32,14 @@ export class BoardOrchestrator {
 
 
   constructor(
-    private pm: PeerManager,
+    private pm: IPeerManager,
     private db: IndexedDBStore,
     private mailbox: DHTMailbox,
     private router: ZoneGossipRouter,
     private cryptoEng: CryptoEngine,
     private powEng: IPoWEngine,
     private identity: Identity,
-    private zm: ZoneManager,
+    private zm: IZoneManager,
     private keyMgr: IKeyManager
   ) {}
 
@@ -80,66 +78,72 @@ export class BoardOrchestrator {
    * パケット（JSONオブジェクト）を処理し、板の状態を更新する
    */
   public async handlePacketObject(boardId: string, boardKey: Uint8Array, packet: any, isFromDB: boolean, rawData?: Uint8Array) {
+    if (this.seenPacketIds.has(packet.packet_id)) return;
+    this.seenPacketIds.add(packet.packet_id);
     try {
-      if (this.seenPacketIds.has(packet.packet_id)) return;
-      this.seenPacketIds.add(packet.packet_id);
-
       const meta = await PacketBuilder.verifyAndDecrypt(packet, boardKey, this.cryptoEng);
-      if (meta && meta.post_type === 1) { 
-        let max_pow = Number(meta.cumulative_pow || 0);
-        // created_at を安全に数値化。無効値なら Date.now() にフォールバック
-        const rawCreatedAt = Number(meta.created_at);
-        const created_at = (isFinite(rawCreatedAt) && rawCreatedAt > 0) ? rawCreatedAt : Date.now();
-        
-        const stats = await this.db.getThreads(boardId).then((list: any[]) => list.find(s => s.threadId === meta.thread_id));
-        if (stats) {
-          max_pow = Math.max(max_pow, stats.max_pow || 0);
-        }
-
-        // メモリ状態の更新
-        const existing = this.threads.get(meta.thread_id);
-        if (existing) {
-          const mergedPow = Math.max(existing.max_pow || 0, max_pow);
-          const mergedCreatedAt = (isFinite(existing.created_at) && existing.created_at > 0) 
-            ? existing.created_at 
-            : created_at;
-
-          if (mergedPow !== existing.max_pow || mergedCreatedAt !== existing.created_at) {
-            this.threads.set(meta.thread_id, { ...existing, max_pow: mergedPow, created_at: mergedCreatedAt });
-            this.notify();
-          }
-        } else {
-          this.threads.set(meta.thread_id, {
-            ...meta,
-            packet_id: packet.packet_id,
-            max_pow,
-            created_at
-          });
-          this.notify();
-        }
-
-        if (!isFromDB) {
-          const dataToSave = rawData || new TextEncoder().encode(JSON.stringify(packet, (_k, v) => {
-            if (v instanceof Uint8Array) return { _type: 'Uint8Array', data: Array.from(v) };
-            return v;
-          }));
-          await this.db.save({
-            boardId: boardId,
-            threadId: BOARD_META_THREAD_ID,
-            payload: dataToSave,
-            dag: {
-              parents: meta.parents || [],
-              cumulative_pow: meta.cumulative_pow || 0,
-              thread_root: meta.thread_id,
-              created_at: meta.created_at
-            }
-          }).catch(() => {});
-        }
-
+      if (!meta) {
+        console.warn(`[BoardOrchestrator] Packet ${packet.packet_id} decrypted to null (failed quickCheck, AEAD, or signature)`);
+        return;
       }
-    } catch (e) {
-      // 復号失敗や検証失敗は無視
+      if (meta.post_type !== 1) {
+        console.warn(`[BoardOrchestrator] Packet ${packet.packet_id} skipped: post_type is not 1 (thread meta) but ${meta.post_type}`);
+        return;
+      }
+
+      const created_at = this.normalizeTimestamp(meta.created_at);
+      const max_pow = await this.resolveMaxPow(boardId, meta);
+      if (this.mergeThread(meta, packet.packet_id, max_pow, created_at)) this.notify();
+      if (!isFromDB) await this.persistThread(boardId, packet, meta, rawData);
+    } catch (e: any) {
+      console.error(`[BoardOrchestrator] Error processing packet ${packet?.packet_id}:`, e);
     }
+  }
+
+  private normalizeTimestamp(raw: any): number {
+    const n = Number(raw);
+    return isFinite(n) && n > 0 ? n : Date.now();
+  }
+
+  private async resolveMaxPow(boardId: string, meta: any): Promise<number> {
+    const base = Number(meta.cumulative_pow || 0);
+    const stats = await this.db.getThreads(boardId)
+      .then((list: any[]) => list.find((s: any) => s.threadId === meta.thread_id));
+    return stats ? Math.max(base, stats.max_pow || 0) : base;
+  }
+
+  private mergeThread(meta: any, packetId: string, max_pow: number, created_at: number): boolean {
+    const existing = this.threads.get(meta.thread_id);
+    if (existing) {
+      const mergedPow = Math.max(existing.max_pow || 0, max_pow);
+      const mergedAt = isFinite(existing.created_at) && existing.created_at > 0
+        ? existing.created_at : created_at;
+      if (mergedPow === existing.max_pow && mergedAt === existing.created_at) return false;
+      this.threads.set(meta.thread_id, { ...existing, max_pow: mergedPow, created_at: mergedAt });
+    } else {
+      this.threads.set(meta.thread_id, { ...meta, packet_id: packetId, max_pow, created_at });
+    }
+    return true;
+  }
+
+  private async persistThread(boardId: string, packet: any, meta: any, rawData?: Uint8Array): Promise<void> {
+    const data = rawData ?? new TextEncoder().encode(JSON.stringify(packet, (_k, v) => {
+      if (v instanceof Uint8Array) return { _type: 'Uint8Array', data: Array.from(v) };
+      return v;
+    }));
+    await this.db.save({
+      boardId,
+      threadId: BOARD_META_THREAD_ID,
+      payload: data,
+      dag: {
+        parents: meta.parents || [],
+        cumulative_pow: meta.cumulative_pow || 0,
+        thread_root: meta.thread_id,
+        created_at: meta.created_at
+      }
+    }).catch((err) => {
+      console.error(`[BoardOrchestrator] DB Save failed for thread meta ${meta?.thread_id}:`, err);
+    });
   }
 
 
@@ -307,11 +311,14 @@ export class BoardOrchestrator {
       const threadTopicHash = KeyManager.deriveTopicHash(threadKey);
       const currentZoneId = KeyManager.computeZoneId(threadTopicHash, this.zm.depth);
 
+      const timestamps = await this.db.getRecentTimestamps(DifficultyEstimator.WINDOW);
+      const powDifficulty = DifficultyEstimator.compute(timestamps);
+
       const packet = await PacketBuilder.build(
         title, boardKey, this.identity, this.cryptoEng,
         this.powEng, this.keyMgr, boardId, threadId,
-        0, null, 10, currentZoneId, 1,
-        [], threadId, 10 // Initial Heat (cumulative_pow) is 10
+        0, null, powDifficulty, currentZoneId, 1,
+        [], threadId, powDifficulty
       );
 
       this.updateStatus('submitting', '拡散中...', true, 100);
@@ -327,17 +334,29 @@ export class BoardOrchestrator {
       // 背景での送信処理
       this.mailbox.publish(boardB64TopicHash, rawPacketData).catch((e: any) => console.error(e));
 
+      const savedAt = Date.now();
       await this.db.save({
         boardId: boardId,
         threadId: BOARD_META_THREAD_ID,
         payload: rawPacketData,
         dag: {
             parents: [],
-            cumulative_pow: 10, // スレ立て時の基本難易度を初期Heatとして刻む
+            cumulative_pow: powDifficulty,
             thread_root: threadId,
-            created_at: Date.now()
+            created_at: savedAt
         }
       }).catch(() => {});
+
+      // Immediately reflect the new thread in local state rather than waiting
+      // for the gossip loopback to come back through verifyAndDecrypt.
+      this.mergeThread(
+        { thread_id: threadId, board_id: boardId, content: title, post_type: 1, created_at: savedAt },
+        packet.packet_id,
+        powDifficulty,
+        savedAt
+      );
+      this.seenPacketIds.add(packet.packet_id);
+      this.notify();
 
       this.updateStatus('idle', '', false, 0);
       return threadId;

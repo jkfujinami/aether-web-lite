@@ -158,9 +158,15 @@ export class IndexedDBStore {
     const tx = this.db.transaction('posts', 'readonly');
     const store = tx.objectStore('posts');
     const index = store.index('board_thread');
-    
+
     const results = await index.getAll([boardId, threadId]);
     return results.sort((a, b) => a.timestamp - b.timestamp);
+  }
+
+  public async getRecentTimestamps(count: number): Promise<number[]> {
+    if (!this.db) return [];
+    const all = await this.db.getAllFromIndex('posts', 'timestamp');
+    return all.slice(-count).map((r: any) => r.timestamp as number);
   }
 
   // --- Identity / Trip Storage ---

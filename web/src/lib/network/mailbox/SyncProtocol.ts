@@ -47,10 +47,12 @@ export class SyncProtocol {
     // 3. 復号・検証・保存
     let count = 0;
     for (const binPacket of packets) {
+      let currentPacketId: string | undefined;
       try {
         // DHTMailboxはJsonBinary.stringifyで保存しているためパースが必要
         const packetStr = new TextDecoder().decode(binPacket);
         const packetObj = JsonBinary.parse(packetStr);
+        currentPacketId = packetObj?.packet_id;
 
         // PacketBuilder を使って 3層の検証（Magic -> AEAD -> Ed25519）を一気に行う
         const post = await PacketBuilder.verifyAndDecrypt(packetObj, threadKey, this.crypto);
@@ -65,11 +67,15 @@ export class SyncProtocol {
               cumulative_pow: post.cumulative_pow || 0,
               thread_root: post.thread_root || threadId
             }
+          }).catch((err) => {
+            console.error(`[SyncProtocol] Store save failed for sync packet ${currentPacketId}:`, err);
           });
           count++;
+        } else {
+          console.warn(`[SyncProtocol] Packet ${currentPacketId || 'unknown'} decrypted to null (failed quickCheck, AEAD, or signature) in topic ${topicHashHex.substring(0,8)}`);
         }
       } catch (e) {
-        console.warn(`[SyncProtocol] Failed to process a packet:`, e);
+        console.warn(`[SyncProtocol] Failed to process packet ${currentPacketId || 'unknown'} during sync:`, e);
         continue;
       }
     }

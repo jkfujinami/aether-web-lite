@@ -1,15 +1,15 @@
-import { PeerManager } from './PeerManager';
+import type { IPeerManager } from '../types';
 import { PEXHandler } from './PEXHandler';
 import { RingPosition } from './RingPosition';
 import { RING_MESH } from '../constants';
 
 export class RingMaintainer {
   private timer: ReturnType<typeof setInterval>;
-  private peerManager: PeerManager;
+  private peerManager: IPeerManager;
   private pexHandler: PEXHandler;
 
   constructor(
-    peerManager: PeerManager,
+    peerManager: IPeerManager,
     pexHandler: PEXHandler
   ) {
     this.peerManager = peerManager;
