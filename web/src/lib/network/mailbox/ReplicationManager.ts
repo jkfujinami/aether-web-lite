@@ -75,9 +75,11 @@ export class ReplicationManager {
   }
 
   private findKNearestExcludingMe(topicPos: number, k: number): PeerId[] {
-    const allPeers = Array.from(this.peerManager.peers.values()) as IPeerConnection[];
-    
-    // RingPosition.distance を使って距離順にソート
+    // ハンドシェイク未完了のピアには複製を送らない。座標が Bound Identity で
+    // 検証されていない相手を担当者に選ぶと、そこが取りこぼしと情報漏れの穴になる。
+    const allPeers = (Array.from(this.peerManager.peers.values()) as IPeerConnection[])
+      .filter(p => p.isConnected && p.isVerified);
+
     const sorted = allPeers.map(p => ({
       id: p.peerId,
       dist: RingPosition.distance(topicPos, p.position)

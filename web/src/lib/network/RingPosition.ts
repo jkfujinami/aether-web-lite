@@ -1,25 +1,46 @@
-export class RingPosition {
-  private _value: number;
+import { NodeIdentity } from '../crypto/NodeIdentity';
 
-  constructor(value?: number) {
-    if (value !== undefined) {
-      if (value < 0.0 || value >= 1.0) {
-        throw new Error("RingPosition must be between [0.0, 1.0)");
-      }
-      this._value = value;
-    } else {
-      // 乱数から [0.0, 1.0) の位置を生成
-      const arr = new Uint32Array(1);
-      crypto.getRandomValues(arr);
-      this._value = arr[0] / 0xFFFFFFFF; // MAX Uint32
-      // 0xFFFFFFFF で割ると厳密には 1.0 になる可能性があるが
-      // 実際にはほぼ [0.0, 1.0) に収まる。厳密には / (0xFFFFFFFF + 1)
-      this._value = arr[0] / 4294967296.0; 
-    }
-  }
+/**
+ * RingPosition — リング座標。
+ *
+ * 旧実装は `crypto.getRandomValues` で座標を生成し localStorage に保存していた。
+ * つまり座標は「自己申告」であり、
+ *   - 狙った topicHash の隣に着地して K=5 の保持者になる
+ *   - 特定ノードを取り囲んで eclipse する
+ * が無コストで可能だった (本家 AETHER 18.5.3 の「★未解決だった重大欠陥」)。
+ *
+ * 現在は Bound Identity に置き換えてある:
+ *
+ *     position = SHA256("AETHER/v3/position" ‖ peerId)
+ *     peerId   = SHA256("AETHER/v3/peerid"   ‖ pubkey)[0..16]  (+ NodeId PoW)
+ *
+ * 座標は peerId の純粋関数なので、
+ *   - ネットワーク上で position を送る必要がない (送らせない)
+ *   - 受信側は相手の peerId から自分で計算する
+ * となり、「申告された座標」という攻撃面そのものが存在しなくなる。
+ *
+ * @see NodeIdentity
+ */
+export class RingPosition {
+  private constructor(private readonly _value: number) {}
 
   get value(): number {
     return this._value;
+  }
+
+  /**
+   * peerId からリング座標を導出する。
+   *
+   * ネットワークから受け取ったピアの座標は必ずこれで計算すること。
+   * 相手が名乗った数値をそのまま使ってはならない。
+   */
+  static forPeer(peerId: string): number {
+    return NodeIdentity.derivePosition(peerId);
+  }
+
+  /** peerId から RingPosition インスタンスを作る */
+  static of(peerId: string): RingPosition {
+    return new RingPosition(RingPosition.forPeer(peerId));
   }
 
   /**
@@ -31,25 +52,5 @@ export class RingPosition {
   static distance(a: number, b: number): number {
     const d = Math.abs(a - b);
     return Math.min(d, 1.0 - d);
-  }
-
-  /**
-   * localStorage から過去の位置を復元、なければ新規生成して保存する。
-   * これによりリロードしても同じ座標（隣人）を維持できる。
-   */
-  static async loadOrCreate(): Promise<RingPosition> {
-    const saved = localStorage.getItem('aether_position');
-    if (saved) {
-      try {
-        const val = parseFloat(saved);
-        console.log(`[RingPosition] Resumed from position: ${val.toFixed(6)}`);
-        return new RingPosition(val);
-      } catch (e) {}
-    }
-
-    const pos = new RingPosition();
-    localStorage.setItem('aether_position', pos.value.toString());
-    console.log(`[RingPosition] New position generated: ${pos.value.toFixed(6)}`);
-    return pos;
   }
 }

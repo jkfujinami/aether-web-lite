@@ -1,9 +1,9 @@
 import { encode, decode } from '@msgpack/msgpack';
-import sodium from 'libsodium-wrappers';
-import type { ICryptoEngine, IIdentity, IPoWEngine, IKeyManager } from '../types';
+import sodium from './sodium';
+import type { ICryptoEngine, IIdentity, IPoWEngine, IKeyManager, GossipPacket } from '../types';
 import { Identity } from './Identity';
-import { KeyManager } from './KeyManager';
 import { MagicFilter } from './MagicFilter';
+import { derivePacketId, toBytes, type PowCommittedHeader } from './PowPolicy';
 
 export class PacketBuilder {
   /**
@@ -26,15 +26,20 @@ export class PacketBuilder {
     dagParents: string[] = [],
     threadRoot: string = '',
     cumulativePow: number = 0
-  ) {
-    await sodium.ready; 
+  ): Promise<GossipPacket> {
+    await sodium.ready;
+
+    // タイムスタンプは PoW のコミット対象なので、探索の *前に* 一度だけ確定させる。
+    // 旧実装は Date.now() を署名層とパケットヘッダで別々に呼んでおり、
+    // PoW 計算に掛かった時間だけ両者がずれていた。
+    const now = Date.now();
 
     // Step 1: 署名層
     const signedDataObj: any = {
       content,
       post_number: postNumber,
       reply_to: replyTo,
-      created_at: Date.now(),
+      created_at: now,
       board_id: boardId,
       thread_id: threadId,
       // -- DAG fields --
@@ -64,24 +69,52 @@ export class PacketBuilder {
     // AEAD暗号化
     const { ciphertext, nonce } = cryptoEngine.encrypt(threadKey, encPayload);
 
-    // Step 3: PoW計算
-    const powNonce = await powEngine.compute(ciphertext, powDifficulty);
-
-    // Step 4: 外側パケット
-    const packetId = sodium.crypto_hash(ciphertext);
-
-    return {
-      packet_id: KeyManager.toHex(packetId.slice(0, 32)),
-      hop_count: 0,
-      pow_nonce: Number(powNonce),
-      pow_difficulty: powDifficulty,
-      timestamp: Date.now(),
+    // Step 3: PoW をヘッダ全体に対して計算する。
+    //
+    // 旧実装は ciphertext だけを PoW の対象にしていたため、傍受した
+    // パケットの timestamp を現在時刻に書き換えるだけで PoW を再計算せずに
+    // 再放流でき、SeenCache の TTL (15分) を越えて無限に増幅できた。
+    // timestamp / zone_id / pow_difficulty / nonce まで覆うことで、
+    // どれか 1 つでも書き換えれば PoW をやり直す必要が生じる。
+    const committed: PowCommittedHeader = {
+      timestamp: now,
       zone_id: keyManager.computeZoneId(
         keyManager.deriveTopicHash(threadKey),
         currentDepth,
       ),
-      nonce: Array.from(nonce),
-      payload: Array.from(ciphertext),
+      pow_difficulty: powDifficulty,
+      nonce,
+      payload: ciphertext,
+    };
+
+    const powNonce = await powEngine.compute(committed);
+
+    // Step 4: 外側パケット。
+    // packet_id はコミット済みヘッダのハッシュ (CHK) なので、受信側は鍵なしで
+    // 「このヘッダは改竄されていない」を検証できる。
+    return {
+      packet_id: derivePacketId(committed),
+      hop_count: 0,
+      pow_nonce: Number(powNonce),
+      pow_difficulty: committed.pow_difficulty,
+      timestamp: committed.timestamp,
+      zone_id: committed.zone_id,
+      nonce,
+      payload: ciphertext,
+    };
+  }
+
+  /**
+   * 受信パケットから PoW / packet_id がコミットしているフィールドだけを抜き出す。
+   * MsgPack や JSON を経由するとバイト列の表現が揺れるため、ここで正規化する。
+   */
+  static committedHeaderOf(packet: any): PowCommittedHeader {
+    return {
+      timestamp: packet?.timestamp,
+      zone_id: packet?.zone_id,
+      pow_difficulty: packet?.pow_difficulty,
+      nonce: toBytes(packet?.nonce),
+      payload: toBytes(packet?.payload),
     };
   }
 
@@ -93,8 +126,8 @@ export class PacketBuilder {
     threadKey: Uint8Array,
     cryptoEngine: ICryptoEngine
   ): Promise<any | null> {
-    const ciphertext = new Uint8Array(packet.payload);
-    const nonce = new Uint8Array(packet.nonce);
+    const ciphertext = toBytes(packet.payload);
+    const nonce = toBytes(packet.nonce);
 
     // 0. Broadcast Veil: 4バイト高速スクリーニング (~5ns)
     // 自分宛てでないパケットをフルAEAD復号の前に弾く
@@ -120,7 +153,7 @@ export class PacketBuilder {
     }
 
     if (!decPayloadBuf) {
-      console.warn(`[PacketBuilder] AEAD decryption failed (invalid key or tampered ciphertext) for packet ${packet.packet_id}`);
+      console.debug(`[PacketBuilder] AEAD decryption failed (not a target packet or invalid key) for packet ${packet.packet_id}`);
       return null;
     }
 

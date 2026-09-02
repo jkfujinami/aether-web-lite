@@ -1,4 +1,4 @@
-import sodium from 'libsodium-wrappers';
+import sodium from './sodium';
 
 export class MagicFilter {
   private static readonly MAGIC = 0x41455448; // "AETH" (Big Endian uint32)

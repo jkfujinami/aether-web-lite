@@ -85,9 +85,9 @@ Phase 2: Fluff（綿毛）— 通常のBroadcast Veil / Zone Gossip
 // DandelionRouter.ts
 
 export class DandelionRouter {
-  static readonly STEM_TTL_MIN = 2;
-  static readonly STEM_TTL_MAX = 4;
-  static readonly FLUFF_PROBABILITY = 0.1; // 各ホップで10%の確率でFluff移行
+  // ★ ホップカウンタ (stemTtl) は廃止。理由は §3.2 を参照。
+  //    経路長は幾何分布 (平均 1/p ホップ)。p=0.3 で平均 3.33 ホップ。
+  static readonly FLUFF_PROBABILITY = 0.3;
 
   /** Stem先ノードの決定 */
   private stemTarget: PeerId | null = null;
@@ -123,15 +123,11 @@ export class DandelionRouter {
     gossipPacket: GossipPacket,
     neighbors: PeerId[],
   ): { target: PeerId; packet: StemPacket } {
-    const stemTtl = DandelionRouter.STEM_TTL_MIN +
-      Math.floor(Math.random() * (DandelionRouter.STEM_TTL_MAX - DandelionRouter.STEM_TTL_MIN + 1));
-
     return {
       target: this.getStemTarget(neighbors),
       packet: {
         type: 'stem',
         zoneId: gossipPacket.zone_id,
-        stemTtl,
         packet: gossipPacket,
       },
     };
@@ -146,18 +142,18 @@ export class DandelionRouter {
   ): { action: 'forward'; target: PeerId; packet: StemPacket }
    | { action: 'fluff'; packet: GossipPacket } {
 
-    // Fluff判定: stemTtl=0 または 確率的にFluff移行
-    if (stem.stemTtl <= 0 || Math.random() < DandelionRouter.FLUFF_PROBABILITY) {
+    // Fluff判定: 各ホップ独立の確率のみ (カウンタは持たない)
+    if (Math.random() < DandelionRouter.FLUFF_PROBABILITY || neighbors.length === 0) {
       // Fluff移行: hop_count=0をセットしてZone Gossip開始
       const fluffPacket = { ...stem.packet, hop_count: 0 };
       return { action: 'fluff', packet: fluffPacket };
     }
 
-    // Stem続行: TTLを減らして次の1人に転送
+    // Stem続行: 次の1人にそのまま転送 (パケットは一切書き換えない)
     return {
       action: 'forward',
       target: this.getStemTarget(neighbors),
-      packet: { ...stem, stemTtl: stem.stemTtl - 1 },
+      packet: stem,
     };
   }
 }
@@ -171,9 +167,9 @@ Adaptive Zone 環境では、Dandelion++に追加の仕組みが必要:
   作者Aが Zone 42 に書き込む場合:
   A自身は Zone 42 を購読していなくてもOK。
 
-  1. A: Stemパケットを作成 { zone_id: 42, stem_ttl: 3 }
+  1. A: Stemパケットを作成 { zone_id: 42 }
   2. A: 自分の隣人（ゾーン関係なし）の中から Stem先を1人選んで送信
-  3. B,C: Stem転送（zone_idを見る必要はない、stem_ttlを減らすだけ）
+  3. B,C: Stem転送（zone_idを見る必要はない、そのまま1人へ渡すだけ）
   4. D: Fluff判定 → Fluff移行
 
   Fluff移行時の処理:
@@ -256,12 +252,44 @@ Stemパケットと通常パケットの区別:
 
 しかし、Stemパケットの暗号化済みpayloadは
 通常パケットと同一構造。
-stem_flagとstem_ttlだけがStem固有の情報。
+WireType が STEM であることだけが Stem 固有の情報 (§3.3 でカウンタは撤去済み)。
 
 攻撃者が「Stemを受け取った瞬間にfluffして追跡」する攻撃:
   → Stemを自分でFluffに変換すると
     攻撃者自身がFluff発信元になってしまう
-  → stem_ttlが分からないため、どこで始まったか不明
+```
+
+### 3.3 ★ ホップカウンタ (stem_ttl) を持たない理由
+
+```
+🔴 かつて stem_ttl を平文でワイヤに載せていたが、これ自体が
+   「経路上の位置」を漏らす致命的な情報源だった。
+
+  初期TTLを [2,4] から乱択し、中継ごとに 1 減らす設計だと:
+
+    発信元が送出しうる値 : {2, 3, 4}
+    中継者が送出しうる値 : {0, 1, 2, 3}   (受信値 - 1、上限4)
+
+  → stem_ttl = 4 を受け取ったら、送信者は発信元だと 100% 確定する。
+    (中継者は 4 を送出できないため)
+    発信元は 1/3 の確率で 1 ホップ目にこれを晒していた。
+    低い値も「中継者確定」を意味し、全域で事後確率が偏る。
+
+  初期TTLの乱択は「自分が何番目か」を隠す意図だったが、
+  上限値だけは発信元にしか出せないため確定オラクルになっていた。
+
+対策: カウンタを完全に廃止し、各ホップで独立に確率 p で Fluff へ移行する。
+  経路長は幾何分布に従い**無記憶**なので、中継者は自分が何ホップ目かを
+  推定する材料を一切持たない。
+  本家 Dandelion++ がカウンタではなく確率を使っているのはこの理由による。
+
+停止性:
+  平均 1/p ホップ (p=0.3 で 3.33)、50ホップ到達確率は 0.7^50 ≈ 2e-8。
+  加えて PoW ヘッダの timestamp が MAX_TIME_DRIFT (15分) を超えると
+  PacketValidator が落とすため、病的な循環も必ず止まる。
+
+転送先が居ない場合 (隣人が送り主だけ) は確定で Fluff に落とす。
+ここを落とすと転送が宛先無しで消え、パケットが黙って失われる。
 ```
 
 ---
@@ -270,7 +298,7 @@ stem_flagとstem_ttlだけがStem固有の情報。
 
 ### 4.1 攻撃者支配率 vs 送信者特定率
 
-| 攻撃者支配率 | Dandelion OFF | Dandelion++ ON (stem_ttl=3) |
+| 攻撃者支配率 | Dandelion OFF | Dandelion++ ON (平均3.3ホップ) |
 |:---:|:---:|:---:|
 | 10% | 47% 特定 | **3.3%** 特定 |
 | 30% | 88% 特定 | **9.9%** 特定 |
@@ -288,10 +316,10 @@ Dandelion OFF:
   1 - (1-p)^6 (p = 攻撃者割合)
   p=0.1 → 1-0.9^6 = 0.47 (47%)
 
-Dandelion++ ON (stem_ttl=3):
-  Stem経路の全3ホップが攻撃者 → 特定
-  p^3
-  p=0.1 → 0.1^3 = 0.001 (0.1%)
+Dandelion++ ON (平均3.3ホップ / FLUFF_PROBABILITY=0.3):
+  Stem経路の全ホップが攻撃者 → 特定
+  経路長は幾何分布なので、期待値はホップ数で重み付けした Σ P(len=k)·p^k
+  p=0.1, 平均3.3ホップ → 概ね 0.1^3 相当 = 0.001 (0.1%)
   + エポック固定の影響で若干上昇 → 約3.3%
 ```
 
@@ -299,7 +327,7 @@ Dandelion++ ON (stem_ttl=3):
 
 ```
 Stemの追加遅延:
-  stem_ttl × RTT ≈ 3ホップ × 40ms = +120ms
+  平均ホップ数(1/p) × RTT ≈ 3.3ホップ × 40ms ≈ +133ms
 
 合計:
   通常のZone Gossip到達時間: ~300ms
@@ -434,8 +462,8 @@ Stemパケットを1本ではなく2本の独立経路で同時に送信:
 interface StemPacket {
   type: 'stem';
   zoneId: number;          // 宛先ゾーンID
-  stemTtl: number;         // 残りStemホップ数 (0になったらFluff)
   packet: GossipPacket;    // 暗号化済みペイロード（通常パケットと同一構造）
+  // ★ ホップカウンタは持たない (§3.3)。停止は確率判定が担う。
 }
 ```
 
@@ -444,10 +472,10 @@ interface StemPacket {
 ```
 Stemパケット受信時:
 
-  1. stem_ttl チェック
-     └→ stem_ttl > 0 && random() >= FLUFF_PROBABILITY:
-         → stem_ttl-- して Stem先（エポック固定）に転送
-     └→ stem_ttl <= 0 || random() < FLUFF_PROBABILITY:
+  1. Fluff判定 (各ホップ独立、カウンタは見ない)
+     └→ random() >= FLUFF_PROBABILITY && 転送先が居る:
+         → パケットを書き換えずに Stem先（エポック固定）へ転送
+     └→ random() < FLUFF_PROBABILITY || 転送先が居ない:
          → Fluff移行
 
   2. Fluff移行処理:
@@ -489,14 +517,12 @@ Stemフェーズの追加帯域:
 
 ```typescript
 export const DANDELION = {
-  /** Stem/Fluffの切り替え確率（各ホップで） */
-  FLUFF_PROBABILITY: 0.1,
-
-  /** Stem TTL の最小値 */
-  STEM_TTL_MIN: 2,
-
-  /** Stem TTL の最大値 */
-  STEM_TTL_MAX: 4,
+  /**
+   * Stem/Fluffの切り替え確率（各ホップで）
+   * 経路長 = 幾何分布 (平均 1/p ホップ)。p=0.3 で平均 3.33 ホップ。
+   * ★ Rust側 (aether-cache) の FLUFF_PROBABILITY と必ず一致させること。
+   */
+  FLUFF_PROBABILITY: 0.3,
 
   /** Stemターゲットのエポック長 (ms) */
   EPOCH_DURATION: 10 * 60 * 1000, // 10分

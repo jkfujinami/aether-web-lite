@@ -10,6 +10,7 @@ pub enum WireType {
     RingInfo = 0x11,
     Ping = 0x12,
     Pong = 0x13,
+    Hello = 0x17,
     
     // PEX (0x2x)
     PexRequest = 0x20,
@@ -38,6 +39,7 @@ impl From<u8> for WireType {
             0x11 => WireType::RingInfo,
             0x12 => WireType::Ping,
             0x13 => WireType::Pong,
+            0x17 => WireType::Hello,
             0x20 => WireType::PexRequest,
             0x21 => WireType::PexResponse,
             0x30 => WireType::SdpRelay,
@@ -58,6 +60,7 @@ impl WireCodec {
     /// V2: 1-byte header (WireType) + MsgPack payload
     pub fn encode_v2(msg: &P2PMessage) -> Result<Vec<u8>> {
         let wire_type = match msg {
+            P2PMessage::Hello { .. } => WireType::Hello,
             P2PMessage::Join { .. } => WireType::Join,
             P2PMessage::Ping { .. } => WireType::Ping,
             P2PMessage::Pong { .. } => WireType::Pong,

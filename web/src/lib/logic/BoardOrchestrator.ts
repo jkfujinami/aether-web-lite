@@ -17,9 +17,17 @@ import { BOARD_META_THREAD_ID, BoardStatus } from './types';
  * 管理対象の「板」のスレッド一覧の取得、同期、投稿、およびメモリ保持を統括する。
  */
 export class BoardOrchestrator {
-  private listeners: Set<(threads: ThreadMeta[]) => void> = new Set();
-  private statusListeners: Set<(status: BoardStatus) => void> = new Set();
+  private listeners: Set<() => void> = new Set();
+  private statusListeners: Set<() => void> = new Set();
   private threads: Map<string, ThreadMeta> = new Map();
+  /**
+   * useSyncExternalStore に渡すスナップショット。
+   *
+   * getSnapshot は「データが変わらない限り同じ参照」を返さなければならない
+   * (返さないと React が無限ループを検出して例外を投げる)。
+   * よって notify() のタイミングでだけ作り直し、それ以外では使い回す。
+   */
+  private snapshot: ThreadMeta[] = [];
   private seenPacketIds: Set<string> = new Set();
   private currentStatus: BoardStatus = { phase: 'idle', message: '' };
   private statsTimer: any = null;
@@ -27,6 +35,9 @@ export class BoardOrchestrator {
   private currentBoardId: string | null = null;
   private currentBoardKey: Uint8Array | null = null;
   private isListening: boolean = false;
+  /** 実行中の fullSync。多重起動を防ぐ */
+  private syncInFlight: Promise<void> | null = null;
+  private syncDebounce: any = null;
 
 
 
@@ -44,32 +55,49 @@ export class BoardOrchestrator {
   ) {}
 
 
-  public subscribe(listener: (threads: ThreadMeta[]) => void) {
+  /**
+   * 変更通知を購読する。
+   *
+   * useSyncExternalStore の subscribe としてそのまま渡せるよう、
+   * 「購読解除関数を返すだけ」に徹する。以前はここで即座に listener を
+   * 呼んでいたが、それは useSyncExternalStore の契約に反する
+   * (初期値は getSnapshot が返す)。
+   */
+  public subscribe(listener: () => void): () => void {
     this.listeners.add(listener);
-    listener(this.getThreads());
-    return () => this.listeners.delete(listener);
+    return () => { this.listeners.delete(listener); };
   }
 
-  public subscribeStatus(listener: (status: BoardStatus) => void) {
+  public subscribeStatus(listener: () => void): () => void {
     this.statusListeners.add(listener);
-    listener(this.currentStatus);
-    return () => this.statusListeners.delete(listener);
+    return () => { this.statusListeners.delete(listener); };
   }
 
+  /** useSyncExternalStore の getSnapshot。キャッシュ済みの参照を返す。 */
   public getThreads(): ThreadMeta[] {
-    return Array.from(this.threads.values());
+    return this.snapshot;
+  }
+
+  public getStatus(): BoardStatus {
+    return this.currentStatus;
   }
 
   private updateStatus(phase: BoardStatus['phase'], message: string, isSubmitting: boolean = false, powProgress: number = 0) {
     this.currentStatus = { phase, message, isSubmitting, powProgress };
-    this.statusListeners.forEach(l => l(this.currentStatus));
+    this.statusListeners.forEach(l => l());
   }
 
 
 
+  /**
+   * スナップショットを作り直してから購読者に「変わった」と伝える。
+   *
+   * 参照が必ず変わるので、React は確実に再描画する。
+   */
   private notify() {
-    const list = this.getThreads();
-    this.listeners.forEach(l => l(list));
+    this.snapshot = Array.from(this.threads.values());
+    console.log(`[TRACE:6-notify] BoardOrchestrator snapshot rebuilt: ${this.snapshot.length} threads, notifying ${this.listeners.size} listener(s)`);
+    this.listeners.forEach(l => l());
   }
 
   // --- 以降、将来のステップでロジックを順次移植する ---
@@ -78,22 +106,28 @@ export class BoardOrchestrator {
    * パケット（JSONオブジェクト）を処理し、板の状態を更新する
    */
   public async handlePacketObject(boardId: string, boardKey: Uint8Array, packet: any, isFromDB: boolean, rawData?: Uint8Array) {
-    if (this.seenPacketIds.has(packet.packet_id)) return;
+    console.log(`[TRACE:4-handlePacketObject] enter packet_id=${packet?.packet_id?.substring(0, 8)} isFromDB=${isFromDB}`);
+    if (this.seenPacketIds.has(packet.packet_id)) {
+      console.log(`[TRACE:4-handlePacketObject] DROPPED already in seenPacketIds packet_id=${packet.packet_id.substring(0, 8)}`);
+      return;
+    }
     this.seenPacketIds.add(packet.packet_id);
     try {
       const meta = await PacketBuilder.verifyAndDecrypt(packet, boardKey, this.cryptoEng);
       if (!meta) {
-        console.warn(`[BoardOrchestrator] Packet ${packet.packet_id} decrypted to null (failed quickCheck, AEAD, or signature)`);
+        console.debug(`[TRACE:4-handlePacketObject] DROPPED decrypted to null (failed quickCheck, AEAD, or signature) packet_id=${packet.packet_id}`);
         return;
       }
       if (meta.post_type !== 1) {
-        console.warn(`[BoardOrchestrator] Packet ${packet.packet_id} skipped: post_type is not 1 (thread meta) but ${meta.post_type}`);
+        console.debug(`[TRACE:4-handlePacketObject] DROPPED post_type is not 1 (thread meta) but ${meta.post_type} packet_id=${packet.packet_id}`);
         return;
       }
 
       const created_at = this.normalizeTimestamp(meta.created_at);
       const max_pow = await this.resolveMaxPow(boardId, meta);
-      if (this.mergeThread(meta, packet.packet_id, max_pow, created_at)) this.notify();
+      const changed = this.mergeThread(meta, packet.packet_id, max_pow, created_at);
+      console.log(`[TRACE:5-mergeThread] thread_id=${meta.thread_id.substring(0, 8)} changed=${changed} totalThreads=${this.threads.size}`);
+      if (changed) this.notify();
       if (!isFromDB) await this.persistThread(boardId, packet, meta, rawData);
     } catch (e: any) {
       console.error(`[BoardOrchestrator] Error processing packet ${packet?.packet_id}:`, e);
@@ -150,7 +184,17 @@ export class BoardOrchestrator {
   /**
    * 板全体の過去ログをネットワークから取得する
    */
-  public async fullSync(boardId: string, boardKey: Uint8Array) {
+  public async fullSync(boardId: string, boardKey: Uint8Array): Promise<void> {
+    // 同時に複数の fullSync が走ると DHT fetch のタイムアウト (4秒) が
+    // そのぶん重なり、UI が「同期中」から抜けられなくなる。
+    if (this.syncInFlight) return this.syncInFlight;
+    this.syncInFlight = this.runFullSync(boardId, boardKey).finally(() => {
+      this.syncInFlight = null;
+    });
+    return this.syncInFlight;
+  }
+
+  private async runFullSync(boardId: string, boardKey: Uint8Array): Promise<void> {
     if (!this.pm || !this.mailbox) return;
 
     try {
@@ -239,17 +283,28 @@ export class BoardOrchestrator {
   private onGossipPacket = async (packet: any) => {
     if (this.currentBoardId && this.currentBoardKey) {
       await this.handlePacketObject(this.currentBoardId, this.currentBoardKey, packet, false);
+    } else {
+      console.log(`[TRACE:3.5-onGossipPacket] DROPPED not activated (currentBoardId=${this.currentBoardId}) packet_id=${packet?.packet_id?.substring(0, 8)}`);
     }
   };
 
   /**
    * ハンドラ: 新しい隣人と繋がったとき
    */
+  /**
+   * 隣人が増えたら再同期する。ただし接続は一気に何本も張られるので、
+   * そのたびに fullSync を投げると DHT fetch (最大4秒) が何本も重なる。
+   * デバウンスして 1 本に畳む。
+   */
   private onPeerConnect = () => {
-    if (this.currentBoardId && this.currentBoardKey) {
-      // 隣人が増えたので再同期を試みる
-      this.fullSync(this.currentBoardId, this.currentBoardKey);
-    }
+    if (!this.currentBoardId || !this.currentBoardKey) return;
+    if (this.syncDebounce) clearTimeout(this.syncDebounce);
+    this.syncDebounce = setTimeout(() => {
+      this.syncDebounce = null;
+      if (this.currentBoardId && this.currentBoardKey) {
+        this.fullSync(this.currentBoardId, this.currentBoardKey);
+      }
+    }, 500);
   };
 
   /**
@@ -308,8 +363,10 @@ export class BoardOrchestrator {
     try {
       const threadId = Math.random().toString(36).substring(2, 12);
       const threadKey = KeyManager.deriveThreadKey(boardKey, threadId);
-      const threadTopicHash = KeyManager.deriveTopicHash(threadKey);
-      const currentZoneId = KeyManager.computeZoneId(threadTopicHash, this.zm.depth);
+      
+      // 🌟 板のメタデータ（スレッド作成通知）なので、スレッドのゾーンではなく「板のゾーン」にブロードキャストする
+      const boardTopicHash = KeyManager.cryptoHash(boardKey);
+      const boardZoneId = KeyManager.computeZoneId(boardTopicHash, this.zm.depth);
 
       const timestamps = await this.db.getRecentTimestamps(DifficultyEstimator.WINDOW);
       const powDifficulty = DifficultyEstimator.compute(timestamps);
@@ -317,13 +374,11 @@ export class BoardOrchestrator {
       const packet = await PacketBuilder.build(
         title, boardKey, this.identity, this.cryptoEng,
         this.powEng, this.keyMgr, boardId, threadId,
-        0, null, powDifficulty, currentZoneId, 1,
+        0, null, powDifficulty, boardZoneId, 1,
         [], threadId, powDifficulty
       );
 
       this.updateStatus('submitting', '拡散中...', true, 100);
-
-      await this.router.broadcast(packet);
 
       const boardB64TopicHash = KeyManager.toHex(KeyManager.cryptoHash(boardKey));
       const rawPacketData = new TextEncoder().encode(JSON.stringify(packet, (_k, v) => {
@@ -331,10 +386,25 @@ export class BoardOrchestrator {
           return v;
       }));
 
-      // 背景での送信処理
-      this.mailbox.publish(boardB64TopicHash, rawPacketData).catch((e: any) => console.error(e));
-
+      // ★ 先に自分の画面へ反映する。
+      //
+      //   以前は `await this.router.broadcast(packet)` としていたが、
+      //   broadcast は Dandelion++ のエコー確認を待つため
+      //   ECHO_TIMEOUT(5秒) × (MAX_RETRIES+1 = 3回) = 最大 15 秒ブロックする。
+      //   その間 isSubmitting が立ちっぱなしになり、立てたスレッドが
+      //   画面に出ないまま固まって見えた。
+      //   ThreadOrchestrator.submitReply は元から非同期送信だったので、
+      //   スレ立てだけが取り残されていた。
       const savedAt = Date.now();
+      this.mergeThread(
+        { thread_id: threadId, board_id: boardId, content: title, post_type: 1, created_at: savedAt },
+        packet.packet_id,
+        powDifficulty,
+        savedAt
+      );
+      this.seenPacketIds.add(packet.packet_id);
+      this.notify();
+
       await this.db.save({
         boardId: boardId,
         threadId: BOARD_META_THREAD_ID,
@@ -347,16 +417,13 @@ export class BoardOrchestrator {
         }
       }).catch(() => {});
 
-      // Immediately reflect the new thread in local state rather than waiting
-      // for the gossip loopback to come back through verifyAndDecrypt.
-      this.mergeThread(
-        { thread_id: threadId, board_id: boardId, content: title, post_type: 1, created_at: savedAt },
-        packet.packet_id,
-        powDifficulty,
-        savedAt
-      );
-      this.seenPacketIds.add(packet.packet_id);
-      this.notify();
+      // ── ここから先はネットワークへの送出。UI を待たせない。 ──
+      this.router.broadcast(packet).catch((err: any) => {
+        console.error('[BoardOrchestrator] Gossip broadcast failed:', err);
+      });
+      this.mailbox.publish(boardB64TopicHash, rawPacketData).catch((e: any) => {
+        console.warn('[BoardOrchestrator] Mailbox publish failed:', e);
+      });
 
       this.updateStatus('idle', '', false, 0);
       return threadId;
@@ -373,6 +440,10 @@ export class BoardOrchestrator {
    */
   public clear() {
     this.stopStatsSync();
+    if (this.syncDebounce) {
+      clearTimeout(this.syncDebounce);
+      this.syncDebounce = null;
+    }
 
     if (this.isListening) {
       this.router.offMessage(this.onGossipPacket);

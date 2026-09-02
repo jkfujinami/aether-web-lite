@@ -260,7 +260,7 @@ Zone-aware リンクの選択基準:
 作者AがZone 42に書き込む場合:
 
 1. A自身はZone 42を購読していなくてもOK
-2. Stemパケットを作成: { zone_id: 42, stem_ttl: 3, payload: encrypted }
+2. Stemパケットを作成: { zone_id: 42, payload: encrypted }  // stem_ttl は廃止 (step5 §3.3)
 3. ランダムな隣人にStem転送（ゾーン無関係に1人だけ）
 4. Stem ホップ × 3-4回
 5. Fluff判定を引き当てたノードFが:

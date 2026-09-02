@@ -20,6 +20,8 @@ export default function ThreadView({
 
   const [replyInput, setReplyInput] = useState('');
 
+  console.log(`[TRACE:10-render] ThreadView render: ${posts.length} posts`);
+
   const formatContent = (content: string) => {
     // 従来の置き換えロジック: sanitize してから >>1 などを着色
     // React では dangerouslySetInnerHTML を使う必要がある点に注意

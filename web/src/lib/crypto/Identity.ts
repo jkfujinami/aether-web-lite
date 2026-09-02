@@ -1,5 +1,15 @@
-import sodium from 'libsodium-wrappers';
+import sodium from './sodium';
 import type { IIdentity, SignatureResult } from '../types';
+import { SecretVault, VAULT_PARAMS, type VaultParams } from '../storage/SecretVault';
+
+/** トリップ鍵を保存できる最小のインターフェース */
+export interface SealedStore {
+  getSealed(slot: string): Promise<{ sealed: any; meta?: any } | undefined>;
+  saveSealed(slot: string, sealed: any, meta?: any): Promise<void>;
+  deleteSealed(slot: string): Promise<void>;
+}
+
+const TRIP_SLOT = 'trip';
 
 export class Identity implements IIdentity {
   /** セッションID（毎タブ一時的） */
@@ -13,38 +23,70 @@ export class Identity implements IIdentity {
   }
 
   /**
-   * トリップの初期化（IndexedDBから読み込み）
-   * なければ名無しモード（tripKeyPair = null）のまま継続
+   * トリップの初期化（IndexedDB から封印を読み出して解く）
+   * なければ／解けなければ名無しモード（tripKeyPair = null）のまま継続。
+   *
+   * @param passphrase 封印時に使ったパスフレーズ。未設定なら空文字。
+   * @returns 復元できたか
    */
-  public async initTrip(store: any): Promise<void> {
-    const stored = await store.getTrip();
-    if (stored) {
-      console.log(`[Identity] Recovered persistent trip identity.`);
-      this.tripKeyPair = {
-        publicKey: stored.publicKey,
-        privateKey: stored.privateKey,
-        keyType: 'ed25519'
-      };
+  public async initTrip(store: SealedStore, passphrase: string = ''): Promise<boolean> {
+    const record = await store.getSealed(TRIP_SLOT);
+    if (!record) return false;
+
+    const secret = SecretVault.open(record.sealed, passphrase);
+    if (!secret) {
+      // パスフレーズ違いか改竄。どちらであるかは区別しない。
+      console.warn(`[Identity] Could not unseal trip identity (wrong passphrase or tampered).`);
+      return false;
     }
+
+    this.tripKeyPair = {
+      publicKey: secret.slice(sodium.crypto_sign_SECRETKEYBYTES),
+      privateKey: secret.slice(0, sodium.crypto_sign_SECRETKEYBYTES),
+      keyType: 'ed25519',
+    };
+    console.log(`[Identity] Recovered persistent trip identity.`);
+    return true;
   }
 
   /**
-   * トリップを新規生成して永続化する
+   * トリップを新規生成して封印・永続化する。
+   *
+   * 旧実装は秘密鍵を平文で IndexedDB に書いていた。押収されれば
+   * 過去の全投稿がこのトリップで紐付く。
    */
-  public async generateTrip(store: any): Promise<string> {
+  public async generateTrip(
+    store: SealedStore,
+    passphrase: string = '',
+    params: VaultParams = VAULT_PARAMS,
+  ): Promise<string> {
     this.tripKeyPair = sodium.crypto_sign_keypair();
-    await store.saveTrip(this.tripKeyPair.publicKey, this.tripKeyPair.privateKey);
-    console.log(`[Identity] Generated and saved new trip identity.`);
+
+    const secret = new Uint8Array(
+      sodium.crypto_sign_SECRETKEYBYTES + sodium.crypto_sign_PUBLICKEYBYTES,
+    );
+    secret.set(this.tripKeyPair.privateKey, 0);
+    secret.set(this.tripKeyPair.publicKey, sodium.crypto_sign_SECRETKEYBYTES);
+
+    await store.saveSealed(TRIP_SLOT, SecretVault.seal(secret, passphrase, params));
+    console.log(
+      `[Identity] Generated and sealed new trip identity (passphrase-protected: ${passphrase.length > 0}).`,
+    );
     return this.tripDisplay;
   }
 
   /**
    * トリップを破棄する
    */
-  public async deleteTrip(store: any): Promise<void> {
+  public async deleteTrip(store: SealedStore): Promise<void> {
     this.tripKeyPair = null;
-    await store.deleteTrip();
+    await store.deleteSealed(TRIP_SLOT);
     console.log(`[Identity] Deleted trip identity.`);
+  }
+
+  /** トリップが設定されているか */
+  public get hasTrip(): boolean {
+    return this.tripKeyPair !== null;
   }
 
   /**

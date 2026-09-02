@@ -1,10 +1,11 @@
 import type { IPeerConnection, PeerId } from '../types';
+import { RingPosition } from './RingPosition';
+import { ChunkedSender } from './stream/ChunkedSender';
+import { ChunkedReceiver } from './stream/ChunkedReceiver';
 
 interface WebRTCPeerOptions {
   localId: string;
   remoteId: string;
-  position: number;
-  zones: number[];
   initiator: boolean;
   onSignal: (payload: any) => void;
   onConnect: () => void;
@@ -15,14 +16,22 @@ interface WebRTCPeerOptions {
 export class WebRTCPeer implements IPeerConnection {
   private pc: RTCPeerConnection;
   private channel?: RTCDataChannel;
-  
+  private chunkedSender = new ChunkedSender();
+  private chunkedReceiver: ChunkedReceiver;
+
   public readonly peerId: PeerId;
-  public position: number;
-  public zones: Set<number>;
+  /**
+   * リング座標。peerId から導出した値であって、相手の申告ではない。
+   * 書き換え可能な public フィールドではなく readonly にしてある。
+   */
+  public readonly position: number;
   public rtt: number = 0;
 
   private _connected = false;
-  private _connecting = true; // 新規追加: 接続試行中フラグ
+  private _connecting = true;
+  private _verified = false;
+  /** 相手に送ったチャレンジ。JOIN の署名検証に使う */
+  private _challenge: Uint8Array | null = null;
   private opts: WebRTCPeerOptions;
 
   public get isConnected(): boolean {
@@ -33,11 +42,24 @@ export class WebRTCPeer implements IPeerConnection {
     return this._connecting;
   }
 
+  /** HELLO/JOIN のハンドシェイクで Bound Identity を検証済みか */
+  public get isVerified(): boolean {
+    return this._verified;
+  }
+
+  public get challenge(): Uint8Array | null {
+    return this._challenge;
+  }
+
   constructor(opts: WebRTCPeerOptions) {
     this.opts = opts;
     this.peerId = opts.remoteId;
-    this.position = opts.position;
-    this.zones = new Set(opts.zones);
+    // 座標は peerId の純粋関数。相手からもらった数値は一切使わない。
+    this.position = RingPosition.forPeer(opts.remoteId);
+
+    this.chunkedReceiver = new ChunkedReceiver((assembled) => {
+      this.opts.onData(new Uint8Array(assembled));
+    });
 
     const iceServers = [
       { urls: 'stun:stun.l.google.com:19302' },
@@ -105,7 +127,7 @@ export class WebRTCPeer implements IPeerConnection {
 
     channel.onmessage = (event) => {
       if (event.data instanceof ArrayBuffer) {
-        this.opts.onData(new Uint8Array(event.data));
+        this.chunkedReceiver.receive(event.data);
       } else {
         this.opts.onData(event.data);
       }
@@ -165,32 +187,32 @@ export class WebRTCPeer implements IPeerConnection {
   }
 
   public send(msg: Uint8Array | string): void {
-    if (this.channel && this.channel.readyState === 'open') {
-      try {
-        if (typeof msg === 'string') {
-          this.channel.send(msg);
-        } else {
-          // DOM typed definitions require ArrayBuffer or strict ArrayBufferView.
-          // Type cast 'any' protects against SharedArrayBuffer mismatch in TS config.
-          this.channel.send(msg as any);
-        }
-      } catch (e) {
-        console.error(`[WebRTCPeer] Send failed`, e);
-      }
+    if (!this.channel || this.channel.readyState !== 'open') return;
+    if (typeof msg === 'string') {
+      this.channel.send(msg);
+      return;
     }
+    // Use ChunkedSender: messages <= 4KB go through in one send(),
+    // larger messages (e.g. DHT sync responses) are split into 4KB chunks.
+    this.chunkedSender.send(this.channel, msg).catch((e) => {
+      console.error(`[WebRTCPeer] ChunkedSend failed`, e);
+    });
   }
 
-  public updatePosition(pos: number) {
-    this.position = pos;
+  /** 送出したチャレンジを記録する (HELLO 送信時) */
+  public setChallenge(challenge: Uint8Array) {
+    this._challenge = challenge;
   }
 
-  public updateZones(zones: number[]) {
-    this.zones = new Set(zones);
+  /** Bound Identity の検証に成功した印を付ける */
+  public markVerified() {
+    this._verified = true;
   }
 
   public close(): void {
     this._connected = false;
     this._connecting = false;
+    this.chunkedReceiver.destroy();
     if (this.channel) this.channel.close();
     this.pc.close();
   }

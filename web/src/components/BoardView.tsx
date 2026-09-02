@@ -1,7 +1,8 @@
 "use client";
 
 import { use, useState } from "react";
-import { useBoard, ThreadMeta } from "@/hooks/useBoard";
+import { useBoard } from "@/hooks/useBoard";
+import type { ThreadMeta } from "@/lib/logic/types";
 
 import { ThreadRanker } from "@/lib/logic/ThreadRanker";
 
@@ -15,6 +16,8 @@ export default function BoardView({
   const { threads, status, submitThread, powProgress, isSubmitting, boardKeyBase64: loadedKey } = useBoard(boardId);
   const [showForm, setShowForm] = useState(false);
   const [titleInput, setTitleInput] = useState('');
+
+  console.log(`[TRACE:10-render] BoardView render: ${threads.length} threads`);
 
   const currentKey = loadedKey || boardKeyBase64;
 

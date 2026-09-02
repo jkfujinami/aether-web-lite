@@ -1,4 +1,4 @@
-import sodium from 'libsodium-wrappers';
+import sodium from './sodium';
 import { Encoding } from '../common/Encoding';
 import { CryptoUtils } from '../common/CryptoUtils';
 

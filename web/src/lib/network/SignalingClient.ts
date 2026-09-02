@@ -1,7 +1,8 @@
 import { TRACKER } from '../constants';
-import type { PeerId, SignalingMessage, ISignalingClient } from '../types';
+import type { PeerId, SignalingMessage, ISignalingClient, WireNodeClaim } from '../types';
+import { Encoding } from '../common/Encoding';
 
-type PeersCallback = (peers: Array<{ peerId: PeerId; position: number; zones: number[] }>) => void;
+type PeersCallback = (peers: Array<{ peerId: PeerId }>) => void;
 type RelayCallback = (senderId: PeerId, payload: any) => void;
 
 export class SignalingClient implements ISignalingClient {
@@ -21,19 +22,21 @@ export class SignalingClient implements ISignalingClient {
     console.log(`[SignalingClient] Tracker URL configured as: ${this.url}`);
   }
 
-  public async connect(options: { peerId: PeerId; position: number; zones: number[]; turnstileToken?: string }): Promise<void> {
+  public async connect(options: { claim: WireNodeClaim; turnstileToken?: string }): Promise<void> {
     return new Promise((resolve, reject) => {
       console.log(`[SignalingClient] Connecting to tracker: ${this.url}`);
       this.ws = new WebSocket(this.url);
 
       this.ws.onopen = () => {
         console.log(`[SignalingClient] Connected to tracker`);
-        // 接続直後に Join メッセージで自身を登録
+        // 接続直後に Join メッセージで自身を登録。
+        // position と zones は送らない (前者は peerId から導出可能、
+        // 後者は購読宣言そのものでトラッカーに興味を晒すことになる)。
         const joinMsg: SignalingMessage = {
           type: 'join',
-          peerId: options.peerId,
-          position: options.position,
-          zones: options.zones,
+          peerId: options.claim.peerId,
+          pubkey: Encoding.toHex(options.claim.pubkey),
+          powCounter: options.claim.powCounter,
           turnstileToken: options.turnstileToken,
         };
         this.send(joinMsg);
@@ -43,10 +46,13 @@ export class SignalingClient implements ISignalingClient {
       this.ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data) as SignalingMessage | any;
-          console.log(`[SignalingClient] <<< Message from tracker: type=${data.type}`, data);
+          console.log(`[SignalingClient] <<< Message from tracker: type=${data.type}`);
 
           if (data.type === 'peers') {
-            if (this.onPeersCb) this.onPeersCb(data.peers);
+            const peers = Array.isArray(data.peers)
+              ? data.peers.filter((p: any) => typeof p?.peerId === 'string').map((p: any) => ({ peerId: p.peerId }))
+              : [];
+            if (this.onPeersCb) this.onPeersCb(peers);
           } else if (data.type === 'relay') {
             // トラッカー経由のリレーメッセージ (Unwrap)
             const senderId = data.senderId || data.sender_id;

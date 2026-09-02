@@ -1,4 +1,4 @@
-import sodium from 'libsodium-wrappers';
+import sodium from './sodium';
 import type { ICryptoEngine, EncryptedPayload } from '../types';
 
 export class CryptoEngine implements ICryptoEngine {

@@ -1,11 +1,38 @@
+import type { PowCommittedHeader } from './crypto/PowPolicy';
+
 export type PeerId = string;
+
+/**
+ * トラッカーに提示する Bound Identity の主張。
+ *
+ * position と zones は載せない:
+ *   - position は peerId の純粋関数なので受け取る側が自分で計算する
+ *     (申告させると詐称の余地が生まれる → Eclipse)
+ *   - zones (購読ゾーン) を申告すると、そのピアが何に興味を持っているかが
+ *     トラッカーと全隣人に漏れ、交差攻撃の材料になる (本家 18.6.2)
+ */
+export interface WireNodeClaim {
+  peerId: PeerId;
+  /** Ed25519 公開鍵 (32 バイト) */
+  pubkey: Uint8Array;
+  /** NodeId PoW の解 */
+  powCounter: number;
+}
 
 // -- Signaling Serverとの通信用メッセージ --
 export type SignalingMessage =
-  | { type: 'join'; peerId: PeerId; position: number; zones: number[]; turnstileToken?: string }
-  | { type: 'peers'; peers: Array<{ peerId: PeerId; position: number; zones: number[] }> }
+  | ({ type: 'join'; turnstileToken?: string } & WireNodeClaimJson)
+  | { type: 'peers'; peers: Array<{ peerId: PeerId }> }
   | { type: 'relay'; targetPeerId: PeerId; payload: any } // トラッカー経由の最初のSDP交換用
   | { type: 'error'; message: string };
+
+/** WebSocket は JSON なのでバイト列は hex 文字列で運ぶ */
+export interface WireNodeClaimJson {
+  peerId: PeerId;
+  /** hex 64 文字 */
+  pubkey: string;
+  powCounter: number;
+}
 
 // -- Gossipの型定義 --
 export interface GossipPacket {
@@ -15,25 +42,32 @@ export interface GossipPacket {
   pow_difficulty: number;
   timestamp: number;
   zone_id: number;
-  nonce: number[];
-  payload: number[];
+  nonce: Uint8Array;
+  payload: Uint8Array;
 }
 
 export interface StemPacket {
   type: 'stem';
   zoneId: number;
-  stemTtl: number;
+  /**
+   * ★ ホップカウンタ (stemTtl) は意図的に持たない。
+   *
+   * カウンタを載せると上限値が「発信元しか出せない値」になり、
+   * それを受け取った中継者が発信元を確定できてしまう。
+   * 停止は各ホップの確率判定 (DANDELION_CONFIG.FLUFF_PROBABILITY) が担う。
+   * 詳細は DandelionRouter.ts のコメントを参照。
+   */
   packet: GossipPacket;
 }
 
 // -- WebRTC DataChannelで送受信される P2PMessage --
 export type P2PMessage =
   // ── Ring管理 ──
-  | { type: 'join'; peerId: PeerId; position: number }
-  | { type: 'ring-info'; neighbors: Array<{ id: PeerId; position: number }> }
-  | { type: 'local-link-request'; peerId: PeerId; position: number; zones: number[] }
-  | { type: 'local-link-accept'; peerId: PeerId }
-  | { type: 'local-link-reject'; reason: 'max-degree' | 'not-neighbor' }
+  /** 接続直後に双方が送るチャレンジ。相手はこれに署名して JOIN を返す */
+  | { type: 'hello'; challenge: Uint8Array }
+  /** Bound Identity の主張 + 所有証明 */
+  | ({ type: 'join'; challenge: Uint8Array; signature: Uint8Array } & WireNodeClaim)
+  | { type: 'ring-info'; neighbors: Array<{ id: PeerId }> }
 
   // ── 生存確認 ──
   | { type: 'ping'; ts: number }
@@ -41,10 +75,11 @@ export type P2PMessage =
 
   // ── PEX (ロングレンジ候補探索) ──
   | { type: 'pex-request'; minDistance: number }
-  | { type: 'pex-response'; peers: Array<{ id: PeerId; position: number; zones: number[] }> }
+  /** position は id から導出できるので載せない */
+  | { type: 'pex-response'; peers: Array<{ id: PeerId }> }
 
   // ── シグナリング (DataChannel越し) ──
-  | { type: 'sdp-relay'; targetPeerId: PeerId; senderId?: PeerId; position?: number; zones?: number[]; sdp: any }
+  | { type: 'sdp-relay'; targetPeerId: PeerId; senderId?: PeerId; sdp: any }
   | { type: 'ice-relay'; targetPeerId: PeerId; senderId?: PeerId; candidate: any }
 
   // ── ゴシップ (Step 2以降) ──
@@ -60,10 +95,12 @@ export type P2PMessage =
 
 export interface IPeerConnection {
   readonly peerId: PeerId;
+  /** peerId から導出された値。相手の申告ではない */
   readonly position: number;
-  readonly zones: ReadonlySet<number>;
   readonly rtt: number;
   readonly isConnected: boolean;
+  /** HELLO/JOIN のハンドシェイクで Bound Identity を検証済みか */
+  readonly isVerified: boolean;
   send(msg: Uint8Array | string): void;
   close(): void;
 }
@@ -73,7 +110,7 @@ export interface IPeerManager {
   readonly degree: number;
   readonly myPeerId: PeerId;
   readonly myPosition: number;
-  connect(peerId: PeerId, position: number, zones: number[], initiator?: boolean, viaPeerId?: PeerId): IPeerConnection | Promise<IPeerConnection> | undefined;
+  connect(peerId: PeerId, initiator?: boolean, viaPeerId?: PeerId): IPeerConnection | Promise<IPeerConnection> | undefined;
   disconnect(peerId: PeerId): void;
   // 高レベルバイナリ送信 (Wire V2)
   sendMessage(peerId: PeerId, type: number, payload: any): void;
@@ -89,10 +126,10 @@ export interface IMessageDispatcher {
 
 // ── Signaling Client ──
 export interface ISignalingClient {
-  connect(options: { peerId: PeerId; position: number; zones: number[]; turnstileToken?: string }): Promise<void>;
+  connect(options: { claim: WireNodeClaim; turnstileToken?: string }): Promise<void>;
   sendRelay(targetPeerId: PeerId, payload: any): void;
   disconnect(): void;
-  on(event: 'peers', cb: (peers: Array<{ peerId: PeerId; position: number; zones: number[] }>) => void): void;
+  on(event: 'peers', cb: (peers: Array<{ peerId: PeerId }>) => void): void;
   on(event: 'relay', cb: (senderId: PeerId, payload: any) => void): void;
 }
 
@@ -144,7 +181,8 @@ export interface IZoneManager {
 
 // ── Anti-Spam (PoW) ──
 export interface IPoWEngine {
-  compute(data: Uint8Array, difficulty: number): Promise<bigint>;
+  /** コミット済みヘッダ全体に対して PoW を探索する */
+  compute(header: PowCommittedHeader): Promise<bigint>;
 }
 
 // ── Crypto Engine ──

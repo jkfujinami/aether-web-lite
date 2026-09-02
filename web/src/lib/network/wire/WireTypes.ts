@@ -7,6 +7,8 @@ export enum WireType {
   LOCAL_LINK_REQ = 0x14,
   LOCAL_LINK_ACK = 0x15,
   LOCAL_LINK_REJ = 0x16,
+  /** 接続直後のチャレンジ。相手はこれに署名して JOIN を返す (Bound Identity の所有証明) */
+  HELLO         = 0x17,
 
   // PEX (0x2x)
   PEX_REQUEST   = 0x20,

@@ -8,12 +8,20 @@ use tracing::{error, warn};
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum TrackerMessage {
+    /// Bound Identity の主張。
+    ///
+    /// position と zones は送らない:
+    ///   - position は peerId の純粋関数なので、トラッカーも各ピアも自分で計算する
+    ///   - zones (購読ゾーン) を申告するとトラッカー 1 箇所に
+    ///     「誰が何に興味があるか」が集まり、交差攻撃の材料になる (本家 18.6.2)
     #[serde(rename = "join")]
     Join {
         #[serde(rename = "peerId")]
         peer_id: String,
-        position: f64,
-        zones: Vec<u32>,
+        /// hex 64 文字 (Ed25519 公開鍵)
+        pubkey: String,
+        #[serde(rename = "powCounter")]
+        pow_counter: u64,
         #[serde(rename = "isSeed")]
         is_seed: bool,
         #[serde(rename = "isCache")]
@@ -31,12 +39,12 @@ pub enum TrackerMessage {
     Error { message: String },
 }
 
+/// トラッカーが返すブートストラップ候補。
+/// position は peerId から導出するので受け取らない。
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PeerInfo {
     #[serde(rename = "peerId")]
     pub peer_id: String,
-    pub position: f64,
-    pub zones: Vec<u32>,
 }
 
 pub struct SignalingClient {
@@ -44,10 +52,12 @@ pub struct SignalingClient {
 }
 
 impl SignalingClient {
+    #[allow(clippy::too_many_arguments)]
     pub async fn connect(
         url: &str,
         peer_id: String,
-        position: f64,
+        pubkey_hex: String,
+        pow_counter: u64,
         is_seed: bool,
         is_cache: bool,
         on_peers: mpsc::UnboundedSender<Vec<PeerInfo>>,
@@ -60,8 +70,8 @@ impl SignalingClient {
         // Join
         let join = TrackerMessage::Join {
             peer_id: peer_id.clone(),
-            position,
-            zones: vec![0], // Default zone 0
+            pubkey: pubkey_hex,
+            pow_counter,
             is_seed,
             is_cache,
         };

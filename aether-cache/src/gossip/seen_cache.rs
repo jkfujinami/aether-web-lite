@@ -1,11 +1,11 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// 重複パケットの配信を防ぐための LRU キャッシュ
+/// A memory-efficient LRU cache with TTL for deduplicating packet IDs.
+/// Because it is owned entirely inside the GossipActor, it requires no internal Mutex/Locks.
 pub struct SeenCache {
-    cache: Mutex<HashMap<String, Instant>>,
-    order: Mutex<VecDeque<String>>,
+    cache: HashMap<String, Instant>,
+    order: VecDeque<String>,
     max_size: usize,
     ttl: Duration,
 }
@@ -13,59 +13,50 @@ pub struct SeenCache {
 impl SeenCache {
     pub fn new(max_size: usize, ttl_secs: u64) -> Self {
         Self {
-            cache: Mutex::new(HashMap::new()),
-            order: Mutex::new(VecDeque::new()),
+            cache: HashMap::new(),
+            order: VecDeque::new(),
             max_size,
             ttl: Duration::from_secs(ttl_secs),
         }
     }
 
-    pub fn has(&self, id: &str) -> bool {
-        let mut cache = self.cache.lock().unwrap();
-        if let Some(timestamp) = cache.get(id) {
+    pub fn has(&mut self, id: &str) -> bool {
+        if let Some(timestamp) = self.cache.get(id) {
             if timestamp.elapsed() < self.ttl {
                 return true;
             } else {
-                // 期限切れ
-                cache.remove(id);
-                // order からの削除は cleanup でまとめて行う
+                self.cache.remove(id);
             }
         }
         false
     }
 
-    pub fn add(&self, id: String) {
-        let mut cache = self.cache.lock().unwrap();
-        let mut order = self.order.lock().unwrap();
-
-        if cache.contains_key(&id) {
+    pub fn add(&mut self, id: String) {
+        if self.cache.contains_key(&id) {
             return;
         }
 
-        cache.insert(id.clone(), Instant::now());
-        order.push_back(id);
+        self.cache.insert(id.clone(), Instant::now());
+        self.order.push_back(id);
 
-        if order.len() > self.max_size {
-            if let Some(oldest) = order.pop_front() {
-                cache.remove(&oldest);
+        if self.order.len() > self.max_size {
+            if let Some(oldest) = self.order.pop_front() {
+                self.cache.remove(&oldest);
             }
         }
     }
 
-    pub fn cleanup(&self) {
-        let mut cache = self.cache.lock().unwrap();
-        let mut order = self.order.lock().unwrap();
-        
-        while let Some(oldest) = order.front() {
-            if let Some(ts) = cache.get(oldest) {
+    pub fn cleanup(&mut self) {
+        while let Some(oldest) = self.order.front() {
+            if let Some(ts) = self.cache.get(oldest) {
                 if ts.elapsed() > self.ttl {
-                    let id = order.pop_front().unwrap();
-                    cache.remove(&id);
+                    let id = self.order.pop_front().unwrap();
+                    self.cache.remove(&id);
                 } else {
                     break;
                 }
             } else {
-                order.pop_front();
+                self.order.pop_front();
             }
         }
     }

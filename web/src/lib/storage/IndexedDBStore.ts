@@ -1,5 +1,6 @@
 import { openDB, type IDBPDatabase } from 'idb';
 import { Encoding } from '../common/Encoding';
+import type { SealedSecret } from './SecretVault';
 
 export interface MailboxEntry {
   topicHash: string;
@@ -19,8 +20,8 @@ export class IndexedDBStore {
   private db!: IDBPDatabase;
 
   public async init() {
-    this.db = await openDB('AetherLiteDB', 5, {
-      upgrade(db, _oldVersion, _newVersion, transaction) {
+    this.db = await openDB('AetherLiteDB', 6, {
+      upgrade(db, oldVersion, _newVersion, transaction) {
         // Mailbox (Raw Packets)
         if (!db.objectStoreNames.contains('mailbox')) {
           const store = db.createObjectStore('mailbox', { keyPath: 'topicHash' });
@@ -43,6 +44,11 @@ export class IndexedDBStore {
         // Identity / Trip
         if (!db.objectStoreNames.contains('identity')) {
           db.createObjectStore('identity', { keyPath: 'key' });
+        } else if (oldVersion < 6) {
+          // v5 以前は Ed25519 秘密鍵を平文で 'primary' に保存していた。
+          // 封印形式へ移行するにあたり、平文レコードは端末上から消す。
+          // 残したままだと押収時に読めてしまい、封印した意味が無くなる。
+          transaction.objectStore('identity').delete('primary');
         }
 
         // Thread Statistics (For Ranking)
@@ -169,30 +175,29 @@ export class IndexedDBStore {
     return all.slice(-count).map((r: any) => r.timestamp as number);
   }
 
-  // --- Identity / Trip Storage ---
+  // --- Identity Storage (封印済み) ---
+  //
+  // 秘密鍵は必ず SecretVault で封印した形でのみ保存する。
+  // 旧実装は Ed25519 秘密鍵を生で書いており、端末を押収されれば
+  // 過去の全投稿がトリップ経由で紐付いた。
 
-  public async getTrip(): Promise<{ publicKey: Uint8Array; privateKey: Uint8Array } | undefined> {
+  /**
+   * @param slot 'trip' = トリップ鍵 / 'node' = ノード identity
+   */
+  public async getSealed(slot: string): Promise<{ sealed: SealedSecret; meta?: any } | undefined> {
     if (!this.db) return undefined;
-    const record = await this.db.get('identity', 'primary');
-    if (!record) return undefined;
-    return {
-      publicKey: record.publicKey,
-      privateKey: record.privateKey,
-    };
+    const record = await this.db.get('identity', slot);
+    if (!record?.sealed) return undefined;
+    return { sealed: record.sealed as SealedSecret, meta: record.meta };
   }
 
-  public async saveTrip(publicKey: Uint8Array, privateKey: Uint8Array): Promise<void> {
+  public async saveSealed(slot: string, sealed: SealedSecret, meta?: any): Promise<void> {
     if (!this.db) return;
-    await this.db.put('identity', {
-      key: 'primary',
-      publicKey,
-      privateKey,
-      updatedAt: Date.now(),
-    });
+    await this.db.put('identity', { key: slot, sealed, meta, updatedAt: Date.now() });
   }
 
-  public async deleteTrip(): Promise<void> {
+  public async deleteSealed(slot: string): Promise<void> {
     if (!this.db) return;
-    await this.db.delete('identity', 'primary');
+    await this.db.delete('identity', slot);
   }
 }

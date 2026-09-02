@@ -1,105 +1,56 @@
-// @ts-ignore
-import argon2 from 'argon2-browser/dist/argon2-bundled.min.js';
+import sodium from '../crypto/sodium';
+import { solvePow, toBytes, type PowCommittedHeader } from '../crypto/PowPolicy';
 
 /**
  * PoW Web Worker
- * 重い Argon2id 計算を UI スレッドから切り離して実行する。
+ *
+ * PoW の *探索* だけをこのスレッドで行う。検証はメインスレッドで同期実行する
+ * ({@link ../crypto/PoWEngine})。SHA-256 の検証は 1.3us 程度で、Worker への
+ * postMessage 往復のほうが遥かに高くつくうえ、単一 Worker が受信処理の
+ * 直列化点になって head-of-line blocking を招くため。
+ *
+ * 旧実装は argon2-browser を使っていたが、メインスレッド側 (PoWEngine) が
+ * type:2 (Argon2id)、この Worker が type:0 (Argon2d) を既定にしており、
+ * 送信側と検証側で別のハッシュを計算し得る不整合があった。実装を
+ * PowPolicy 1 箇所に集約したことで構造的に起こらなくなっている。
  */
-// Argon2 type enum: Argon2d=0, Argon2i=1, Argon2id=2
-const DEFAULT_PARAMS = {
-  type: 2,          // Argon2id by default
-  mem: 1024,
-  time: 1,
-  parallelism: 1,
-  hashLen: 32,
-};
 
-self.onmessage = async (e: MessageEvent) => {
-  const { type, payload, difficulty, nonce, id, params } = e.data;
+interface ComputeRequest {
+  id: string;
+  type: 'compute';
+  header: {
+    timestamp: number;
+    zone_id: number;
+    pow_difficulty: number;
+    nonce: unknown;
+    payload: unknown;
+  };
+}
 
-  // メインスレッドから渡された params を優先し、欠落分をデフォルトで補完
-  const hashParams = { ...DEFAULT_PARAMS, ...params };
+self.onmessage = async (e: MessageEvent<ComputeRequest>) => {
+  const { id, type, header } = e.data ?? ({} as ComputeRequest);
 
   try {
-    if (type === 'compute') {
-      const result = await computePoW(payload, difficulty, hashParams);
-      self.postMessage({ type: 'result', id, nonce: result });
-    } else if (type === 'verify') {
-      const result = await verifyPoW(payload, nonce, difficulty, hashParams);
-      self.postMessage({ type: 'result', id, isValid: result });
+    await sodium.ready;
+
+    if (type !== 'compute') {
+      throw new Error(`unsupported request type: ${String(type)}`);
     }
+
+    const committed: PowCommittedHeader = {
+      timestamp: header.timestamp,
+      zone_id: header.zone_id,
+      pow_difficulty: header.pow_difficulty,
+      nonce: toBytes(header.nonce),
+      payload: toBytes(header.payload),
+    };
+
+    const nonce = solvePow(committed);
+    if (nonce === null) throw new Error('PoW search exhausted');
+
+    // BigInt は構造化複製で渡せる処理系とそうでない処理系があるため文字列で返す
+    self.postMessage({ id, type: 'result', result: nonce.toString() });
   } catch (err: any) {
-    console.error(`[PoWWorker] Error during ${type}:`, err);
-    self.postMessage({ type: 'error', id, error: err.message });
+    self.postMessage({ id, type: 'error', error: err?.message ?? String(err) });
   }
 };
-
-async function computePoW(payload: Uint8Array, difficulty: number, params: any): Promise<bigint> {
-  if (difficulty === 0) return 0n;
-  let nonce = 0n;
-
-  while (true) {
-    const input = concatBytes(payload, bigintToBytes(nonce));
-    const result = await argon2.hash({
-      ...params,
-      pass: input,
-      salt: getSalt(input),
-    });
-
-    if (checkDifficulty(result.hash, difficulty)) {
-      return nonce;
-    }
-    nonce++;
-  }
-}
-
-async function verifyPoW(payload: Uint8Array, nonce: bigint, difficulty: number, params: any): Promise<boolean> {
-  if (difficulty === 0) return true;
-  const input = concatBytes(payload, bigintToBytes(nonce));
-  
-  const result = await argon2.hash({
-    ...params,
-    pass: input,
-    salt: getSalt(input),
-  });
-
-  return checkDifficulty(result.hash, difficulty);
-}
-
-// --- Helper Functions (Duplicated for Worker context) ---
-
-function checkDifficulty(hash: Uint8Array, difficulty: number): boolean {
-  const fullBytes = Math.floor(difficulty / 8);
-  const remainBits = difficulty % 8;
-
-  for (let i = 0; i < fullBytes; i++) {
-    if (hash[i] !== 0) return false;
-  }
-
-  if (remainBits > 0) {
-    const mask = 0xFF << (8 - remainBits);
-    if ((hash[fullBytes] & mask) !== 0) return false;
-  }
-  return true;
-}
-
-function getSalt(input: Uint8Array): Uint8Array {
-  if (input.length >= 16) return input.slice(0, 16);
-  const pad = new Uint8Array(16);
-  pad.set(input);
-  return pad;
-}
-
-function bigintToBytes(val: bigint): Uint8Array {
-  const buf = new Uint8Array(8);
-  const view = new DataView(buf.buffer);
-  view.setBigUint64(0, val, false); 
-  return buf;
-}
-
-function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
-  const res = new Uint8Array(a.length + b.length);
-  res.set(a, 0);
-  res.set(b, a.length);
-  return res;
-}

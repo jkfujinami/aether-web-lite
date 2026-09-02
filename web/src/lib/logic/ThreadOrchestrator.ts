@@ -20,8 +20,13 @@ import { DifficultyEstimator } from '../crypto/DifficultyEstimator';
  * 特定のスレッドにおける投稿（Post）の取得、DAG構築、同期、および投稿を統括する。
  */
 export class ThreadOrchestrator {
-  private listeners: Set<(posts: DAGPost[]) => void> = new Set();
-  private statusListeners: Set<(status: ThreadStatus) => void> = new Set();
+  private listeners: Set<() => void> = new Set();
+  private statusListeners: Set<() => void> = new Set();
+  /**
+   * useSyncExternalStore に渡すスナップショット。
+   * データが変わらない限り同じ参照を返す必要があるため、notify() でだけ作り直す。
+   */
+  private snapshot: DAGPost[] = [];
   private dag: ThreadDAGManager = new ThreadDAGManager(''); // 初期はダミー
   private seenPacketIds: Set<string> = new Set();
   private currentStatus: ThreadStatus = { phase: 'idle', message: '' };
@@ -32,6 +37,9 @@ export class ThreadOrchestrator {
   private currentThreadKey: Uint8Array | null = null;
   private currentThreadTopicHash: Uint8Array | null = null;
   private isListening: boolean = false;
+  /** 実行中の fullSync。多重起動を防ぐ */
+  private syncInFlight: Promise<void> | null = null;
+  private syncDebounce: any = null;
 
 
 
@@ -48,48 +56,58 @@ export class ThreadOrchestrator {
     private syncProtocol: SyncProtocol
   ) {}
 
-  public subscribe(listener: (posts: DAGPost[]) => void) {
+  /** useSyncExternalStore の subscribe。購読解除関数を返すだけに徹する。 */
+  public subscribe(listener: () => void): () => void {
     this.listeners.add(listener);
-    listener(this.getPosts());
-    return () => this.listeners.delete(listener);
+    return () => { this.listeners.delete(listener); };
   }
 
-  public subscribeStatus(listener: (status: ThreadStatus) => void) {
+  public subscribeStatus(listener: () => void): () => void {
     this.statusListeners.add(listener);
-    listener(this.currentStatus);
-    return () => this.statusListeners.delete(listener);
+    return () => { this.statusListeners.delete(listener); };
   }
 
+  /** useSyncExternalStore の getSnapshot。キャッシュ済みの参照を返す。 */
   public getPosts(): DAGPost[] {
-    return this.dag.getSortedPosts();
+    return this.snapshot;
+  }
+
+  public getStatus(): ThreadStatus {
+    return this.currentStatus;
   }
 
   private updateStatus(phase: ThreadStatus['phase'], message: string, isSubmitting: boolean = false, powProgress: number = 0) {
     this.currentStatus = { phase, message, isSubmitting, powProgress };
-    this.statusListeners.forEach(l => l(this.currentStatus));
+    this.statusListeners.forEach(l => l());
   }
 
+  /** スナップショットを作り直してから「変わった」と伝える */
   private notify() {
-    const list = this.getPosts();
-    this.listeners.forEach(l => l(list));
+    this.snapshot = this.dag.getSortedPosts();
+    console.log(`[TRACE:6-notify] ThreadOrchestrator snapshot rebuilt: ${this.snapshot.length} posts, notifying ${this.listeners.size} listener(s)`);
+    this.listeners.forEach(l => l());
   }
 
   /**
    * パケット（JSONオブジェクト）を処理し、DAGを更新する
    */
   public async handlePacketObject(boardId: string, threadId: string, threadKey: Uint8Array, packet: any, isFromDB: boolean) {
-    if (this.seenPacketIds.has(packet.packet_id)) return;
+    console.log(`[TRACE:4-handlePacketObject] ThreadOrchestrator enter packet_id=${packet?.packet_id?.substring(0, 8)} isFromDB=${isFromDB}`);
+    if (this.seenPacketIds.has(packet.packet_id)) {
+      console.log(`[TRACE:4-handlePacketObject] DROPPED already in seenPacketIds packet_id=${packet.packet_id.substring(0, 8)}`);
+      return;
+    }
     this.seenPacketIds.add(packet.packet_id);
 
     try {
       const post = await PacketBuilder.verifyAndDecrypt(packet, threadKey, this.cryptoEng);
       if (!post) {
-        console.warn(`[ThreadOrchestrator] Packet ${packet.packet_id} decrypted to null (failed quickCheck, AEAD, or signature)`);
+        console.warn(`[TRACE:4-handlePacketObject] DROPPED decrypted to null (failed quickCheck, AEAD, or signature) packet_id=${packet.packet_id}`);
         return;
       }
 
       if (post.thread_id === threadId && post.post_type === 0) {
-        
+
         const dagPost: DAGPost = {
           ...post,
           packet_id: packet.packet_id,
@@ -99,9 +117,10 @@ export class ThreadOrchestrator {
         };
 
         const isNew = this.dag.addPost(dagPost);
+        console.log(`[TRACE:5-dag.addPost] packet_id=${packet.packet_id.substring(0, 8)} isNew=${isNew}`);
         if (isNew) {
           this.notify();
-          
+
           if (!isFromDB) {
               const rawPacketData = new TextEncoder().encode(JsonBinary.stringify(packet));
               await this.db.save({ 
@@ -207,7 +226,15 @@ export class ThreadOrchestrator {
   /**
    * ネットワーク(DHT)から過去ログを同期する
    */
-  public async fullSync(boardId: string, threadId: string, boardKey: Uint8Array) {
+  public async fullSync(boardId: string, threadId: string, boardKey: Uint8Array): Promise<void> {
+    if (this.syncInFlight) return this.syncInFlight;
+    this.syncInFlight = this.runFullSync(boardId, threadId, boardKey).finally(() => {
+      this.syncInFlight = null;
+    });
+    return this.syncInFlight;
+  }
+
+  private async runFullSync(boardId: string, threadId: string, boardKey: Uint8Array): Promise<void> {
     if (this.pm.degree === 0) return;
 
     this.updateStatus('syncing', 'ピアと同期中 (DHT同期)...');
@@ -235,16 +262,24 @@ export class ThreadOrchestrator {
   private onGossipPacket = async (packet: any) => {
     if (this.currentBoardId && this.currentThreadId && this.currentThreadKey) {
       await this.handlePacketObject(this.currentBoardId, this.currentThreadId, this.currentThreadKey, packet, false);
+    } else {
+      console.log(`[TRACE:3.5-onGossipPacket] ThreadOrchestrator DROPPED not activated (currentThreadId=${this.currentThreadId}) packet_id=${packet?.packet_id?.substring(0, 8)}`);
     }
   };
 
   /**
    * ハンドラ: 新しい隣人と繋がったとき
    */
+  /** 接続が連続して張られたときに fullSync が何本も重ならないようデバウンスする */
   private onPeerConnect = () => {
-    if (this.currentBoardId && this.currentThreadId && this.currentBoardKey) {
-      this.fullSync(this.currentBoardId, this.currentThreadId, this.currentBoardKey);
-    }
+    if (!this.currentBoardId || !this.currentThreadId || !this.currentBoardKey) return;
+    if (this.syncDebounce) clearTimeout(this.syncDebounce);
+    this.syncDebounce = setTimeout(() => {
+      this.syncDebounce = null;
+      if (this.currentBoardId && this.currentThreadId && this.currentBoardKey) {
+        this.fullSync(this.currentBoardId, this.currentThreadId, this.currentBoardKey);
+      }
+    }, 500);
   };
 
 
@@ -341,6 +376,10 @@ export class ThreadOrchestrator {
    * メモリ状態をリセットする
    */
   public clear() {
+    if (this.syncDebounce) {
+      clearTimeout(this.syncDebounce);
+      this.syncDebounce = null;
+    }
     if (this.isListening) {
       this.router.offMessage(this.onGossipPacket);
       this.pm.off('peer:connect', this.onPeerConnect);

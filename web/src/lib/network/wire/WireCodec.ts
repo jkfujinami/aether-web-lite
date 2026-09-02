@@ -7,6 +7,7 @@ export interface DecodedWireMessage {
 }
 export class WireCodec {
   private static readonly REVERSE_TYPE_MAP: Record<number, string> = {
+    [WireType.HELLO]: 'hello',
     [WireType.JOIN]: 'join',
     [WireType.RING_INFO]: 'ring-info',
     [WireType.PING]: 'ping',
@@ -33,7 +34,6 @@ export class WireCodec {
       ? { type: tag, ...payload }
       : payload;
 
-    console.log(`[WireCodec] Encoding WireType: 0x${type.toString(16)} (tag: ${tag})`, taggedPayload);
     const body = encode(taggedPayload);
     const frame = new Uint8Array(1 + body.byteLength);
     frame[0] = type;
@@ -51,10 +51,9 @@ export class WireCodec {
     if (typeByte >= 0x10 && typeByte <= 0x52) {
       try {
         const payload = decode(data.subarray(1));
-        console.log(`[WireCodec] Decoded WireType: 0x${typeByte.toString(16)}`, payload);
         return { type: typeByte as WireType, payload };
-      } catch (e) {
-        console.warn(`[WireCodec] MsgPack decode failed for 0x${typeByte.toString(16)}, falling back to JSON`, e);
+      } catch {
+        // MsgPack として読めなければ下の JSON フォールバックへ
       }
     }
 
@@ -65,6 +64,7 @@ export class WireCodec {
       
       // Map JSON 'type' to WireType
       const typeMap: Record<string, WireType> = {
+        'hello': WireType.HELLO,
         'join': WireType.JOIN,
         'ping': WireType.PING,
         'pong': WireType.PONG,

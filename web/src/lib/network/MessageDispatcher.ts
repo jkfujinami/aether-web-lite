@@ -22,7 +22,8 @@ export class MessageDispatcher implements IMessageDispatcher {
    */
   public dispatch(peerId: PeerId, type: number, payload: any): void {
     const typeHandlers = this.handlers.get(type);
-    
+    console.log(`[TRACE:1-dispatch] type=0x${type.toString(16)} from=${peerId.substring(0, 8)} handlers=${typeHandlers?.size ?? 0}`);
+
     if (!typeHandlers || typeHandlers.size === 0) {
       // 未登録のメッセージ種別が届いた場合はデバッグ用に記録（必要に応じて）
       return;

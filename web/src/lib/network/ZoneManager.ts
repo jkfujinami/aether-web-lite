@@ -39,9 +39,20 @@ export class ZoneManager {
    * ネットワークサイズを推定し、depth を更新する (§3.4)
    * 隣人の Ring 密度が高いほど、ネットワーク全体が巨大であると推定する。
    */
+  /**
+   * 密度からネットワーク規模を推定するのに必要な最小ピア数。
+   *
+   * ピアが 2〜3 台しかいないと、たまたま座標が近いだけで
+   * 「巨大ネットワークだ」と誤推定し、depth が跳ね上がる。
+   * depth が 5 以上になると isSubscribed() が実際にフィルタを始めるため、
+   * **少人数の網で受信パケットが黙って捨てられる**という分かりにくい壊れ方をする。
+   * 標本が足りないうちは depth 0 (全ゾーン購読 = Broadcast Veil) のままにする。
+   */
+  private static readonly MIN_PEERS_FOR_ESTIMATE = 8;
+
   private recomputeDepth() {
     const peers = Array.from(this.peerManager.peers.values());
-    if (peers.length < 2) return;
+    if (peers.length < ZoneManager.MIN_PEERS_FOR_ESTIMATE) return;
 
     // 隣人との平均距離を計算
     const myPos = this.peerManager.myPosition;
