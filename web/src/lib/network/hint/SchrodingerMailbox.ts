@@ -71,7 +71,7 @@ export class SchrodingerMailbox {
   private bodyListeners: Array<(body: Uint8Array, hint: OpenedHint) => void> = [];
 
   private onPeerConnect = (peer: IPeerConnection | string) => {
-    const peerId = typeof peer === 'string' ? peer : peer.peerId;
+    const peerId = typeof peer === 'string' ? peer : peer?.peerId;
     if (!peerId) return;
     // 繋がった相手は、こちらが持っている Hint を取りこぼしている可能性がある。
     // 要求を待たずに送る (要求のやり取り自体が観測点になるため)。

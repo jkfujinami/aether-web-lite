@@ -107,7 +107,12 @@ export class ZoneManager {
    */
   private initSubscribedZones() {
     // セッション中（または永続的に）固定するために localStorage を使用 (§7.2)
-    const saved = localStorage.getItem('aether_subscribed_zones');
+    let saved: string | null = null;
+    try {
+      if (typeof localStorage !== 'undefined') {
+        saved = localStorage.getItem('aether_subscribed_zones');
+      }
+    } catch {}
     if (saved) {
       try {
         const list = JSON.parse(saved) as number[];
@@ -168,6 +173,10 @@ export class ZoneManager {
   }
 
   private saveSubscribedZones() {
-    localStorage.setItem('aether_subscribed_zones', JSON.stringify(Array.from(this._subscribedZones)));
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem('aether_subscribed_zones', JSON.stringify(Array.from(this._subscribedZones)));
+      }
+    } catch {}
   }
 }
