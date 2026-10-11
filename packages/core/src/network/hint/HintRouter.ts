@@ -3,8 +3,11 @@ import type { DandelionRouter } from '../gossip/DandelionRouter';
 import { SeenCache } from '../gossip/SeenCache';
 import { WireType } from '../wire/WireTypes';
 import { createLogger } from '../../common/Logger';
+import type { OnionCircuit } from '../onion/OnionCircuit';
 import {
+  decodeHint,
   decrementHintTtl,
+  encodeHint,
   hintId,
   parseHintPacket,
   verifyHintPow,
@@ -77,9 +80,13 @@ export class HintRouter {
      * 観測者に渡す辺が 1 本増える (§3.1 の前提が崩れる)。
      */
     private dandelion: DandelionRouter,
+    /** 作者の Hint はこの回路で出口まで運ぶ */
+    private circuit: OnionCircuit,
   ) {
     dispatcher.register(WireType.HINT, (senderId, msg) => this.handleHint(senderId, msg));
-    dispatcher.register(WireType.HINT_STEM, (senderId, msg) => this.handleHintStem(senderId, msg));
+    circuit.onExit('exit_hint', (payload) => {
+      if (payload.type === 'exit_hint') this.handleExitHint(payload.hint);
+    });
   }
 
   /**
@@ -131,83 +138,51 @@ export class HintRouter {
   /**
    * 自分が作った Hint をネットワークへ放流する。
    *
-   * ★ 必ず Dandelion の Stem を通す。
+   * ★ 必ずオニオン回路を通す。
    *
    *   直接 flood すると、隣人から見て「この IP が発信元」が確定する。
    *   Hint は mailbox_key の在り処を運ぶので、発信元が割れることは
    *   「誰がその投稿を書いたか」が割れることと同じになる。
+   *   旧実装は平文 Stem (HINT_STEM) で運び、失敗時は直接 flood に落ちていた。
    *
-   *   Stem で数ホップ運んでから誰かが Fluff (全体配信) に移すので、
-   *   ネットワークからは Fluff 地点が発信元に見える。
+   * ★ Fail-Closed: 回路で届かなくても平文には落とさない。
+   *   Hint は Slot に同梱されて保管されるため、保持者の再放流 (§18.3-A) で
+   *   後から必ず配られる。可用性の損失は遅延だけ。
    *
-   * ★ Fail-Closed: Stem が失敗しても**絶対に直接 flood しない**。
-   *
-   *   旧実装は可用性を優先して直接 flood にフォールバックしていた。
-   *   攻撃者は自分宛ての HINT_STEM を握り潰すだけで、発信元に
-   *   「自分の IP から全隣人へ Hint を直射する」ことを強制できた
-   *   (ドロップ誘発ダウングレード)。Hint は投稿の在り処そのものなので、
-   *   これは「誰が書いたか」の告白と同じになる。
-   *
-   *   Hint は Slot に同梱されて保管されるため、ここで落としても
-   *   保持者の再放流 (§18.3-A) で後から必ず配られる。可用性の損失は遅延だけ。
-   *
-   * @returns Stem が Fluff まで届いたか
+   * @returns 網に現れたこと (エコー) を確認できたか
    */
   public async originate(hint: HintPacket, id: string): Promise<boolean> {
     // 自分が作ったものを自分に通知しても意味が無い。戻ってきたときの
-    // 二重通知も防げる。中継の記録 (flooded) はここでは触らない ——
-    // flood() は冒頭で flooded を見るので、先に入れると 1 通も外へ出ない。
+    // 二重通知も防げる。中継の記録 (flooded) はここでは触らない。
     this.delivered.add(id);
-    log.debug(() => `originating hint ${id.substring(0, 8)} via stem`);
+    log.debug(() => `originating hint ${id.substring(0, 8)} via onion circuit`);
 
-    const echoed = await this.dandelion.publishVia(id, (target) => {
-      this.peerManager.sendMessage(target, WireType.HINT_STEM, hint);
-    });
+    const echoed = await this.circuit.send({ type: 'exit_hint', hint: encodeHint(hint) }, id);
     if (!echoed) {
-      log.warn(`hint stem failed for ${id.substring(0, 8)}; dropping (fail-closed, holders will reflood)`);
+      log.warn(`hint delivery failed for ${id.substring(0, 8)}; dropping (fail-closed, holders will reflood)`);
     }
     return echoed;
   }
 
   /**
-   * Stem として届いた Hint。転送を続けるか、Fluff (全体配信) へ移すかを決める。
-   *
-   * 判断は DandelionRouter が持つ (ペイロードを見ない)。
-   * ここで「見たことがあるか」で分岐してはいけない —— 分岐させると、
-   * 攻撃者が Hint を送りつけて相手の反応を見るだけで
-   * 「既に知っていたか」を判定できるオラクルになる。
+   * 出口として受け取った Hint を全体配信へ移す。
    */
-  private handleHintStem(senderId: PeerId, msg: any): void {
-    const hint = parseHintPacket(msg);
+  private handleExitHint(bytes: Uint8Array): void {
+    const hint = decodeHint(bytes);
     if (!hint) {
-      log.debug(() => `HINT_STEM REJECTED (malformed) from=${senderId.substring(0, 8)}`);
+      log.debug(() => `exit hint REJECTED (malformed)`);
       return;
     }
     if (!verifyHintPow(hint)) {
-      log.debug(() => `HINT_STEM REJECTED (pow) from=${senderId.substring(0, 8)}`);
+      log.debug(() => `exit hint REJECTED (pow)`);
       return;
     }
-
-    const decision = this.dandelion.decideStem(senderId);
     const id = hintId(hint);
-    // ★ 転送先は TRACE 止まり (経路情報)
-    log.trace(() => `HINT_STEM ${id.substring(0, 8)} decision=${decision.action}`);
-
-    if (decision.action === 'fluff') {
-      // Fluff 地点。ここから全体配信に移る。
-      //
-      // ★ 自分が Fluff した時点でエコーを確定させる。
-      //   flood() は送信元を除外するため、自分が撒いたものは隣人同士で
-      //   転送し合うだけで自分には返ってこない。ここで通知しないと、
-      //   自分で Fluff したのに発信元が再送を空回りさせる。
-      this.dandelion.notifyEcho(id);
-      this.remember(hint);
-      this.tryOpen(hint, id);
-      this.flood(hint, this.peerManager.myPeerId);
-      return;
-    }
-    // 書き換えずにそのまま次の 1 人へ
-    this.peerManager.sendMessage(decision.target, WireType.HINT_STEM, hint);
+    // 自分で Fluff した時点でエコーを確定させる (flood は自分に返ってこない)
+    this.dandelion.notifyEcho(id);
+    this.remember(hint);
+    this.tryOpen(hint, id);
+    this.flood(hint, this.peerManager.myPeerId);
   }
 
   /**

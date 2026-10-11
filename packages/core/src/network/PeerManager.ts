@@ -235,7 +235,7 @@ export class PeerManager implements IPeerManager {
       return;
     }
 
-    peer.markVerified(claim.pubkey);
+    peer.markVerified(claim.pubkey, claim.powCounter);
     log.debug(
       `[PeerManager] Peer ${peerId.substring(0, 8)} verified (bound position: ${peer.position.toFixed(6)})`,
     );
@@ -308,6 +308,11 @@ export class PeerManager implements IPeerManager {
 
   public get nodeIdentity(): NodeIdentity {
     return this.identity;
+  }
+
+  /** NodeId PoW の検証パラメータ (他モジュールが claim を検証するときに揃える) */
+  public get nodeIdPowParams(): NodeIdPowParams {
+    return this.powParams;
   }
 
   public async start(): Promise<void> {

@@ -4,7 +4,7 @@ import { RingPosition } from '../../src/network/RingPosition';
 import { OnionRouter, type OnionHop } from '../../src/crypto/OnionRouter';
 import { derivePacketId, verifyPow } from '../../src/crypto/PowPolicy';
 import type { GossipPacket } from '../../src/types';
-import { calculateExponentialDelay } from '../../src/network/gossip/ZoneGossipRouter';
+import { exponentialDelay } from '../../src/network/onion/OnionCircuit';
 
 describe('🔴 レッドチーム徹底侵入テスト & 匿名性限界測定 (Red Team Penetration Audit)', () => {
   beforeAll(async () => {
@@ -116,7 +116,7 @@ describe('🔴 レッドチーム徹底侵入テスト & 匿名性限界測定 (
       }
 
       // ── 防御あり (中継ノードが指数ランダム遅延を注入: 平均 40ms, 10-120ms) ──
-      const relayExpDelay = calculateExponentialDelay(40);
+      const relayExpDelay = exponentialDelay(40, 400);
       const arrivalWithDefense = WATERMARK_DELAY_MS + networkJitter + relayExpDelay;
 
       // Exit スパイが同じ固定閾値で検知を試みる

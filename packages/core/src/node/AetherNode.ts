@@ -12,6 +12,7 @@ import { RateLimiter } from '../network/RateLimiter';
 import { PeerManager } from '../network/PeerManager';
 import { ZoneManager } from '../network/ZoneManager';
 import { DandelionRouter } from '../network/gossip/DandelionRouter';
+import { OnionCircuit, type OnionCircuitOptions } from '../network/onion/OnionCircuit';
 import { ZoneGossipRouter } from '../network/gossip/ZoneGossipRouter';
 import { DHTMailbox } from '../network/mailbox/DHTMailbox';
 import { ReplicationManager } from '../network/mailbox/ReplicationManager';
@@ -36,6 +37,8 @@ export interface AetherNodeConfig {
   releaseMode?: ReleaseMode;
   db?: IndexedDBStore;
   autoStart?: boolean;
+  /** オニオン回路のパラメータ (テスト用に遅延を縮めるときなど) */
+  circuit?: OnionCircuitOptions;
 }
 
 /**
@@ -59,6 +62,7 @@ export class AetherNode {
   public readonly peerManager: PeerManager;
   public readonly zoneManager: ZoneManager;
   public readonly dandelion: DandelionRouter;
+  public readonly circuit: OnionCircuit;
   public readonly mailbox: DHTMailbox;
   public readonly replicationManager: ReplicationManager;
   public readonly syncProtocol: SyncProtocol;
@@ -88,6 +92,7 @@ export class AetherNode {
       peerManager: PeerManager;
       zoneManager: ZoneManager;
       dandelion: DandelionRouter;
+      circuit: OnionCircuit;
       mailbox: DHTMailbox;
       replicationManager: ReplicationManager;
       syncProtocol: SyncProtocol;
@@ -113,6 +118,7 @@ export class AetherNode {
     this.peerManager = params.peerManager;
     this.zoneManager = params.zoneManager;
     this.dandelion = params.dandelion;
+    this.circuit = params.circuit;
     this.mailbox = params.mailbox;
     this.replicationManager = params.replicationManager;
     this.syncProtocol = params.syncProtocol;
@@ -165,12 +171,13 @@ export class AetherNode {
     await identity.initTrip(db);
 
     const dandelion = new DandelionRouter(peerManager);
-    const mailbox = new DHTMailbox(peerManager, dispatcher, db, dandelion);
+    const circuit = new OnionCircuit(peerManager, dispatcher, dandelion, config.circuit);
+    const mailbox = new DHTMailbox(peerManager, dispatcher, db, circuit);
     const replicationManager = new ReplicationManager(mailbox, peerManager, db);
     const syncProtocol = new SyncProtocol(mailbox, cryptoEngine, keyManager, db);
 
-    const gossipRouter = new ZoneGossipRouter(peerManager, dispatcher, zoneManager, dandelion);
-    const hintRouter = new HintRouter(peerManager, dispatcher, dandelion);
+    const gossipRouter = new ZoneGossipRouter(peerManager, dispatcher, zoneManager, dandelion, circuit);
+    const hintRouter = new HintRouter(peerManager, dispatcher, dandelion, circuit);
     const schrodinger = new SchrodingerMailbox(
       mailbox,
       hintRouter,
@@ -222,6 +229,7 @@ export class AetherNode {
       peerManager,
       zoneManager,
       dandelion,
+      circuit,
       mailbox,
       replicationManager,
       syncProtocol,
@@ -251,6 +259,8 @@ export class AetherNode {
 
     this.schrodinger.startReflood();
     this.heartbeat.start();
+    // cover traffic は投稿の有無に関係なく起動直後から流す (OnionCircuit.start 参照)
+    this.circuit.start();
     this.replicationManager.executeRebalance();
 
     try {
@@ -269,6 +279,7 @@ export class AetherNode {
     this.isStarted = false;
 
     this.schrodinger.destroy();
+    this.circuit.stop();
     for (const peerId of this.peerManager.peers.keys()) {
       this.peerManager.disconnect(peerId);
     }

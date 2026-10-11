@@ -523,14 +523,7 @@ export class BoardOrchestrator {
       }).catch(() => {});
 
       // ── ここから先はネットワークへの送出。UI を待たせない。 ──
-      this.router.broadcast(packet).catch((err: any) => {
-        log.error('[BoardOrchestrator] Gossip broadcast failed:', err);
-      });
-      // ★ 本体はランダムな Slot へ、その在り処は Hint で配る。
-      //   Hint は Stem を通るので発信元が隣人に割れない。
-      this.schrodinger.publish(boardKey, rawPacketData, savedAt).catch((e: any) => {
-        log.warn('Schrodinger publish failed:', e);
-      });
+      this.sendAnonymously(packet, boardKey, savedAt, rawPacketData.length);
 
       this.updateStatus('idle', '', false, 0);
       return threadId;
@@ -541,6 +534,28 @@ export class BoardOrchestrator {
     }
   }
 
+
+  /**
+   * 投稿をオニオン回路で送り出す。
+   *
+   * ★ 本体・Slot・索引のすべてがオニオンセルに載る (C3)。
+   *   Slot は Gossip と同じセルに同梱し、出口が作者の代わりに保管する。
+   *   索引 (Hint) は本体が網に現れた後で、時間をずらして別のセルで放流する。
+   *   回路で届かなかった場合は平文に落とさず、その旨を表示する (Fail-Closed)。
+   */
+  private sendAnonymously(packet: any, key: Uint8Array, messageId: number, bodyBytes: number): void {
+    const slot = this.schrodinger.prepareSlot(key, messageId);
+    void (async () => {
+      const delivered = await this.router.broadcast(packet, { slot: slot.exitSlot });
+      if (!delivered) {
+        this.updateStatus('error', '匿名経路で送信できませんでした (平文での送信は行っていません)。隣人が増えてから再度お試しください。');
+        return;
+      }
+      await this.schrodinger.releaseHint(slot.hint, bodyBytes);
+    })().catch((err: any) => {
+      log.error('[BoardOrchestrator] anonymous send failed:', err);
+    });
+  }
 
   /**
    * メモリ状態をリセットする（板の切り替え時など）

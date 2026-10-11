@@ -4,8 +4,8 @@ import type { HintRouter, OpenedHint } from './HintRouter';
 import { Encoding } from '../../common/Encoding';
 import { createLogger } from '../../common/Logger';
 import { buildHint, mailboxKeyFromNonce, newMailboxSlot, type HintPayload } from './HintCrypto';
-import { hintId, type HintPacket } from './HintPacket';
-import { decodeSlotBlob, encodeSlotBlob, extractHint } from './SlotBlob';
+import { encodeHint, hintId, type HintPacket } from './HintPacket';
+import { decodeSlotBlob, extractHint } from './SlotBlob';
 import { HintReleaseScheduler, type ReleaseMode, type ReleaseStatus } from './HintRelease';
 
 const log = createLogger('net.schrodinger');
@@ -153,54 +153,44 @@ export class SchrodingerMailbox {
   }
 
   /**
-   * 本体を保管し、その在り処を Hint で配る。
+   * 新しい Slot を用意する (まだ何も送らない)。
+   *
+   * 返す `exitSlot` を Gossip の broadcast に同梱すると、出口ノードが
+   * 作者の代わりに本体を K-nearest へ保管する ({@link DHTMailbox.storeSlotAsExit})。
+   * 作者自身は PUT を一切出さない。
    *
    * @param k         板/スレッドの鍵。これを持つ者だけが Hint を開ける
-   * @param body      封印済みの本体 (このクラスは中身を見ない)
    * @param messageId メッセージ識別子
    */
-  public async publish(k: Uint8Array, body: Uint8Array, messageId: number): Promise<HintPacket> {
-    const { hint } = await this.publishWithStatus(k, body, messageId);
-    return hint;
-  }
-
-  /** 待ち時間の理由まで返す版 (UI へ出すため) */
-  public async publishWithStatus(
-    k: Uint8Array,
-    body: Uint8Array,
-    messageId: number,
-  ): Promise<{ hint: HintPacket; release: ReleaseStatus }> {
+  public prepareSlot(k: Uint8Array, messageId: number): {
+    hint: HintPacket;
+    keyHex: string;
+    exitSlot: { topicHash: string; hint: Uint8Array };
+  } {
     const { nonce, mailboxKey } = newMailboxSlot();
     const payload: HintPayload = { nonce, message_id: messageId, timestamp: Date.now() };
     const hint = buildHint(k, payload);
-
-    // 本体と索引を同じ Slot に入れる。保持者は索引を復号できないが、
-    // バイト列として再放流できる (§18.3-A)。
-    const blob = encodeSlotBlob(hint, body);
     const keyHex = Encoding.toHex(mailboxKey);
+    log.info(() => `prepared slot=${keyHex.substring(0, 8)} hint=${hintId(hint).substring(0, 8)} msg=${messageId}`);
+    return { hint, keyHex, exitSlot: { topicHash: keyHex, hint: encodeHint(hint) } };
+  }
 
-    log.info(
-      () =>
-        `publish slot=${keyHex.substring(0, 8)} body=${body.length}B ` +
-        `hint=${hintId(hint).substring(0, 8)} msg=${messageId}`,
-    );
-    await this.mailbox.publish(keyHex, blob);
-
-    // ★ 本体 PUT と Hint 放流を時間で切り離す (§18.4.5)。
-    //
-    //   同時に出ると、両方を観測できる位置にいる者に
-    //   「この IP が D 秒間アップロードしていた」×「T+ε に Hint が現れた」で
-    //   紐づけられる。Hint の中身が不透明でも、この相関は中身を必要としない。
-    //
-    //   小さい送信や、網が小さくて匿名集合が生まれない状況では
-    //   遅延しない (待つ意味が無いコストを払わせない)。
-    const release = await this.release.waitFor(body.length);
-
-    // ★ Hint は必ず Stem を通す (HintRouter.originate の中で行う)。
-    //   直接 flood すると発信元が隣人に割れ、それは
-    //   「誰がその投稿を書いたか」が割れることと同じになる。
-    await this.hintRouter.originate(hint, hintId(hint));
-    return { hint, release };
+  /**
+   * 本体が網に現れた後で、索引 (Hint) をオニオン回路で放流する。
+   *
+   * ★ 本体の配送と Hint の放流を時間で切り離す (§18.4.5)。
+   *   同時に出ると、両方を観測できる位置にいる者に紐づけられる。
+   *   小さい送信や、網が小さくて匿名集合が生まれない状況では遅延しない。
+   *
+   * @param bodyBytes 本体の大きさ (遅延の計算に使う)
+   */
+  public async releaseHint(
+    hint: HintPacket,
+    bodyBytes: number,
+  ): Promise<{ released: boolean; release: ReleaseStatus }> {
+    const release = await this.release.waitFor(bodyBytes);
+    const released = await this.hintRouter.originate(hint, hintId(hint));
+    return { released, release };
   }
 
   /** Hint から本体を取りに行く */

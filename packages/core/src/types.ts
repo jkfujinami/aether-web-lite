@@ -136,7 +136,6 @@ export interface ISignalingClient {
 
 // ── Mailbox (DHT) ──
 export interface IMailbox {
-  publish(topicHashHex: string, data: Uint8Array): Promise<void>;
   fetch(topicHashHex: string): Promise<Uint8Array[]>;
   replicate(targetPeerId: string, topicHash: string, entries: Uint8Array[]): void;
 }

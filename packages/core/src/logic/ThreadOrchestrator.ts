@@ -439,18 +439,12 @@ export class ThreadOrchestrator {
 
       this.updateStatus('submitting', '送信完了 (配信待機中...)', true, 100);
 
-      // 物理送信 (バックグラウンド)
-      this.router.broadcast(packet).catch((err: any) => {
-        log.error('ゴシップ送信に失敗:', err);
-      });
-
-      // ★ 本体はランダムな Slot へ、その在り処は Hint で配る。
+      // 物理送信 (バックグラウンド)。
+      // ★ 本体はランダムな Slot へ、その在り処は Hint で配る。どちらもオニオン回路に載る。
       //   旧実装は `topicHash = SHA512(threadKey)` という固定鍵に置いていたが、
       //   これはスレッド鍵を持つ者なら誰でも計算できるため、GET を受けた
       //   K 人に「この IP はこのスレを読んでいる」が直接漏れていた。
-      this.schrodinger.publish(this.currentThreadKey, rawPacketData, Date.now()).catch((err: any) => {
-        log.warn('Schrodinger publish failed:', err);
-      });
+      this.sendAnonymously(packet, this.currentThreadKey, Date.now(), rawPacketData.length);
 
       this.updateStatus('idle', '計算完了！送信中...', false, 0);
       setTimeout(() => this.updateStatus('idle', ''), 3000);
@@ -459,6 +453,24 @@ export class ThreadOrchestrator {
       log.error('Failed to prepare packet:', err);
       this.updateStatus('error', '🔴 失敗: ' + err.toString());
     }
+  }
+
+  /**
+   * 投稿をオニオン回路で送り出す (BoardOrchestrator.sendAnonymously と同じ方針)。
+   * 回路で届かなかった場合は平文に落とさず、その旨を表示する (Fail-Closed)。
+   */
+  private sendAnonymously(packet: any, key: Uint8Array, messageId: number, bodyBytes: number): void {
+    const slot = this.schrodinger.prepareSlot(key, messageId);
+    void (async () => {
+      const delivered = await this.router.broadcast(packet, { slot: slot.exitSlot });
+      if (!delivered) {
+        this.updateStatus('error', '匿名経路で送信できませんでした (平文での送信は行っていません)。隣人が増えてから再度お試しください。');
+        return;
+      }
+      await this.schrodinger.releaseHint(slot.hint, bodyBytes);
+    })().catch((err: any) => {
+      log.error('[ThreadOrchestrator] anonymous send failed:', err);
+    });
   }
 
   /**

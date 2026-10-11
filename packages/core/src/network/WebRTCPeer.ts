@@ -34,6 +34,7 @@ export class WebRTCPeer implements IPeerConnection {
   private _connecting = true;
   private _verified = false;
   private _pubkey: Uint8Array | null = null;
+  private _powCounter: number | null = null;
   /** 相手に送ったチャレンジ。JOIN の署名検証に使う */
   private _challenge: Uint8Array | null = null;
   private opts: WebRTCPeerOptions;
@@ -54,6 +55,11 @@ export class WebRTCPeer implements IPeerConnection {
   /** 検証済みの Ed25519 公開鍵 */
   public get pubkey(): Uint8Array | null {
     return this._pubkey;
+  }
+
+  /** 検証済みの NodeId PoW の解 (PEX で隣人の claim を紹介するために保持する) */
+  public get powCounter(): number | null {
+    return this._powCounter;
   }
 
   public get challenge(): Uint8Array | null {
@@ -228,9 +234,10 @@ export class WebRTCPeer implements IPeerConnection {
   }
 
   /** Bound Identity の検証に成功した印を付ける */
-  public markVerified(pubkey?: Uint8Array) {
+  public markVerified(pubkey?: Uint8Array, powCounter?: number) {
     this._verified = true;
     if (pubkey) this._pubkey = pubkey;
+    if (typeof powCounter === 'number') this._powCounter = powCounter;
   }
 
   public close(): void {
