@@ -28,14 +28,29 @@ const log = createLogger('net.peer');
 /** peerId は Bound Identity なので hex 32 文字に固定されている */
 const PEER_ID_RE = /^[0-9a-f]{32}$/;
 
-/** WireType → レートリミッタのカテゴリ */
-const RATE_CATEGORY: Partial<Record<WireType, string>> = {
+/**
+ * WireType → レートリミッタのカテゴリ。
+ *
+ * ★ すべての WireType を必ずどこかに割り当てる (Record で網羅を型検査させる)。
+ *   旧実装は Partial で、HINT / HINT_STEM / DHT_PUT_STEM / PING / PONG / RING_INFO が
+ *   表から漏れて無制限に受け付けられていた。
+ */
+const RATE_CATEGORY: Record<Exclude<WireType, WireType.UNKNOWN>, string> = {
   [WireType.HELLO]: 'handshake',
   [WireType.JOIN]: 'handshake',
+  [WireType.RING_INFO]: 'control',
+  [WireType.PING]: 'control',
+  [WireType.PONG]: 'control',
+  [WireType.LOCAL_LINK_REQ]: 'control',
+  [WireType.LOCAL_LINK_ACK]: 'control',
+  [WireType.LOCAL_LINK_REJ]: 'control',
   [WireType.GOSSIP]: 'gossip',
   [WireType.STEM]: 'gossip',
-  [WireType.ONION_STEM]: 'gossip',
+  [WireType.HINT]: 'gossip',
+  [WireType.HINT_STEM]: 'gossip',
+  [WireType.ONION_STEM]: 'onion',
   [WireType.DHT_PUT]: 'dhtPut',
+  [WireType.DHT_PUT_STEM]: 'dhtPut',
   [WireType.DHT_GET]: 'dhtGet',
   [WireType.DHT_RES]: 'dhtGet',
   [WireType.PEX_REQUEST]: 'pex',
@@ -49,6 +64,31 @@ const RATE_CATEGORY: Partial<Record<WireType, string>> = {
  * これ以外は Bound Identity の検証が済むまで一切ディスパッチしない。
  */
 const PRE_HANDSHAKE_TYPES = new Set<WireType>([WireType.HELLO, WireType.JOIN]);
+
+/**
+ * WireType ごとのフレーム長の上限 (bytes)。デコードの前に確かめる。
+ *
+ * レート制限は件数しか数えないので、1 件を巨大にすると (再組み立ての上限 1MB)
+ * msgpack のデコード負荷を何百倍にも水増しできる。正規のメッセージが
+ * 取りうる大きさに余裕を持たせた値で切る。DHT だけは複数エントリを運ぶので大きい。
+ */
+const MAX_FRAME_BYTES: Partial<Record<WireType, number>> = {
+  [WireType.HELLO]: 256,
+  [WireType.JOIN]: 1024,
+  [WireType.PING]: 256,
+  [WireType.PONG]: 256,
+  [WireType.ONION_STEM]: 4096,
+  [WireType.GOSSIP]: 8 * 1024,
+  [WireType.STEM]: 8 * 1024,
+  [WireType.HINT]: 1024,
+  [WireType.HINT_STEM]: 1024,
+  [WireType.PEX_REQUEST]: 256,
+  [WireType.PEX_RESPONSE]: 4096,
+  [WireType.SDP_RELAY]: 16 * 1024,
+  [WireType.ICE_RELAY]: 4096,
+  [WireType.DHT_GET]: 1024,
+};
+const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
 
 /** ハンドシェイク未完了の接続の同時上限 */
 const MAX_PENDING_PEERS = 8;
@@ -570,9 +610,13 @@ export class PeerManager implements IPeerManager {
       return;
     }
 
-    const decoded = (data instanceof Uint8Array)
-      ? WireCodec.decode(data)
-      : WireCodec.decode(new TextEncoder().encode(data));
+    const bytes = (data instanceof Uint8Array) ? data : new TextEncoder().encode(data);
+    const limit = MAX_FRAME_BYTES[bytes[0] as WireType] ?? DEFAULT_MAX_FRAME_BYTES;
+    if (bytes.byteLength > limit) {
+      log.debug(() => `dropped oversized frame (type=0x${bytes[0]?.toString(16)}, ${bytes.byteLength}B) from ${peerId.substring(0, 8)}`);
+      return;
+    }
+    const decoded = WireCodec.decode(bytes);
 
     const peer = this._peers.get(peerId);
     // 違反点は「本人確認が済んだ peerId」にだけ付ける。未検証の接続の
@@ -588,12 +632,15 @@ export class PeerManager implements IPeerManager {
       return;
     }
 
-    const category = RATE_CATEGORY[decoded.type];
-    if (category && !this.rateLimiter.allow(peerId, category)) {
-      if (authenticated &&
-          this.misbehavior.recordViolation(peerId, ViolationType.RATE_LIMIT_EXCEEDED, 'Rate limit exceeded')) {
-        this.disconnect(peerId);
-      }
+    // ★ レート超過は「捨てる」だけで、違反点は付けない。
+    //   Gossip は正直な隣人がそのまま中継してくるものなので、網全体で投稿が
+    //   集中すると正直な隣人も一時的に上限を超える。旧実装はこれに 25 点を付けて
+    //   4 回で BAN していたため、攻撃者が安い PoW のパケットを網に流すだけで
+    //   正直なノード同士が互いを BAN し合い、網が自然に分断された。
+    //   流量の上限はトークンバケットが既に保証している。
+    const category = RATE_CATEGORY[decoded.type as Exclude<WireType, WireType.UNKNOWN>] ?? 'unknown';
+    if (!this.rateLimiter.allow(peerId, category)) {
+      log.trace(() => `rate limited ${category} from ${peerId.substring(0, 8)}`);
       return;
     }
 

@@ -116,4 +116,40 @@ describe('PeerManager 要塞化 (Hardening Integration Tests)', () => {
     expect(peerManagerA.peers.size).toBeLessThanOrEqual(8);
     delete (globalThis as any).RTCPeerConnection;
   });
+
+  describe('レート制限 (H2)', () => {
+    const PEER = 'cafe0000000000000000000000000001';
+
+    function attachVerified() {
+      const peer: any = { peerId: PEER, isVerified: true, isConnected: true, close: vi.fn(), send: vi.fn() };
+      (peerManagerA as any)._peers.set(PEER, peer);
+      return peer;
+    }
+
+    it('以前は表から漏れていた HINT / PING も制限され、超過しても BAN はしない', () => {
+      attachVerified();
+      const seen = { hint: 0, ping: 0 };
+      dispatcherA.register(WireType.HINT, () => seen.hint++);
+      dispatcherA.register(WireType.PING, () => seen.ping++);
+
+      for (let i = 0; i < 500; i++) {
+        (peerManagerA as any).handleData(PEER, WireCodec.encode(WireType.HINT, { version: 1 }));
+        (peerManagerA as any).handleData(PEER, WireCodec.encode(WireType.PING, { ts: i }));
+      }
+      expect(seen.hint).toBeLessThan(500);
+      expect(seen.ping).toBeLessThan(500);
+      // 正直な隣人でも一時的に超えうるので、点は付けない (BAN の連鎖を起こさない)
+      expect(peerManagerA.misbehavior.getScore(PEER)).toBe(0);
+      expect(peerManagerA.peers.has(PEER)).toBe(true);
+    });
+
+    it('WireType ごとの上限を超える巨大フレームはデコードせずに捨てる', () => {
+      attachVerified();
+      let delivered = 0;
+      dispatcherA.register(WireType.GOSSIP, () => delivered++);
+      const huge = WireCodec.encode(WireType.GOSSIP, { packet: { payload: new Uint8Array(64 * 1024) } });
+      (peerManagerA as any).handleData(PEER, huge);
+      expect(delivered).toBe(0);
+    });
+  });
 });

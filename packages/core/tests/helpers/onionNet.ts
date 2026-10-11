@@ -17,7 +17,7 @@ export const FAST_POW = { difficulty: 0, opsLimit: 1, memLimit: 8192 };
 
 /** テスト用に十分緩いレート制限 (cover traffic を短い間隔で回すため) */
 const LOOSE_LIMITS = Object.fromEntries(
-  ['gossip', 'dhtPut', 'dhtGet', 'pex', 'handshake', 'signaling', 'control'].map(k => [k, { ratePerSec: 1e6, burst: 1e6 }]),
+  ['gossip', 'dhtPut', 'dhtGet', 'pex', 'handshake', 'signaling', 'control', 'onion'].map(k => [k, { ratePerSec: 1e6, burst: 1e6 }]),
 );
 
 export interface SimNode {
