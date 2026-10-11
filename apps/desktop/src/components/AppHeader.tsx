@@ -3,9 +3,10 @@ import { useP2P } from '@/providers/P2PProvider';
 import { KeyManager, type BoardRecord } from '@aether/core';
 import { DEFAULT_BOARD_ID, newBoardId, parseShareCode } from '@/lib/boardKeys';
 import { SecurityInfo } from './SecurityInfo';
+import { TrackerSettings } from './TrackerSettings';
 
 export function AppHeader() {
-  const { node, identity, db, panicWipe, lock } = useP2P();
+  const { node, identity, db, panicWipe, lock, trackerUrl } = useP2P();
   const [peerCount, setPeerCount] = useState(0);
   const [boards, setBoards] = useState<BoardRecord[]>([]);
   const [showImport, setShowImport] = useState(false);
@@ -13,6 +14,7 @@ export function AppHeader() {
   const [importError, setImportError] = useState<string | null>(null);
   const [confirmWipe, setConfirmWipe] = useState(false);
   const [showSecurity, setShowSecurity] = useState(false);
+  const [showTracker, setShowTracker] = useState(false);
 
   useEffect(() => {
     if (!node) return;
@@ -137,6 +139,16 @@ export function AppHeader() {
 
         <button
           className="btn"
+          onClick={() => setShowTracker((v) => !v)}
+          disabled={!node}
+          title={trackerUrl ? 'トラッカーの設定' : 'トラッカーが未設定です'}
+          style={{ padding: '3px 10px', fontSize: '11px', ...(node && !trackerUrl ? { borderColor: '#eab308', color: '#eab308' } : {}) }}
+        >
+          {node && !trackerUrl ? 'トラッカー未設定' : 'トラッカー'}
+        </button>
+
+        <button
+          className="btn"
           onClick={() => setShowSecurity((v) => !v)}
           style={{ padding: '3px 10px', fontSize: '11px' }}
         >
@@ -168,6 +180,12 @@ export function AppHeader() {
           <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '10px' }}>
             <button className="btn" onClick={() => setShowSecurity(false)}>閉じる</button>
           </div>
+        </div>
+      )}
+
+      {showTracker && (
+        <div className="card" style={{ position: 'absolute', top: '50px', right: '15px', zIndex: 10, width: '420px' }}>
+          <TrackerSettings onClose={() => setShowTracker(false)} />
         </div>
       )}
 

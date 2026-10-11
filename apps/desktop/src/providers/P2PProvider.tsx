@@ -3,6 +3,8 @@ import {
   AetherNode,
   IndexedDBStore,
   WrongPassphraseError,
+  parseTrackerUrl,
+  describeTrackerUrlError,
   type BoardOrchestrator,
   type ThreadOrchestrator,
   type Identity,
@@ -10,7 +12,12 @@ import {
   createLogger,
 } from '@aether/core';
 
+import { loadTrackerUrl, saveTrackerUrl } from '@/lib/trackerSetting';
+
 const log = createLogger('ui.p2p');
+
+/** トラッカーの設定結果。ok でも、接続できなかった場合は notice に理由が入る */
+export type TrackerSaveResult = { ok: true; notice?: string } | { ok: false; error: string };
 
 /**
  * ロックの状態。
@@ -46,6 +53,10 @@ interface P2PContextType {
   panicWipe: () => Promise<void>;
   /** ロック: データは消さずに通信を止め、メモリ上の鍵を消してパスワード画面に戻る */
   lock: () => Promise<void>;
+  /** 接続先のトラッカー (未設定なら null) */
+  trackerUrl: string | null;
+  /** トラッカーを設定する (null で消す)。暗号化 DB に保存し、すぐ接続し直す */
+  setTrackerUrl: (url: string | null) => Promise<TrackerSaveResult>;
 }
 
 const noop = async () => {};
@@ -64,6 +75,8 @@ export const P2PContext = createContext<P2PContextType>({
   resetAll: noop,
   panicWipe: noop,
   lock: noop,
+  trackerUrl: null,
+  setTrackerUrl: async () => ({ ok: false, error: 'ロックを解除してください' }),
 });
 
 export const P2PContextForTest = P2PContext;
@@ -82,6 +95,7 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
   const [node, setNode] = useState<AetherNode | null>(null);
   const [lockState, setLockState] = useState<LockState>('checking');
   const [unlockError, setUnlockError] = useState<string | null>(null);
+  const [trackerUrl, setTrackerUrlState] = useState<string | null>(null);
   const storeRef = useRef<IndexedDBStore | null>(null);
   const nodeRef = useRef<AetherNode | null>(null);
 
@@ -115,8 +129,18 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
         db: store(),
         passphrase,
         releaseMode: 'adaptive',
-        autoStart: true,
+        autoStart: false,
       });
+      try {
+        // トラッカーの設定は暗号化 DB にあるので、ロック解除後に読んでから起動する
+        const url = await loadTrackerUrl(aether.db);
+        if (url) await aether.setTrackerUrl(url);
+        await aether.start();
+      } catch (err) {
+        await aether.stop().catch(() => {});
+        throw err;
+      }
+      setTrackerUrlState(aether.trackerUrl);
       nodeRef.current = aether;
       setNode(aether);
       setLockState('ready');
@@ -169,6 +193,27 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
     setLockState('locked');
   }, []);
 
+  const setTrackerUrl = useCallback(async (input: string | null): Promise<TrackerSaveResult> => {
+    const current = nodeRef.current;
+    if (!current) return { ok: false, error: 'ロックを解除してください' };
+    let url: string | null = null;
+    if (input !== null) {
+      const parsed = parseTrackerUrl(input);
+      if (!parsed.ok) return { ok: false, error: describeTrackerUrlError(parsed.reason) };
+      url = parsed.url;
+    }
+    await saveTrackerUrl(current.db, url);
+    try {
+      await current.setTrackerUrl(url);
+    } catch {
+      // 設定は済んでいる。到達できなければ、ノードが定期的に再試行する
+      setTrackerUrlState(current.trackerUrl);
+      return { ok: true, notice: '保存しました。いまは接続できませんでした (自動で再試行します)' };
+    }
+    setTrackerUrlState(current.trackerUrl);
+    return { ok: true };
+  }, []);
+
   // トレイ (Electron のメインプロセス) からのロック / 緊急消去
   useEffect(() => {
     const api = (typeof window !== 'undefined' ? (window as any).electronAPI : undefined);
@@ -195,6 +240,8 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
         resetAll,
         panicWipe,
         lock,
+        trackerUrl: node ? trackerUrl : null,
+        setTrackerUrl,
       }}
     >
       {children}

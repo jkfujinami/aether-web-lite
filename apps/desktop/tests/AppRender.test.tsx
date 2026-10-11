@@ -101,7 +101,7 @@ describe('Desktop UI Rendering & Workflows (AETHER Specification)', () => {
       fireEvent.click(screen.getByText('安全性について'));
       expect(screen.getByText('守れないこと')).toBeTruthy();
       expect(screen.getByText(/国全体の通信を監視できる相手/)).toBeTruthy();
-      expect(screen.getByText(/IP アドレスは接続先の端末と通信事業者/)).toBeTruthy();
+      expect(screen.getByText(/IP アドレスは接続先の端末、トラッカーの運営者、通信事業者/)).toBeTruthy();
     });
 
     it('ロックボタンで lock が呼ばれる (データは消さない)', async () => {

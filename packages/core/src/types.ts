@@ -131,6 +131,10 @@ export interface IMessageDispatcher {
 // ── Signaling Client ──
 export interface ISignalingClient {
   readonly isConnected?: boolean;
+  /** 現在の接続先 (未設定なら null)。URL を持たない実装 (テスト用など) では undefined */
+  readonly url?: string | null;
+  /** 接続先を変える。不正な URL は例外。既存の接続は切る */
+  setUrl?(url: string | null): void;
   connect(options: { claim: WireNodeClaim; turnstileToken?: string }): Promise<void>;
   sendRelay(targetPeerId: PeerId, payload: any): void;
   disconnect(): void;

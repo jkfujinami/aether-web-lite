@@ -8,7 +8,8 @@ import { PoWEngine } from '../crypto/PoWEngine';
 import { KeyManager } from '../crypto/KeyManager';
 import { Identity } from '../crypto/Identity';
 import { MessageDispatcher } from '../network/MessageDispatcher';
-import { SignalingClient } from '../network/SignalingClient';
+import { SignalingClient, TrackerNotConfiguredError } from '../network/SignalingClient';
+import { parseTrackerUrl } from '../network/TrackerUrl';
 import { RateLimiter } from '../network/RateLimiter';
 import { PeerManager } from '../network/PeerManager';
 import { ZoneManager } from '../network/ZoneManager';
@@ -32,7 +33,12 @@ import { createLogger } from '../common/Logger';
 const log = createLogger('node.facade');
 
 export interface AetherNodeConfig {
-  signalingUrl?: string;
+  /**
+   * トラッカー (シグナリングサーバ) の URL。公式のトラッカーは無いので利用者が設定する。
+   * wss:// のみ (ws:// は localhost に限る)。未設定 (null / 省略) なら接続しない。
+   * 起動後の変更は {@link AetherNode.setTrackerUrl}。
+   */
+  trackerUrl?: string | null;
   signalingClient?: ISignalingClient;
   turnstileToken?: string;
   releaseMode?: ReleaseMode;
@@ -157,6 +163,12 @@ export class AetherNode {
   public static async create(config: AetherNodeConfig = {}): Promise<AetherNode> {
     await sodiumReady;
 
+    // 不正なトラッカー URL は、鍵の導出やデータの解錠より前に拒否する
+    if (config.trackerUrl && !config.signalingClient) {
+      const parsed = parseTrackerUrl(config.trackerUrl);
+      if (!parsed.ok) throw new Error(`invalid tracker URL: ${parsed.reason}`);
+    }
+
     // 1. ストレージ (パスワード必須。ロックを解除しない限りデータは読み書きできない)
     const passphrase = config.passphrase ?? '';
     if (passphrase.length === 0) {
@@ -196,7 +208,7 @@ export class AetherNode {
 
     // 4. 通信・ルーティング
     const dispatcher = new MessageDispatcher();
-    const signaling = config.signalingClient || new SignalingClient(config.signalingUrl);
+    const signaling = config.signalingClient || new SignalingClient(config.trackerUrl ?? null);
     const rateLimiter = new RateLimiter();
     const peerManager = new PeerManager(nodeIdentity, dispatcher, signaling, { rateLimiter });
     const zoneManager = new ZoneManager(peerManager);
@@ -305,7 +317,12 @@ export class AetherNode {
     try {
       await this.peerManager.start();
     } catch (err) {
-      log.warn('Could not connect to signaling tracker on start, continuing in local/p2p mode', err);
+      if (err instanceof TrackerNotConfiguredError) {
+        log.info(() => 'No tracker configured; waiting for one to be set');
+      } else {
+        // URL はログに出さない (どのネットワークに参加しているかの手掛かりになる)
+        log.warn(() => 'Could not reach the tracker on start; will retry periodically');
+      }
     }
     log.info(() => 'AetherNode started');
   }
@@ -363,5 +380,33 @@ export class AetherNode {
 
   public get running(): boolean {
     return this.isStarted;
+  }
+
+  /** 現在のトラッカー URL (未設定なら null) */
+  public get trackerUrl(): string | null {
+    return this.signaling.url ?? null;
+  }
+
+  /** トラッカーへ接続中か (登録後しばらくすると切り離すので、普段は false) */
+  public get trackerConnected(): boolean {
+    return this.signaling.isConnected === true;
+  }
+
+  /**
+   * トラッカーを変更する (null で未設定に戻す)。不正な URL は例外で、設定は変わらない。
+   * 起動中なら新しいトラッカーへ接続し直し、到達できなければ例外を返す
+   * (設定自体は変わっており、以後は定期的に再試行する)。
+   */
+  public async setTrackerUrl(url: string | null): Promise<void> {
+    if (this.isDestroyed) throw new Error('AetherNode: node is stopped');
+    if (!this.signaling.setUrl) throw new Error('signaling client does not support changing the tracker');
+    let normalized: string | null = null;
+    if (url !== null) {
+      const parsed = parseTrackerUrl(url);
+      if (!parsed.ok) throw new Error(`invalid tracker URL: ${parsed.reason}`);
+      normalized = parsed.url;
+    }
+    this.signaling.setUrl(normalized);
+    if (this.isStarted && normalized) await this.peerManager.reconnectTracker();
   }
 }

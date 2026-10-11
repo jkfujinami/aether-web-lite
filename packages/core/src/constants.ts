@@ -36,10 +36,5 @@ export const RING_MESH_ZONE = {
   DEPTH_RECOMPUTE_INTERVAL: 60_000,
 } as const;
 
-export const TRACKER = {
-  // Next.js カスタムサーバーの /ws で WebSocket シグナリングに接続
-  // HTTP と WS が同一ポート (3000) で動作するため、ngrok 1つで公開可能
-  URL: (typeof location !== 'undefined' && location.host) 
-    ? `ws${location.protocol === 'https:' ? 's' : ''}://${location.host}/ws`
-    : 'ws://localhost:3000/ws'
-} as const;
+// トラッカーの URL は固定しない (公式のトラッカーは無い)。network/TrackerUrl.ts と
+// AetherNodeConfig.trackerUrl を参照。

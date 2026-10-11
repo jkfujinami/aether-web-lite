@@ -15,7 +15,7 @@ describe('AetherNode Facade', () => {
 
     const node = await AetherNode.create({
       db,
-      signalingUrl: 'ws://localhost:9999/ws',
+      trackerUrl: 'ws://localhost:9999/ws',
       releaseMode: 'disabled',
       autoStart: false,
       passphrase: 'test-passphrase',

@@ -126,13 +126,17 @@ export class DataVault {
   /** 復号する。鍵違い・改竄・すり替えはいずれも null */
   open<T = any>(blob: unknown, ad: string): T | null {
     this.assertOpen();
-    if (!(blob instanceof Uint8Array) || blob.length <= NONCE_BYTES) return null;
+    // IndexedDB から戻る値は別の realm の Uint8Array のことがある (テスト環境の jsdom など)。
+    // instanceof では弾かれ、libsodium も受け付けないので、型タグで判定してこの realm に写す。
+    if (Object.prototype.toString.call(blob) !== '[object Uint8Array]') return null;
+    const bytes = blob instanceof Uint8Array ? blob : new Uint8Array(blob as ArrayLike<number>);
+    if (bytes.length <= NONCE_BYTES) return null;
     try {
       const pt = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
         null,
-        blob.subarray(NONCE_BYTES),
+        bytes.subarray(NONCE_BYTES),
         new TextEncoder().encode(ad),
-        blob.subarray(0, NONCE_BYTES),
+        bytes.subarray(0, NONCE_BYTES),
         this.encKey,
       );
       return msgpackDecode(pt) as T;

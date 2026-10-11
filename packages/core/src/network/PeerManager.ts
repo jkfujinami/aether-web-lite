@@ -22,6 +22,7 @@ import {
   type SignedNodeClaim,
 } from '../crypto/NodeIdentity';
 import { toBytes } from '../crypto/PowPolicy';
+import { TrackerNotConfiguredError } from './SignalingClient';
 import { createLogger } from '../common/Logger';
 
 const log = createLogger('net.peer');
@@ -410,11 +411,40 @@ export class PeerManager implements IPeerManager {
 
   public async start(): Promise<void> {
     log.debug(`Starting as ${this.myPeerId} (bound position: ${this.myPosition.toFixed(6)})`);
-
-    // 購読ゾーンは送らない。トラッカーに申告すると、そのピアが何に興味を
-    // 持っているかをトラッカーと全ピアに晒すことになる (本家 18.6.2 の交差攻撃)。
     this.stopped = false;
+
+    // 接続数低下時または孤立防止の動的再アナウンス (Adaptive Re-announce)。
+    // ★ 旧実装は最初のトラッカー接続が成功した後にだけこれを仕掛けていたため、
+    //   起動時にトラッカーへ届かないと二度と再試行しなかった。先に仕掛ける。
+    if (this.reannounceTimer) clearInterval(this.reannounceTimer);
+    this.reannounceTimer = setInterval(() => {
+      if (this.stopped) return;
+      if (this.degree < 4 && !this.signaling.isConnected) {
+        log.info(`Degree dropped to ${this.degree} (< 4). Reconnecting to tracker for network repair.`);
+        this.connectTracker().catch((err) => {
+          if (err instanceof TrackerNotConfiguredError) return;
+          log.warn(`Adaptive tracker reconnect failed: ${err}`);
+        });
+      }
+    }, 30_000);
+
+    await this.connectTracker();
+  }
+
+  /**
+   * トラッカーへ接続して自身を登録し、しばらくしたら切り離す。
+   *
+   * 購読ゾーンは送らない。トラッカーに申告すると、そのピアが何に興味を
+   * 持っているかをトラッカーと全ピアに晒すことになる (本家 18.6.2 の交差攻撃)。
+   * 接続し続けないのも同じ理由で、トラッカーが見られる期間を短くするため。
+   */
+  private async connectTracker(): Promise<void> {
+    if (this.stopped) return;
     await this.signaling.connect({ claim: this.identity.claim() });
+    if (this.stopped) {
+      this.signaling.disconnect();
+      return;
+    }
 
     if (this.detachTimer) clearTimeout(this.detachTimer);
     this.detachTimer = setTimeout(() => {
@@ -422,18 +452,19 @@ export class PeerManager implements IPeerManager {
       log.debug(`Detaching from Tracker Server! Entering Fully Decentralized Mode.`);
       this.signaling.disconnect();
     }, 15_000);
+  }
 
-    // 接続数低下時または孤立防止の動的再アナウンス (Adaptive Re-announce)
-    if (this.reannounceTimer) clearInterval(this.reannounceTimer);
-    this.reannounceTimer = setInterval(() => {
-      if (this.stopped) return;
-      if (this.degree < 4 && !this.signaling.isConnected) {
-        log.info(`Degree dropped to ${this.degree} (< 4). Reconnecting to tracker for network repair.`);
-        this.signaling.connect({ claim: this.identity.claim() }).catch((err) => {
-          log.warn(`Adaptive tracker reconnect failed: ${err}`);
-        });
-      }
-    }, 30_000);
+  /**
+   * トラッカーの設定を変えた直後に呼ぶ。停止中は何もしない。
+   * 失敗 (未設定・到達不能) は例外で返す。以後は再アナウンスが再試行する。
+   */
+  public async reconnectTracker(): Promise<void> {
+    if (this.stopped) return;
+    if (this.detachTimer) {
+      clearTimeout(this.detachTimer);
+      this.detachTimer = null;
+    }
+    await this.connectTracker();
   }
 
   /**

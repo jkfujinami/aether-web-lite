@@ -57,7 +57,14 @@ export { ChunkedReceiver } from './network/stream/ChunkedReceiver';
 // ── Network & Routing ──
 export { PeerManager } from './network/PeerManager';
 export { WebRTCPeer } from './network/WebRTCPeer';
-export { SignalingClient } from './network/SignalingClient';
+export { SignalingClient, TrackerNotConfiguredError } from './network/SignalingClient';
+export {
+  parseTrackerUrl,
+  describeTrackerUrlError,
+  TRACKER_URL_MAX_LENGTH,
+  type TrackerUrlError,
+  type TrackerUrlResult,
+} from './network/TrackerUrl';
 export { MessageDispatcher } from './network/MessageDispatcher';
 export { ZoneManager } from './network/ZoneManager';
 export { ZoneGossipRouter } from './network/gossip/ZoneGossipRouter';

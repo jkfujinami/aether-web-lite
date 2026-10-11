@@ -75,7 +75,10 @@ export class DHTMailbox implements IMailbox {
     dispatcher.register(WireType.DHT_RES, (peerId, msg) => this.handleRes(peerId, msg));
     circuit.onExit('exit_fluff', (payload) => {
       if (payload.type === 'exit_fluff' && payload.slot) {
-        void this.storeSlotAsExit(payload.slot.topicHash, payload.slot.hint, payload.packet);
+        // 停止 (ロック) 直後に届いた分は保管できずに失敗する。未処理の reject にしない
+        this.storeSlotAsExit(payload.slot.topicHash, payload.slot.hint, payload.packet).catch((err) => {
+          log.debug(() => `exit slot store failed: ${(err as Error)?.message ?? err}`);
+        });
       }
     });
   }

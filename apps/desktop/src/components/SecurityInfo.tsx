@@ -17,7 +17,7 @@ export function SecurityInfo({ compact = false }: { compact?: boolean }) {
 
       <div style={{ fontWeight: 700, color: '#ef4444', marginBottom: '4px' }}>守れないこと</div>
       <ul style={{ margin: '0 0 0 18px', padding: 0 }}>
-        <li>AETHER を使っていること自体。あなたの IP アドレスは接続先の端末と通信事業者 (ISP) から見えます。端末に AETHER が入っていることも隠せません。</li>
+        <li>AETHER を使っていること自体。あなたの IP アドレスは接続先の端末、トラッカーの運営者、通信事業者 (ISP) から見えます。端末に AETHER が入っていることも隠せません。</li>
         <li>国全体の通信を監視できる相手。そのような環境での告発には使わないでください。</li>
         <li>職場など所属組織のネットワークや端末からの利用。組織内の調査では、利用者であること自体から特定され得ます。</li>
         <li>ロックを解除している間の端末の押収。席を離れるときはロックしてください。</li>
