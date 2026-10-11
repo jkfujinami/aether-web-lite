@@ -1,3 +1,7 @@
+import { createLogger } from '../common/Logger';
+
+const log = createLogger('logic.dag');
+
 // DAGMetadata is not used here directly as an object, so removing unused import
 
 /**
@@ -39,7 +43,7 @@ export class ThreadDAGManager {
     
     // スレッドIDの一致確認
     if (post.thread_id !== this.threadId) {
-      console.warn(`[DAGManager] Thread ID mismatch: ${post.thread_id} !== ${this.threadId}`);
+      log.warn(`Thread ID mismatch: ${post.thread_id} !== ${this.threadId}`);
       return false;
     }
 

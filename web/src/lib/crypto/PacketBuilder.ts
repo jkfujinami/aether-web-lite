@@ -4,6 +4,9 @@ import type { ICryptoEngine, IIdentity, IPoWEngine, IKeyManager, GossipPacket } 
 import { Identity } from './Identity';
 import { MagicFilter } from './MagicFilter';
 import { derivePacketId, toBytes, type PowCommittedHeader } from './PowPolicy';
+import { createLogger } from '../common/Logger';
+
+const log = createLogger('crypto.packet');
 
 export class PacketBuilder {
   /**
@@ -135,7 +138,7 @@ export class PacketBuilder {
     try {
       isMatch = MagicFilter.quickCheck(threadKey, ciphertext, nonce);
     } catch (e: any) {
-      console.error(`[PacketBuilder] QuickCheck threw exception for packet ${packet.packet_id}:`, e);
+      log.error(`QuickCheck threw exception for packet ${packet.packet_id}:`, e);
       throw new Error(`QuickCheck failure: ${e.message}`);
     }
 
@@ -148,12 +151,12 @@ export class PacketBuilder {
     try {
       decPayloadBuf = cryptoEngine.decrypt(threadKey, { ciphertext, nonce });
     } catch (e: any) {
-      console.error(`[PacketBuilder] AEAD decryption crashed for packet ${packet.packet_id}:`, e);
+      log.error(`AEAD decryption crashed for packet ${packet.packet_id}:`, e);
       throw new Error(`AEAD decrypt crash: ${e.message}`);
     }
 
     if (!decPayloadBuf) {
-      console.debug(`[PacketBuilder] AEAD decryption failed (not a target packet or invalid key) for packet ${packet.packet_id}`);
+      log.trace(`AEAD decryption failed (not a target packet or invalid key) for packet ${packet.packet_id}`);
       return null;
     }
 
@@ -162,7 +165,7 @@ export class PacketBuilder {
     try {
       encPayload = decode(decPayloadBuf) as any;
     } catch (e: any) {
-      console.error(`[PacketBuilder] Msgpack decode (layer 1) failed for packet ${packet.packet_id}:`, e);
+      log.error(`Msgpack decode (layer 1) failed for packet ${packet.packet_id}:`, e);
       return null;
     }
 
@@ -171,7 +174,7 @@ export class PacketBuilder {
     try {
       innerPayload = decode(encPayload.inner_payload) as any;
     } catch (e: any) {
-      console.error(`[PacketBuilder] Msgpack decode (layer 2) failed for packet ${packet.packet_id}:`, e);
+      log.error(`Msgpack decode (layer 2) failed for packet ${packet.packet_id}:`, e);
       return null;
     }
     
@@ -203,12 +206,12 @@ export class PacketBuilder {
         new Uint8Array(innerPayload.session_sig)
       );
     } catch (e: any) {
-      console.error(`[PacketBuilder] Ed25519 signature verification crashed for packet ${packet.packet_id}:`, e);
+      log.error(`Ed25519 signature verification crashed for packet ${packet.packet_id}:`, e);
       return null;
     }
 
     if (!isValid) {
-      console.warn(`[PacketBuilder] Signature Verification Failed for packet: ${packet.packet_id}`);
+      log.warn(`Signature Verification Failed for packet: ${packet.packet_id}`);
       return null;
     }
 

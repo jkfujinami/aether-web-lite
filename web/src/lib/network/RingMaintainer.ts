@@ -2,6 +2,9 @@ import type { IPeerManager } from '../types';
 import { PEXHandler } from './PEXHandler';
 import { RingPosition } from './RingPosition';
 import { RING_MESH } from '../constants';
+import { createLogger } from '../common/Logger';
+
+const log = createLogger('net.ring');
 
 export class RingMaintainer {
   private timer: ReturnType<typeof setInterval>;
@@ -27,7 +30,7 @@ export class RingMaintainer {
            const connectedPeers = Array.from(this.peerManager.peers.values()).filter(p => p.isConnected);
            if (connectedPeers.length > 0) {
              const target = connectedPeers[Math.floor(Math.random() * connectedPeers.length)];
-             console.log(`[RingMaintainer] Only ${this.peerManager.degree} peers. Requesting PEX from ${target.peerId.substring(0,8)}...`);
+             log.debug(`Only ${this.peerManager.degree} peers. Requesting PEX from ${target.peerId.substring(0,8)}...`);
              this.pexHandler.requestPeers(target.peerId);
            }
          }
@@ -60,7 +63,7 @@ export class RingMaintainer {
       for (let i = 0; i < excess; i++) {
         const target = longRangeLinks.pop();
         if (target) {
-          console.log(`[RingMaintainer] Auto-healing: dropping excess long-range link ${target.peerId.substring(0,8)}`);
+          log.debug(`Auto-healing: dropping excess long-range link ${target.peerId.substring(0,8)}`);
           this.peerManager.disconnect(target.peerId);
         }
       }

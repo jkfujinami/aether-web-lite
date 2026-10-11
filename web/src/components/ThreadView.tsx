@@ -3,6 +3,9 @@
 import { use, useState, KeyboardEvent } from "react";
 import { useThread } from "@/hooks/useThread";
 import { KeyManager } from "@/lib/crypto/KeyManager";
+import { createLogger } from '@/lib/common/Logger';
+
+const log = createLogger('ui.thread');
 
 export default function ThreadView({
   boardId,
@@ -20,7 +23,7 @@ export default function ThreadView({
 
   const [replyInput, setReplyInput] = useState('');
 
-  console.log(`[TRACE:10-render] ThreadView render: ${posts.length} posts`);
+  log.trace(() => `ThreadView render: ${posts.length} posts`);
 
   const formatContent = (content: string) => {
     // 従来の置き換えロジック: sanitize してから >>1 などを着色

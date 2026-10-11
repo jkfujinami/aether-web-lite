@@ -2,6 +2,9 @@ import type { IPeerConnection, PeerId } from '../types';
 import { RingPosition } from './RingPosition';
 import { ChunkedSender } from './stream/ChunkedSender';
 import { ChunkedReceiver } from './stream/ChunkedReceiver';
+import { createLogger } from '../common/Logger';
+
+const log = createLogger('net.webrtc');
 
 interface WebRTCPeerOptions {
   localId: string;
@@ -85,7 +88,7 @@ export class WebRTCPeer implements IPeerConnection {
 
   private setupEvents(): void {
     this.pc.onicecandidate = (event) => {
-      console.log(`[WebRTCPeer ${this.peerId}] onicecandidate:`, event.candidate ? 'has candidate' : 'null (done)');
+      log.debug(`[WebRTCPeer ${this.peerId}] onicecandidate:`, event.candidate ? 'has candidate' : 'null (done)');
       if (event.candidate) {
         this.opts.onSignal(event.candidate);
       }
@@ -99,7 +102,7 @@ export class WebRTCPeer implements IPeerConnection {
 
     this.pc.oniceconnectionstatechange = () => {
       const state = this.pc.iceConnectionState;
-      console.log(`[WebRTCPeer ${this.peerId}] iceConnectionState:`, state);
+      log.debug(`[WebRTCPeer ${this.peerId}] iceConnectionState:`, state);
       if (state === 'disconnected' || state === 'failed') {
         this._connected = false;
         this._connecting = false;
@@ -112,14 +115,14 @@ export class WebRTCPeer implements IPeerConnection {
     channel.binaryType = 'arraybuffer';
 
     channel.onopen = () => {
-      console.log(`[WebRTCPeer] DataChannel open with ${this.peerId}`);
+      log.debug(`DataChannel open with ${this.peerId}`);
       this._connected = true;
       this._connecting = false;
       this.opts.onConnect();
     };
 
     channel.onclose = () => {
-      console.log(`[WebRTCPeer] DataChannel closed with ${this.peerId}`);
+      log.debug(`DataChannel closed with ${this.peerId}`);
       this._connected = false;
       this._connecting = false;
       this.opts.onDisconnect();
@@ -141,22 +144,22 @@ export class WebRTCPeer implements IPeerConnection {
       
       this.opts.onSignal(this.pc.localDescription);
     } catch (e) {
-      console.error(`[WebRTCPeer] Error creating offer`, e);
+      log.error(`Error creating offer`, e);
     }
   }
 
   private pendingCandidates: RTCIceCandidateInit[] = [];
 
   public async signal(data: any): Promise<void> {
-    console.log(`[WebRTCPeer ${this.peerId}] signal() called with:`, data.type);
+    log.debug(`[WebRTCPeer ${this.peerId}] signal() called with:`, data.type);
     try {
       if (data.sdp) {
-        console.log(`[WebRTCPeer ${this.peerId}] Setting remote description (${data.sdp.type})`);
+        log.debug(`[WebRTCPeer ${this.peerId}] Setting remote description (${data.sdp.type})`);
         const sdp = new RTCSessionDescription(data.sdp);
         await this.pc.setRemoteDescription(sdp);
         
         if (sdp.type === 'offer') {
-          console.log(`[WebRTCPeer ${this.peerId}] Creating answer`);
+          log.debug(`[WebRTCPeer ${this.peerId}] Creating answer`);
           const answer = await this.pc.createAnswer();
           await this.pc.setLocalDescription(answer);
 
@@ -165,24 +168,24 @@ export class WebRTCPeer implements IPeerConnection {
         }
         
         // バッファされたICE Candidateを処理
-        console.log(`[WebRTCPeer ${this.peerId}] Processing ${this.pendingCandidates.length} buffered candidates`);
+        log.debug(`[WebRTCPeer ${this.peerId}] Processing ${this.pendingCandidates.length} buffered candidates`);
         for (const candidate of this.pendingCandidates) {
-          await this.pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(e => console.error(e));
+          await this.pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(e => log.error(e));
         }
         this.pendingCandidates = [];
 
       } else if (data.candidate) {
-        console.log(`[WebRTCPeer ${this.peerId}] Received ICE candidate`);
+        log.debug(`[WebRTCPeer ${this.peerId}] Received ICE candidate`);
         if (this.pc.remoteDescription) {
           const candidate = new RTCIceCandidate(data.candidate);
-          await this.pc.addIceCandidate(candidate).catch(e => console.error(e));
+          await this.pc.addIceCandidate(candidate).catch(e => log.error(e));
         } else {
-          console.warn(`[WebRTCPeer ${this.peerId}] remoteDescription not set yet, buffering candidate!`);
+          log.warn(`[WebRTCPeer ${this.peerId}] remoteDescription not set yet, buffering candidate!`);
           this.pendingCandidates.push(data.candidate);
         }
       }
     } catch (e) {
-      console.error(`[WebRTCPeer ${this.peerId}] Error handling signal`, e);
+      log.error(`[WebRTCPeer ${this.peerId}] Error handling signal`, e);
     }
   }
 
@@ -195,7 +198,7 @@ export class WebRTCPeer implements IPeerConnection {
     // Use ChunkedSender: messages <= 4KB go through in one send(),
     // larger messages (e.g. DHT sync responses) are split into 4KB chunks.
     this.chunkedSender.send(this.channel, msg).catch((e) => {
-      console.error(`[WebRTCPeer] ChunkedSend failed`, e);
+      log.error(`ChunkedSend failed`, e);
     });
   }
 

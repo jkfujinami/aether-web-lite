@@ -1,3 +1,7 @@
+import { createLogger } from '../common/Logger';
+
+const log = createLogger('worker.bridge');
+
 /**
  * WorkerBridge
  * Web Worker とメインスレッドを Promise で繋ぐ架け橋。
@@ -22,7 +26,7 @@ export class WorkerBridge {
       this.worker = new Worker(new URL('./pow.worker.ts', import.meta.url), { type: 'module' });
       this.worker.onmessage = (e) => this.handleMessage(e);
       this.worker.onerror = (err) => {
-        console.error('[WorkerBridge] Worker error:', err);
+        log.error('Worker error:', err);
         this.rejectAll(new Error(`PoW worker error: ${err.message ?? 'unknown'}`));
         // 壊れた Worker は捨てて次回作り直す
         this.worker?.terminate();

@@ -1,6 +1,9 @@
 import type { GossipPacket } from '../../types';
 import { PacketBuilder } from '../../crypto/PacketBuilder';
 import { POW_POLICY, derivePacketId, verifyPow } from '../../crypto/PowPolicy';
+import { createLogger } from '../../common/Logger';
+
+const log = createLogger('net.validator');
 
 /**
  * 互換用エイリアス。値は {@link POW_POLICY} を単一の出所とする。
@@ -141,7 +144,7 @@ export class PacketValidator {
     const result = PacketValidator.check(packet, opts);
     if (!result.ok) {
       const id = typeof packet?.packet_id === 'string' ? packet.packet_id.substring(0, 8) : '????????';
-      console.warn(`[PacketValidator] Dropped ${id} (${result.reason})`);
+      log.warn(`Dropped ${id} (${result.reason})`);
     }
     return result.ok;
   }

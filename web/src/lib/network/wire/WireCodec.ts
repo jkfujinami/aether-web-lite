@@ -5,6 +5,11 @@ export interface DecodedWireMessage {
   type: WireType;
   payload: any;
 }
+/** 実在する WireType の集合。decode の判定に使う。 */
+const KNOWN_WIRE_TYPES: ReadonlySet<number> = new Set(
+  Object.values(WireType).filter((v): v is number => typeof v === 'number' && v !== WireType.UNKNOWN),
+);
+
 export class WireCodec {
   private static readonly REVERSE_TYPE_MAP: Record<number, string> = {
     [WireType.HELLO]: 'hello',
@@ -18,7 +23,10 @@ export class WireCodec {
     [WireType.ICE_RELAY]: 'ice-relay',
     [WireType.GOSSIP]: 'gossip',
     [WireType.STEM]: 'stem',
+    [WireType.HINT]: 'hint',
+    [WireType.HINT_STEM]: 'hint-stem',
     [WireType.DHT_PUT]: 'dht-put',
+    [WireType.DHT_PUT_STEM]: 'dht-put-stem',
     [WireType.DHT_GET]: 'dht-get',
     [WireType.DHT_RES]: 'dht-res',
   };
@@ -47,8 +55,12 @@ export class WireCodec {
   static decode(data: Uint8Array): DecodedWireMessage {
     const typeByte = data[0];
     
-    // First byte is one of our enums
-    if (typeByte >= 0x10 && typeByte <= 0x52) {
+    // ★ 範囲のハードコードはしない。
+    //   以前は `0x10 <= t <= 0x52` と書いていたため、範囲外に WireType を
+    //   足した瞬間に無言で JSON フォールバックへ落ち、
+    //   「送っているのに相手が一切受け取らない」という形で壊れた。
+    //   既知の WireType 集合そのもので判定する。
+    if (KNOWN_WIRE_TYPES.has(typeByte)) {
       try {
         const payload = decode(data.subarray(1));
         return { type: typeByte as WireType, payload };

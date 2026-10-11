@@ -5,6 +5,9 @@ import { useP2P } from '@/providers/P2PProvider';
 import { KeyManager } from '@/lib/crypto/KeyManager';
 import { ThreadRanker } from '@/lib/logic/ThreadRanker';
 import { ThreadMeta, BoardStatus } from '@/lib/logic/types';
+import { createLogger } from '@/lib/common/Logger';
+
+const log = createLogger('ui.board');
 
 const EMPTY_THREADS: ThreadMeta[] = [];
 const IDLE_STATUS: BoardStatus = { phase: 'idle', message: '初期化中...', isSubmitting: false, powProgress: 0 };
@@ -32,14 +35,12 @@ export function useBoard(boardId: string) {
 
   const subscribeThreads = useCallback(
     (onChange: () => void) => {
-      console.log('[TRACE:7-useBoard] subscribeThreads: attaching listener');
       const wrapped = () => {
-        console.log('[TRACE:8-useBoard] subscribeThreads: onChange fired -> React will re-render');
+        log.trace('store changed -> re-render');
         onChange();
       };
       const unsub = boardOrchestrator?.subscribe(wrapped) ?? (() => {});
       return () => {
-        console.log('[TRACE:7-useBoard] subscribeThreads: detaching listener');
         unsub();
       };
     },
@@ -48,7 +49,6 @@ export function useBoard(boardId: string) {
   const getThreads = useCallback(
     () => {
       const t = boardOrchestrator?.getThreads() ?? EMPTY_THREADS;
-      console.log(`[TRACE:9-useBoard] getThreads snapshot read: ${t.length} threads`);
       return t;
     },
     [boardOrchestrator],

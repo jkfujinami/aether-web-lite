@@ -100,8 +100,8 @@ impl MailboxActor {
 
                 if !rejected.is_empty() {
                     warn!(
-                        "[DHT] PUT from {}: dropped {} invalid entries ({:?})",
-                        short(&peer_id), rejected.len(), rejected.first()
+                        "[DHT] PUT from {} topic={}: dropped {} invalid entries ({:?})",
+                        short(&peer_id), &topic_hash[..8], rejected.len(), rejected.first()
                     );
                 }
                 if accepted.is_empty() {
@@ -110,7 +110,10 @@ impl MailboxActor {
 
                 let existing = self.store.get(&topic_hash).unwrap_or_default();
                 if existing.len() >= MAX_ENTRIES_PER_TOPIC {
-                    warn!("[DHT] PUT rejected for {}: topic is full", &topic_hash[..8]);
+                    warn!(
+                        "[DHT] PUT rejected for {} from {}: topic is full ({}/{})",
+                        &topic_hash[..8], short(&peer_id), existing.len(), MAX_ENTRIES_PER_TOPIC
+                    );
                     return Ok(());
                 }
                 if existing.is_empty() && self.store.topic_count().unwrap_or(0) >= MAX_TOPICS {
@@ -121,8 +124,13 @@ impl MailboxActor {
                 let room = MAX_ENTRIES_PER_TOPIC - existing.len();
                 let to_store: Vec<Vec<u8>> = accepted.into_iter().take(room).collect();
                 info!(
-                    "[DHT] Storing {} verified entries for {} from {}",
-                    to_store.len(), &topic_hash[..8], short(&peer_id)
+                    "[DHT] Storing {} verified entries for {} from {} (slot={})",
+                    to_store.len(),
+                    &topic_hash[..8],
+                    short(&peer_id),
+                    // Slot 形式かどうかが分かると、旧経路と新経路のどちらで
+                    // 流れてきたかが実網ログだけで切り分けられる
+                    to_store.first().map(|e| crate::protocol::hint::slot::decode(e).is_some()).unwrap_or(false)
                 );
                 self.store.put(&topic_hash, to_store)?;
             }

@@ -15,6 +15,10 @@ import { WireType } from '@/lib/network/wire/WireTypes';
 import { SignalingHub, HubSignalingClient, FakeZoneManager, FakeStore } from '../helpers/fakes';
 import { installFakeWebRTC, resetFakeWebRTC } from '../helpers/webrtc';
 import { syncPowEngine, keyMgr, toMailboxEntry, forgePacketWithoutPow } from '../helpers/packets';
+import { DandelionRouter } from '@/lib/network/gossip/DandelionRouter';
+import { buildHint, newMailboxSlot } from '@/lib/network/hint/HintCrypto';
+import { encodeSlotBlob, decodeSlotBlob } from '@/lib/network/hint/SlotBlob';
+import { hintId } from '@/lib/network/hint/HintPacket';
 
 const PARAMS = NODE_ID_POW_FAST;
 const BOARD_KEY = new Uint8Array(32).fill(42);
@@ -53,7 +57,8 @@ async function makeNode(): Promise<Node> {
   const zm = new FakeZoneManager();
   const router = new ZoneGossipRouter(pm, dispatcher, zm);
   const store = new FakeStore();
-  const mailbox = new DHTMailbox(pm, dispatcher, store as any);
+  const dandelion = new DandelionRouter(pm as any);
+  const mailbox = new DHTMailbox(pm, dispatcher, store as any, dandelion);
   new PEXHandler(pm, dispatcher);
 
   const received: GossipPacket[] = [];
@@ -156,7 +161,10 @@ describe('E2E: DHT による過去ログの往復', () => {
     const packet = await buildPost('過去ログ', threadKey);
     const topicHash = KeyManager.toHex(KeyManager.deriveTopicHash(threadKey));
 
+    // ★ publish は Stem を通る (発信元を保管者に晒さないため)。
+    //   A → B へ 1 ホップ運ばれ、B には転送先が居ないので B が実行地点になる。
     await a.mailbox.publish(topicHash, toMailboxEntry(packet));
+    await settle();
     await settle();
 
     const fetched = await b.mailbox.fetch(topicHash);
@@ -232,5 +240,89 @@ describe('E2E: 全ノードが同じ判定に収束する', () => {
       expect(PacketValidator.check(good).ok).toBe(true);
       expect(PacketValidator.check(bad).ok).toBe(false);
     }
+  });
+});
+
+/**
+ * ★ Schrödinger Slot が**ノードを跨いで**保管されること。
+ *
+ * 単体テストでは K-nearest に自分が入り、`handlePut` の検証を通らずに
+ * ローカルへ書けてしまうため、この欠陥が丸ごと素通しになっていた。
+ * 実網では「PUT が受信側で全部 not-json として捨てられ、履歴が一切
+ * 保管されない」という形で出た。
+ */
+describe('★Schrödinger Slot のノード間保管', () => {
+  it('★A が publish した Slot を B が受理して保管する', async () => {
+    const a = await makeNode();
+    const b = await makeNode();
+    a.pm.connect(b.identity.peerId, true);
+    await settle();
+
+    const threadKey = KeyManager.deriveThreadKey(BOARD_KEY, THREAD_ID);
+    const packet = await buildPost('Slot に入る本文', threadKey);
+    const body = toMailboxEntry(packet);
+
+    const { nonce, mailboxKey } = newMailboxSlot();
+    const hint = buildHint(threadKey, { nonce, message_id: 1, timestamp: Date.now() });
+    const slot = encodeSlotBlob(hint, body);
+    const keyHex = KeyManager.toHex(mailboxKey);
+
+    await a.mailbox.publish(keyHex, slot);
+    await settle();
+    await settle();
+
+    const stored = [
+      ...(a.store.topics.get(keyHex) ?? []),
+      ...(b.store.topics.get(keyHex) ?? []),
+    ];
+    expect(stored.length, 'Slot がどこにも保管されていない').toBeGreaterThan(0);
+
+    // 保管されたものから索引と本体を取り出せる
+    const decoded = decodeSlotBlob(stored[0]);
+    expect(decoded, '保管された Slot が壊れている').not.toBeNull();
+    expect(hintId(decoded!.hint)).toBe(hintId(hint));
+  });
+
+  it('★索引の PoW を払っていない Slot は受理しない', async () => {
+    const a = await makeNode();
+    const b = await makeNode();
+    a.pm.connect(b.identity.peerId, true);
+    await settle();
+
+    const threadKey = KeyManager.deriveThreadKey(BOARD_KEY, THREAD_ID);
+    const packet = await buildPost('索引だけ偽物', threadKey);
+    const { nonce, mailboxKey } = newMailboxSlot();
+    const hint = buildHint(threadKey, { nonce, message_id: 1, timestamp: Date.now() });
+    // PoW を壊す
+    const forgedSlot = encodeSlotBlob({ ...hint, pow_nonce: hint.pow_nonce + 1 }, toMailboxEntry(packet));
+    const keyHex = KeyManager.toHex(mailboxKey);
+
+    b.dispatcher.dispatch(a.identity.peerId, WireType.DHT_PUT, {
+      topicHash: keyHex, entries: [forgedSlot],
+    });
+    await settle();
+
+    expect(b.store.topics.get(keyHex) ?? []).toHaveLength(0);
+  });
+
+  it('★本体が偽物の Slot は受理しない (索引が正しくても)', async () => {
+    const a = await makeNode();
+    const b = await makeNode();
+    a.pm.connect(b.identity.peerId, true);
+    await settle();
+
+    const threadKey = KeyManager.deriveThreadKey(BOARD_KEY, THREAD_ID);
+    const forged = forgePacketWithoutPow({ pow_difficulty: 0 });
+    const { nonce, mailboxKey } = newMailboxSlot();
+    const hint = buildHint(threadKey, { nonce, message_id: 1, timestamp: Date.now() });
+    const slot = encodeSlotBlob(hint, toMailboxEntry(forged));
+    const keyHex = KeyManager.toHex(mailboxKey);
+
+    b.dispatcher.dispatch(a.identity.peerId, WireType.DHT_PUT, {
+      topicHash: keyHex, entries: [slot],
+    });
+    await settle();
+
+    expect(b.store.topics.get(keyHex) ?? []).toHaveLength(0);
   });
 });

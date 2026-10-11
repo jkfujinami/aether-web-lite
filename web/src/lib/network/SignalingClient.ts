@@ -1,6 +1,9 @@
 import { TRACKER } from '../constants';
 import type { PeerId, SignalingMessage, ISignalingClient, WireNodeClaim } from '../types';
 import { Encoding } from '../common/Encoding';
+import { createLogger } from '../common/Logger';
+
+const log = createLogger('net.signaling');
 
 type PeersCallback = (peers: Array<{ peerId: PeerId }>) => void;
 type RelayCallback = (senderId: PeerId, payload: any) => void;
@@ -19,16 +22,16 @@ export class SignalingClient implements ISignalingClient {
     } else {
       this.url = url;
     }
-    console.log(`[SignalingClient] Tracker URL configured as: ${this.url}`);
+    log.debug(`Tracker URL configured as: ${this.url}`);
   }
 
   public async connect(options: { claim: WireNodeClaim; turnstileToken?: string }): Promise<void> {
     return new Promise((resolve, reject) => {
-      console.log(`[SignalingClient] Connecting to tracker: ${this.url}`);
+      log.debug(`Connecting to tracker: ${this.url}`);
       this.ws = new WebSocket(this.url);
 
       this.ws.onopen = () => {
-        console.log(`[SignalingClient] Connected to tracker`);
+        log.debug(`Connected to tracker`);
         // 接続直後に Join メッセージで自身を登録。
         // position と zones は送らない (前者は peerId から導出可能、
         // 後者は購読宣言そのものでトラッカーに興味を晒すことになる)。
@@ -46,7 +49,7 @@ export class SignalingClient implements ISignalingClient {
       this.ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data) as SignalingMessage | any;
-          console.log(`[SignalingClient] <<< Message from tracker: type=${data.type}`);
+          log.debug(`<<< Message from tracker: type=${data.type}`);
 
           if (data.type === 'peers') {
             const peers = Array.isArray(data.peers)
@@ -64,22 +67,22 @@ export class SignalingClient implements ISignalingClient {
             const senderId = data.senderId || data.sender_id;
             if (this.onRelayCb) this.onRelayCb(senderId, data);
           } else if (data.type === 'error') {
-            console.error(`[SignalingClient] Tracker error:`, data.message);
+            log.error(`Tracker error:`, data.message);
           } else {
-            console.warn(`[SignalingClient] Unhandled message type: ${data.type}`);
+            log.warn(`Unhandled message type: ${data.type}`);
           }
         } catch (e) {
-          console.error(`[SignalingClient] Failed to parse message`, e);
+          log.error(`Failed to parse message`, e);
         }
       };
 
       this.ws.onerror = (e) => {
-        console.error(`[SignalingClient] WebSocket error`, e);
+        log.error(`WebSocket error`, e);
         reject(e);
       };
 
       this.ws.onclose = () => {
-        console.log(`[SignalingClient] Disconnected from tracker`);
+        log.debug(`Disconnected from tracker`);
       };
     });
   }

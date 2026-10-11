@@ -67,25 +67,25 @@ export interface PowCommittedHeader {
   payload: Uint8Array;
 }
 
-function u64be(value: number | bigint): Uint8Array {
+export function u64be(value: number | bigint): Uint8Array {
   const buf = new Uint8Array(8);
   new DataView(buf.buffer).setBigUint64(0, BigInt(value), false);
   return buf;
 }
 
-function u32be(value: number): Uint8Array {
+export function u32be(value: number): Uint8Array {
   const buf = new Uint8Array(4);
   new DataView(buf.buffer).setUint32(0, value >>> 0, false);
   return buf;
 }
 
-function u16be(value: number): Uint8Array {
+export function u16be(value: number): Uint8Array {
   const buf = new Uint8Array(2);
   new DataView(buf.buffer).setUint16(0, value & 0xffff, false);
   return buf;
 }
 
-function concat(parts: Uint8Array[]): Uint8Array {
+export function concat(parts: Uint8Array[]): Uint8Array {
   let total = 0;
   for (const p of parts) total += p.length;
   const out = new Uint8Array(total);

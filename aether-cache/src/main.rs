@@ -16,6 +16,18 @@ use aether_cache::NetworkEvent;
 async fn main() -> Result<()> {
     // 1. Initialize logging
     use tracing_subscriber::{EnvFilter, fmt};
+    // ログレベルは RUST_LOG で制御する。モジュール単位で絞れる:
+    //
+    //   RUST_LOG=aether_cache::gossip=trace
+    //   RUST_LOG=info,aether_cache::mailbox=debug
+    //
+    // ブラウザ側 (web/src/lib/common/Logger.ts) のスコープと対応:
+    //   aether_cache::gossip  <->  net.gossip / net.dandelion
+    //   aether_cache::mailbox <->  net.mailbox
+    //   aether_cache::network <->  net.peer / net.webrtc / net.signaling
+    //
+    // 既定は info。**パケット毎に出るログは debug 以下に置くこと** —
+    // info を「状態変化だけ」に保たないと実網のログが読めない量になる。
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,webrtc_mdns=off,webrtc_ice=warn,webrtc_sctp=warn,webrtc=warn"));
     fmt().with_env_filter(filter).init();

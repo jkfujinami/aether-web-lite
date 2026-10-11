@@ -10,6 +10,7 @@ import { POW_POLICY, derivePacketId } from '@/lib/crypto/PowPolicy';
 import { PacketBuilder } from '@/lib/crypto/PacketBuilder';
 import { JsonBinary } from '@/lib/common/JsonBinary';
 import { FakePeerManager, FakeStore } from '../helpers/fakes';
+import { DandelionRouter } from '@/lib/network/gossip/DandelionRouter';
 import {
   buildValidPacket,
   forgePacketWithoutPow,
@@ -45,7 +46,8 @@ function setup(peerIds: string[] = []) {
   for (const id of peerIds) pm.addPeer(id, { verified: true, connected: true });
   const dispatcher = new MessageDispatcher();
   const store = new FakeStore();
-  const mailbox = new DHTMailbox(pm, dispatcher, store as any);
+  const dandelion = new DandelionRouter(pm as any);
+  const mailbox = new DHTMailbox(pm, dispatcher, store as any, dandelion);
   return { pm, dispatcher, store, mailbox };
 }
 
@@ -377,12 +379,69 @@ describe('DHT GET', () => {
   });
 });
 
+describe('★fetch は最遅のピアを待たない (Phase 0.1)', () => {
+  /** peerId を K-nearest に必ず入れるため、その座標上の topicHash を作る */
+  const RESPONDER = 'cc'.repeat(16);
+  const SILENT_A = 'dd'.repeat(16);
+  const SILENT_B = 'ee'.repeat(16);
+
+  it('★1 人でも応答すれば、残りの沈黙を 4 秒待たずに確定する', async () => {
+    const { pm, dispatcher, mailbox } = setup([RESPONDER, SILENT_A, SILENT_B]);
+    const topic = topicNearMe();
+
+    const started = Date.now();
+    const pending = mailbox.fetch(topic);
+
+    // 送られた GET のうち、1 人分にだけ応答を返す
+    await vi.waitFor(() => expect(pm.messagesOfType(WireType.DHT_GET).length).toBeGreaterThan(0));
+    const req = pm.messagesOfType(WireType.DHT_GET)[0];
+    dispatcher.dispatch(req.to, WireType.DHT_RES, {
+      topicHash: topic,
+      reqId: req.payload.reqId,
+      entries: [validEntry],
+    });
+
+    const result = await pending;
+    const elapsed = Date.now() - started;
+
+    expect(result).toHaveLength(1);
+    // 旧実装は全員の応答を待ち、4 秒のハードタイムアウトまで引きずられていた
+    expect(elapsed, `4 秒のタイムアウトまで待ってしまっている (${elapsed}ms)`).toBeLessThan(2000);
+  });
+
+  it('誰も応答しなければハードタイムアウトで空を返す', async () => {
+    const { mailbox } = setup([SILENT_A, SILENT_B]);
+    const result = await mailbox.fetch(topicNearMe());
+    expect(result).toEqual([]);
+  }, 10_000);
+
+  it('全員が応答した場合は猶予を待たずに即確定する', async () => {
+    const { pm, dispatcher, mailbox } = setup([RESPONDER]);
+    const topic = topicNearMe();
+
+    const started = Date.now();
+    const pending = mailbox.fetch(topic);
+
+    await vi.waitFor(() => expect(pm.messagesOfType(WireType.DHT_GET).length).toBe(1));
+    const req = pm.messagesOfType(WireType.DHT_GET)[0];
+    dispatcher.dispatch(req.to, WireType.DHT_RES, {
+      topicHash: topic,
+      reqId: req.payload.reqId,
+      entries: [validEntry],
+    });
+
+    await pending;
+    // 唯一の相手が応答したので猶予 (300ms) すら待たない
+    expect(Date.now() - started).toBeLessThan(250);
+  });
+});
+
 describe('K-nearest は検証済みピアのみを使う', () => {
   it('未検証ピアは担当集合に入らない', () => {
     const pm = new FakePeerManager(ME);
     pm.addPeer('bb'.repeat(16), { verified: false });
     pm.addPeer('cc'.repeat(16), { verified: true });
-    const mailbox = new DHTMailbox(pm, new MessageDispatcher(), new FakeStore() as any);
+    const mailbox = new DHTMailbox(pm, new MessageDispatcher(), new FakeStore() as any, new DandelionRouter(pm));
 
     const nearest: string[] = (mailbox as any).findKNearest(0.5, 10);
     expect(nearest).not.toContain('bb'.repeat(16));
@@ -397,14 +456,103 @@ describe('publish', () => {
     await expect(mailbox.publish('bad', new Uint8Array([1]))).rejects.toThrow(RangeError);
   });
 
-  it('担当 K 人へ PUT を送る', async () => {
+  it('★publish は直接 PUT せず Stem に載せる (発信元を保管者に晒さない)', async () => {
+    // ★ 直接 PUT すると保管者は「この IP が置いた」を確実に知る。
+    //   Gossip と違い「中継しただけかも」という否認可能性が無く、
+    //   保管者が板の参加者なら本体も復号できてしまう。
     const peerIds = Array.from({ length: 10 }, (_, i) =>
       sodium.to_hex(sodium.crypto_hash_sha256(new TextEncoder().encode(`p-${i}`)).slice(0, 16)),
     );
     const { pm, mailbox } = setup(peerIds);
     await mailbox.publish(topicHashAt(0.3), validEntry);
-    const puts = pm.messagesOfType(WireType.DHT_PUT);
-    expect(puts.length).toBeGreaterThan(0);
-    expect(puts.length).toBeLessThanOrEqual(5);
+
+    expect(pm.messagesOfType(WireType.DHT_PUT), '直接 PUT している').toHaveLength(0);
+    expect(pm.messagesOfType(WireType.DHT_PUT_STEM)).toHaveLength(1);
+  });
+
+  it('★Stem は 1 人にだけ送る (全体には撒かない)', async () => {
+    const peerIds = Array.from({ length: 10 }, (_, i) =>
+      sodium.to_hex(sodium.crypto_hash_sha256(new TextEncoder().encode(`q-${i}`)).slice(0, 16)),
+    );
+    const { pm, mailbox } = setup(peerIds);
+    await mailbox.publish(topicHashAt(0.3), validEntry);
+    const targets = new Set(pm.messagesOfType(WireType.DHT_PUT_STEM).map(m => m.to));
+    expect(targets.size).toBe(1);
+  });
+
+  it('隣人が居なければ自分で置く (届かないより匿名性が下がる方がまし)', async () => {
+    const { mailbox, store } = setup();
+    const topic = topicNearMe();
+    await mailbox.publish(topic, validEntry);
+    expect((await store.get(topic))?.length).toBe(1);
+  });
+});
+
+describe('★Stem で運ばれてきた PUT', () => {
+  const PEERS10 = Array.from({ length: 10 }, (_, i) =>
+    sodium.to_hex(sodium.crypto_hash_sha256(new TextEncoder().encode(`s-${i}`)).slice(0, 16)),
+  );
+
+  it('★最終ホップが発信元の代わりに K-nearest へ置く', () => {
+    const { pm, dispatcher } = setup(PEERS10);
+    const spy = vi.spyOn(Math, 'random').mockReturnValue(0.01); // 確実に Fluff (実行地点)
+    try {
+      dispatcher.dispatch(PEERS10[0], WireType.DHT_PUT_STEM, {
+        topicHash: topicHashAt(0.3), entries: [validEntry],
+      });
+      const puts = pm.messagesOfType(WireType.DHT_PUT);
+      expect(puts.length).toBeGreaterThan(0);
+      expect(puts.length).toBeLessThanOrEqual(5);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('★転送時はそのまま次の 1 人へ (書き換えない)', () => {
+    const { pm, dispatcher } = setup(PEERS10);
+    const spy = vi.spyOn(Math, 'random').mockReturnValue(0.99); // Fluff を外す
+    try {
+      const topic = topicHashAt(0.3);
+      dispatcher.dispatch(PEERS10[0], WireType.DHT_PUT_STEM, {
+        topicHash: topic, entries: [validEntry],
+      });
+      const fwd = pm.messagesOfType(WireType.DHT_PUT_STEM);
+      expect(fwd).toHaveLength(1);
+      expect(fwd[0].payload.topicHash).toBe(topic);
+      expect(pm.messagesOfType(WireType.DHT_PUT), '転送中に置いてしまっている').toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('★送り主には転送し返さない', () => {
+    const { pm, dispatcher } = setup(PEERS10);
+    const spy = vi.spyOn(Math, 'random').mockReturnValue(0.99);
+    try {
+      dispatcher.dispatch(PEERS10[0], WireType.DHT_PUT_STEM, {
+        topicHash: topicHashAt(0.3), entries: [validEntry],
+      });
+      const targets = pm.messagesOfType(WireType.DHT_PUT_STEM).map(m => m.to);
+      expect(targets).not.toContain(PEERS10[0]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('★PoW を満たさないエントリは運ばない (増幅器にならない)', () => {
+    const { pm, dispatcher } = setup(PEERS10);
+    dispatcher.dispatch(PEERS10[0], WireType.DHT_PUT_STEM, {
+      topicHash: topicHashAt(0.3),
+      entries: [toMailboxEntry(forgePacketWithoutPow({ pow_difficulty: 0 }))],
+    });
+    expect(pm.sentMessages).toHaveLength(0);
+  });
+
+  it('壊れた PUT_STEM でも例外を投げない', () => {
+    const { pm, dispatcher } = setup(PEERS10);
+    for (const bad of [undefined, null, {}, { topicHash: 'bad' }, 'x', 42]) {
+      expect(() => dispatcher.dispatch(PEERS10[0], WireType.DHT_PUT_STEM, bad)).not.toThrow();
+    }
+    expect(pm.sentMessages).toHaveLength(0);
   });
 });

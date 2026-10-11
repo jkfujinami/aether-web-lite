@@ -9,6 +9,11 @@ import { PacketBuilder } from '../crypto/PacketBuilder';
 import { KeyManager } from '../crypto/KeyManager';
 import { DifficultyEstimator } from '../crypto/DifficultyEstimator';
 import { BOARD_META_THREAD_ID, BoardStatus } from './types';
+import { createLogger } from '../common/Logger';
+import type { SchrodingerMailbox } from '../network/hint/SchrodingerMailbox';
+import type { OpenedHint } from '../network/hint/HintRouter';
+
+const log = createLogger('logic.board');
 
 
 
@@ -38,6 +43,14 @@ export class BoardOrchestrator {
   /** 実行中の fullSync。多重起動を防ぐ */
   private syncInFlight: Promise<void> | null = null;
   private syncDebounce: any = null;
+  /**
+   * 隣人が居る状態でこれだけ待ってから「1 件も無い」と判定する。
+   * 履歴が非同期にしか届かないので、即断すると必ず「無い」と出る。
+   */
+  private static readonly EMPTY_VERDICT_GRACE_MS = 8000;
+  /** 現在の活性化で最初に隣人が現れた時刻 */
+  private firstPeerAt: number | null = null;
+  private emptyVerdictTimer: any = null;
 
 
 
@@ -51,8 +64,40 @@ export class BoardOrchestrator {
     private powEng: IPoWEngine,
     private identity: Identity,
     private zm: IZoneManager,
-    private keyMgr: IKeyManager
+    private keyMgr: IKeyManager,
+    /**
+     * Schrödinger Mailbox。**必須**にしてある。
+     * 省略可にすると、渡し忘れたときに新しい保管経路が黙って無効化され、
+     * 「動いているように見えて匿名性が無い」状態になる。
+     */
+    private schrodinger: SchrodingerMailbox,
   ) {}
+
+  /** この板の Hint を引き当てるための鍵 ID */
+  private hintKeyId(boardId: string): string {
+    return `board:${boardId}`;
+  }
+
+  /**
+   * Hint 経由で本体が取れたときの処理。
+   *
+   * Schrödinger 化により、ネットワークからの流入はこの経路に一本化された
+   * (mailbox_key が投稿ごとにランダムなので「板の過去ログを一括 fetch」は
+   *  原理的に存在しない)。
+   */
+  private onHintBody = async (body: Uint8Array, hint: OpenedHint) => {
+    if (!this.currentBoardId || !this.currentBoardKey) return;
+    if (hint.keyId !== this.hintKeyId(this.currentBoardId)) return;
+    try {
+      const packet = JSON.parse(new TextDecoder().decode(body), (_k, v) => {
+        if (v && v._type === 'Uint8Array') return new Uint8Array(v.data);
+        return v;
+      });
+      await this.handlePacketObject(this.currentBoardId, this.currentBoardKey, packet, false, body);
+    } catch (e) {
+      log.warn('hint body parse error (skipping)', e);
+    }
+  };
 
 
   /**
@@ -83,8 +128,70 @@ export class BoardOrchestrator {
   }
 
   private updateStatus(phase: BoardStatus['phase'], message: string, isSubmitting: boolean = false, powProgress: number = 0) {
+    const cur = this.currentStatus;
+    // 同じ内容なら通知しない。空判定の再評価は頻繁に走るので、
+    // ここで畳まないと無意味な再描画が積み上がる。
+    if (cur.phase === phase && cur.message === message &&
+        (cur.isSubmitting ?? false) === isSubmitting && (cur.powProgress ?? 0) === powProgress) {
+      return;
+    }
     this.currentStatus = { phase, message, isSubmitting, powProgress };
     this.statusListeners.forEach(l => l());
+  }
+
+  /**
+   * 「スレッドが 1 件も無い」と表示してよいかを判定する。
+   *
+   * ★ 即断してはいけない。
+   *
+   *   Schrödinger 化後、履歴は**非同期にしか届かない**:
+   *     - 接続時に隣人が送ってくるバックログ
+   *     - 保持者による定期再放流
+   *     - 鍵登録時に手元の Hint を開き直した分
+   *   いずれも Hint → 本体取得というネットワーク往復を挟む。
+   *
+   *   旧実装は fullSync の中で同期的に `threads.size === 0` を見て
+   *   「見つかりませんでした」と断定していたため、**繋がった直後は必ず
+   *   「無い」と表示された**。その後スレッドが届いても文言が残り、
+   *   一覧と表示が食い違う状態にもなっていた。
+   *
+   *   隣人が居る状態で猶予を過ぎて初めて「無い」と言う。
+   *   新しい隣人が増えたら、その隣人が履歴を持っているかもしれないので
+   *   猶予を引き直す。
+   */
+  private refreshEmptyStatus(): void {
+    // 投稿中の表示は壊さない
+    if (this.currentStatus.isSubmitting) return;
+
+    if (this.emptyVerdictTimer) {
+      clearTimeout(this.emptyVerdictTimer);
+      this.emptyVerdictTimer = null;
+    }
+
+    if (this.threads.size > 0) {
+      this.updateStatus('idle', '');
+      return;
+    }
+
+    if (this.pm.degree === 0) {
+      this.firstPeerAt = null;
+      this.updateStatus('loading', '隣人を探しています (接続中)...');
+      return;
+    }
+
+    if (this.firstPeerAt === null) this.firstPeerAt = Date.now();
+    const remaining = BoardOrchestrator.EMPTY_VERDICT_GRACE_MS - (Date.now() - this.firstPeerAt);
+
+    if (remaining > 0) {
+      this.updateStatus('syncing', `${this.pm.degree}人の隣人と同期中...`);
+      this.emptyVerdictTimer = setTimeout(() => {
+        this.emptyVerdictTimer = null;
+        this.refreshEmptyStatus();
+      }, remaining);
+      return;
+    }
+
+    this.updateStatus('idle', 'スレッドが見つかりませんでした。一番乗りで立ててみませんか？');
   }
 
 
@@ -96,7 +203,7 @@ export class BoardOrchestrator {
    */
   private notify() {
     this.snapshot = Array.from(this.threads.values());
-    console.log(`[TRACE:6-notify] BoardOrchestrator snapshot rebuilt: ${this.snapshot.length} threads, notifying ${this.listeners.size} listener(s)`);
+    log.debug(() => `notify: ${this.snapshot.length} threads -> ${this.listeners.size} listener(s)`);
     this.listeners.forEach(l => l());
   }
 
@@ -106,31 +213,35 @@ export class BoardOrchestrator {
    * パケット（JSONオブジェクト）を処理し、板の状態を更新する
    */
   public async handlePacketObject(boardId: string, boardKey: Uint8Array, packet: any, isFromDB: boolean, rawData?: Uint8Array) {
-    console.log(`[TRACE:4-handlePacketObject] enter packet_id=${packet?.packet_id?.substring(0, 8)} isFromDB=${isFromDB}`);
+    log.trace(() => `packet enter ${short(packet?.packet_id)} fromDB=${isFromDB}`);
     if (this.seenPacketIds.has(packet.packet_id)) {
-      console.log(`[TRACE:4-handlePacketObject] DROPPED already in seenPacketIds packet_id=${packet.packet_id.substring(0, 8)}`);
+      log.trace(() => `packet DROP (already seen) ${short(packet.packet_id)}`);
       return;
     }
     this.seenPacketIds.add(packet.packet_id);
     try {
       const meta = await PacketBuilder.verifyAndDecrypt(packet, boardKey, this.cryptoEng);
       if (!meta) {
-        console.debug(`[TRACE:4-handlePacketObject] DROPPED decrypted to null (failed quickCheck, AEAD, or signature) packet_id=${packet.packet_id}`);
+        log.debug(() => `packet DROP (decrypt failed: quickCheck/AEAD/signature) ${short(packet.packet_id)}`);
         return;
       }
       if (meta.post_type !== 1) {
-        console.debug(`[TRACE:4-handlePacketObject] DROPPED post_type is not 1 (thread meta) but ${meta.post_type} packet_id=${packet.packet_id}`);
+        log.trace(() => `packet DROP (post_type=${meta.post_type}, want 1) ${short(packet.packet_id)}`);
         return;
       }
 
       const created_at = this.normalizeTimestamp(meta.created_at);
       const max_pow = await this.resolveMaxPow(boardId, meta);
       const changed = this.mergeThread(meta, packet.packet_id, max_pow, created_at);
-      console.log(`[TRACE:5-mergeThread] thread_id=${meta.thread_id.substring(0, 8)} changed=${changed} totalThreads=${this.threads.size}`);
-      if (changed) this.notify();
+      log.debug(() => `merge thread=${short(meta.thread_id)} changed=${changed} total=${this.threads.size}`);
+      if (changed) {
+        this.notify();
+        // 1 件でも届いたら「無い」の表示を消す
+        this.refreshEmptyStatus();
+      }
       if (!isFromDB) await this.persistThread(boardId, packet, meta, rawData);
     } catch (e: any) {
-      console.error(`[BoardOrchestrator] Error processing packet ${packet?.packet_id}:`, e);
+      log.error(`Error processing packet ${packet?.packet_id}:`, e);
     }
   }
 
@@ -176,7 +287,7 @@ export class BoardOrchestrator {
         created_at: meta.created_at
       }
     }).catch((err) => {
-      console.error(`[BoardOrchestrator] DB Save failed for thread meta ${meta?.thread_id}:`, err);
+      log.error(`DB Save failed for thread meta ${meta?.thread_id}:`, err);
     });
   }
 
@@ -199,45 +310,33 @@ export class BoardOrchestrator {
 
     try {
       if (this.pm.degree === 0) {
-        this.updateStatus('loading', '隣人を探しています (接続中)...');
+        this.refreshEmptyStatus();
         return;
       }
 
-      this.updateStatus('syncing', `${this.pm.degree}人の隣人から最新のスレッドを取得中...`);
-      
-      // Board Meta Topic Hash は SHA-512 (128文字) を使用
-      const boardTopicHash = KeyManager.toHex(KeyManager.cryptoHash(boardKey));
-      const entries = await this.mailbox.fetch(boardTopicHash);
-      
-      for (const entry of entries) {
-        try {
-          const rawPacket = (entry as any).payload || entry;
-          if (rawPacket instanceof Uint8Array) {
-            const decoded = new TextDecoder().decode(rawPacket);
-            const packet = JSON.parse(decoded, (_k, v) => {
-              if (v && v._type === 'Uint8Array') return new Uint8Array(v.data);
-              return v;
-            });
-            await this.handlePacketObject(boardId, boardKey, packet, false, rawPacket);
-          }
-        } catch (e) {
-          console.warn('[BoardOrchestrator] Packet parse error (skipping):', e);
-        }
-      }
+      // ★ topicHash による一括 fetch は廃止した。
+      //
+      //   旧実装は `mailbox.fetch(SHA512(boardKey))` で板の過去ログをまとめて
+      //   引いていたが、この topicHash は板の鍵から誰でも計算できるため、
+      //   GET を受けた K 人に「この IP はこの板を読んでいる」が直接漏れていた。
+      //   しかも問い合わせ先はトピック座標が決めるので、そこに peerId を
+      //   グラインドした攻撃者は板の全読者を観測できた。
+      //
+      //   現在は本体がランダムな Slot にあり、在り処は Hint でしか分からない。
+      //   履歴は次の 2 つで埋まる (どちらも要求を出さない = 何も申告しない):
+      //     - 接続時に隣人が送ってくるバックログ (SchrodingerMailbox)
+      //     - 保持者による定期再放流 (§18.3-A)
+      //   加えて、板の鍵を登録した時点で手元に溜まっている Hint を
+      //   HintRouter が開き直すので、既に流れてきた分は即座に反映される。
 
-
-      const currentCount = this.threads.size;
-      if (currentCount === 0) {
-        this.updateStatus('idle', 'スレッドが見つかりませんでした。一番乗りで立ててみませんか？');
-      } else {
-        this.updateStatus('idle', '');
-      }
+      // 「無い」の判定は refreshEmptyStatus に一本化する (即断しない)
+      this.refreshEmptyStatus();
 
       // 定期的なDB統計の同期を開始
       this.startStatsSync(boardId);
 
     } catch (err) {
-      console.error('[BoardOrchestrator] fullSync error:', err);
+      log.error('[BoardOrchestrator] fullSync error:', err);
       this.updateStatus('error', '最新スレッドの取得に失敗しました');
     }
   }
@@ -284,7 +383,7 @@ export class BoardOrchestrator {
     if (this.currentBoardId && this.currentBoardKey) {
       await this.handlePacketObject(this.currentBoardId, this.currentBoardKey, packet, false);
     } else {
-      console.log(`[TRACE:3.5-onGossipPacket] DROPPED not activated (currentBoardId=${this.currentBoardId}) packet_id=${packet?.packet_id?.substring(0, 8)}`);
+      log.trace(() => `gossip DROP (board not activated, current=${this.currentBoardId}) ${short(packet?.packet_id)}`);
     }
   };
 
@@ -297,6 +396,10 @@ export class BoardOrchestrator {
    * デバウンスして 1 本に畳む。
    */
   private onPeerConnect = () => {
+    // 新しい隣人は履歴を持っているかもしれない。空判定の猶予を引き直す。
+    if (this.threads.size === 0) this.firstPeerAt = Date.now();
+    this.refreshEmptyStatus();
+
     if (!this.currentBoardId || !this.currentBoardKey) return;
     if (this.syncDebounce) clearTimeout(this.syncDebounce);
     this.syncDebounce = setTimeout(() => {
@@ -322,6 +425,9 @@ export class BoardOrchestrator {
     if (!this.isListening) {
       this.router.onMessage(this.onGossipPacket);
       this.pm.on('peer:connect', this.onPeerConnect);
+      // Hint の試行復号に板の鍵を渡し、本体が取れたら流し込む
+      this.schrodinger.addKey(this.hintKeyId(boardId), boardKey);
+      this.schrodinger.onBody(this.onHintBody);
       this.isListening = true;
     }
 
@@ -380,7 +486,6 @@ export class BoardOrchestrator {
 
       this.updateStatus('submitting', '拡散中...', true, 100);
 
-      const boardB64TopicHash = KeyManager.toHex(KeyManager.cryptoHash(boardKey));
       const rawPacketData = new TextEncoder().encode(JSON.stringify(packet, (_k, v) => {
           if (v instanceof Uint8Array) return { _type: 'Uint8Array', data: Array.from(v) };
           return v;
@@ -419,16 +524,18 @@ export class BoardOrchestrator {
 
       // ── ここから先はネットワークへの送出。UI を待たせない。 ──
       this.router.broadcast(packet).catch((err: any) => {
-        console.error('[BoardOrchestrator] Gossip broadcast failed:', err);
+        log.error('[BoardOrchestrator] Gossip broadcast failed:', err);
       });
-      this.mailbox.publish(boardB64TopicHash, rawPacketData).catch((e: any) => {
-        console.warn('[BoardOrchestrator] Mailbox publish failed:', e);
+      // ★ 本体はランダムな Slot へ、その在り処は Hint で配る。
+      //   Hint は Stem を通るので発信元が隣人に割れない。
+      this.schrodinger.publish(boardKey, rawPacketData, savedAt).catch((e: any) => {
+        log.warn('Schrodinger publish failed:', e);
       });
 
       this.updateStatus('idle', '', false, 0);
       return threadId;
     } catch (err) {
-      console.error('[BoardOrchestrator] submitThread error:', err);
+      log.error('[BoardOrchestrator] submitThread error:', err);
       this.updateStatus('error', 'スレッドの作成に失敗しました', false, 0);
       return null;
     }
@@ -440,11 +547,19 @@ export class BoardOrchestrator {
    */
   public clear() {
     this.stopStatsSync();
+    this.firstPeerAt = null;
+    if (this.emptyVerdictTimer) {
+      clearTimeout(this.emptyVerdictTimer);
+      this.emptyVerdictTimer = null;
+    }
     if (this.syncDebounce) {
       clearTimeout(this.syncDebounce);
       this.syncDebounce = null;
     }
 
+    if (this.currentBoardId) {
+      this.schrodinger.removeKey(this.hintKeyId(this.currentBoardId));
+    }
     if (this.isListening) {
       this.router.offMessage(this.onGossipPacket);
       this.pm.off('peer:connect', this.onPeerConnect);
@@ -459,4 +574,9 @@ export class BoardOrchestrator {
   }
 
 
+}
+
+/** ログ用の短縮表示。undefined でも落ちないようにしておく */
+function short(id: string | undefined | null): string {
+  return id ? id.substring(0, 8) : '?';
 }

@@ -5,7 +5,8 @@ export class SeenCache {
   private readonly MAX_SIZE = 50_000;
   
   // キャッシュ有効期限: 15分 (これより過去のパケットは時刻バリデーター自体が弾くため、15分で十分)
-  private readonly TTL_MS = 15 * 60 * 1000;
+  public static readonly TTL_MS = 15 * 60 * 1000;
+  private readonly TTL_MS = SeenCache.TTL_MS;
   
   // クリーンアップタイマー
   private timer: ReturnType<typeof setInterval>;

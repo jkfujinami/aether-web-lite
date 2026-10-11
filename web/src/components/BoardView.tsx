@@ -5,6 +5,9 @@ import { useBoard } from "@/hooks/useBoard";
 import type { ThreadMeta } from "@/lib/logic/types";
 
 import { ThreadRanker } from "@/lib/logic/ThreadRanker";
+import { createLogger } from '@/lib/common/Logger';
+
+const log = createLogger('ui.board');
 
 export default function BoardView({
   boardId,
@@ -17,7 +20,7 @@ export default function BoardView({
   const [showForm, setShowForm] = useState(false);
   const [titleInput, setTitleInput] = useState('');
 
-  console.log(`[TRACE:10-render] BoardView render: ${threads.length} threads`);
+  log.trace(() => `BoardView render: ${threads.length} threads`);
 
   const currentKey = loadedKey || boardKeyBase64;
 

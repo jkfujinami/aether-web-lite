@@ -33,6 +33,8 @@ pub const MAX_TOPICS: usize = 100_000;
 pub enum EntryReject {
     TooLarge,
     NotJson,
+    /// Slot の索引 (Hint) が PoW を払っていない
+    BadHintPow,
     Packet(RejectReason),
 }
 
@@ -54,7 +56,30 @@ pub fn check_entry(entry: &[u8], now_ms: u64) -> Result<GossipPacket, EntryRejec
         return Err(EntryReject::TooLarge);
     }
 
-    let packet: GossipPacket = serde_json::from_slice(entry).map_err(|_| EntryReject::NotJson)?;
+    // ★ Slot 形式 (`hint_blob ‖ body_blob`) を先に試す。
+    //
+    //   Schrödinger 化以降、本体は索引 (Hint) と一緒に 1 つの Slot として
+    //   保管される。これはバイナリのエンベロープなので、素の JSON として
+    //   解釈しようとすると必ず失敗する。
+    //
+    //   ここを見落としていたため、**Schrödinger の PUT が受信側の検証で
+    //   全部 NotJson として捨てられ、履歴が一切保管されなかった**。
+    //   ブラウザ側 `MailboxEntry.checkEntry` と対称。
+    if let Some(slot) = crate::protocol::hint::slot::decode(entry) {
+        // 索引側も PoW を払っていること。ここを素通しにすると、
+        // 本体だけ正しい Slot を大量に作って索引をフラッドできる。
+        if slot.hint.view().check(crate::protocol::hint::HINT_POW_DIFFICULTY).is_err() {
+            return Err(EntryReject::BadHintPow);
+        }
+        return check_packet_bytes(slot.body, now_ms);
+    }
+
+    check_packet_bytes(entry, now_ms)
+}
+
+/// JSON 化された GossipPacket として検証する
+fn check_packet_bytes(bytes: &[u8], now_ms: u64) -> Result<GossipPacket, EntryReject> {
+    let packet: GossipPacket = serde_json::from_slice(bytes).map_err(|_| EntryReject::NotJson)?;
 
     check_packet(&packet, ValidateOptions { now_ms, allow_stale: true })
         .map_err(EntryReject::Packet)?;

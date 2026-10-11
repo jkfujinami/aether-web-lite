@@ -2,6 +2,9 @@ import sodium from './sodium';
 import { NodeIdentity, NODE_ID_POW, type NodeIdPowParams } from './NodeIdentity';
 import { SecretVault, VAULT_PARAMS, type VaultParams } from '../storage/SecretVault';
 import type { SealedStore } from './Identity';
+import { createLogger } from '../common/Logger';
+
+const log = createLogger('crypto.nodeid');
 
 const NODE_SLOT = 'node';
 
@@ -30,14 +33,14 @@ export class NodeIdentityStore {
 
     const restored = await NodeIdentityStore.tryLoad(store, passphrase, params);
     if (restored) {
-      console.log(`[NodeIdentityStore] Restored node identity ${restored.peerId.substring(0, 8)}`);
+      log.debug(`Restored node identity ${restored.peerId.substring(0, 8)}`);
       return restored;
     }
 
-    console.log(`[NodeIdentityStore] Mining new node identity (difficulty ${params.difficulty})...`);
+    log.debug(`Mining new node identity (difficulty ${params.difficulty})...`);
     const started = Date.now();
     const identity = await NodeIdentity.mine(params);
-    console.log(
+    log.debug(
       `[NodeIdentityStore] Mined ${identity.peerId.substring(0, 8)} in ${Date.now() - started}ms ` +
       `(bound position: ${identity.position.toFixed(6)})`,
     );
@@ -56,7 +59,7 @@ export class NodeIdentityStore {
 
     const secret = SecretVault.open(record.sealed, passphrase);
     if (!secret) {
-      console.warn(`[NodeIdentityStore] Could not unseal node identity.`);
+      log.warn(`Could not unseal node identity.`);
       return null;
     }
 
@@ -76,7 +79,7 @@ export class NodeIdentityStore {
     // 難易度を引き上げた後などは、保存済みの解が今の基準を満たさない。
     // その場合は捨てて採掘し直す (満たさない identity で参加しても弾かれる)。
     if (!NodeIdentity.verifyClaim(identity.claim(), params)) {
-      console.warn(`[NodeIdentityStore] Stored identity no longer meets NodeId PoW policy — re-mining.`);
+      log.warn(`Stored identity no longer meets NodeId PoW policy — re-mining.`);
       return null;
     }
 

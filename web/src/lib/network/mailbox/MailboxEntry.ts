@@ -1,6 +1,8 @@
 import type { GossipPacket } from '../../types';
 import { JsonBinary } from '../../common/JsonBinary';
 import { PacketValidator, type RejectReason } from '../gossip/PacketValidator';
+import { decodeSlotBlob } from '../hint/SlotBlob';
+import { verifyHintPow } from '../hint/HintPacket';
 
 /**
  * DHT に保存されるエントリの検証。
@@ -21,7 +23,11 @@ import { PacketValidator, type RejectReason } from '../gossip/PacketValidator';
  */
 
 export const MAILBOX_LIMITS = {
-  /** 1 エントリのバイト長上限。GossipPacket 1 個 (payload 2KB) が JSON 化された分の余裕を見る */
+  /**
+   * 1 エントリのバイト長上限。
+   * GossipPacket 1 個 (payload 2KB) が JSON 化された分 + Slot の索引部
+   * (`hint_blob` 約 94 バイト) の余裕を見る。
+   */
   MAX_ENTRY_BYTES: 16 * 1024,
   /** 1 メッセージで受け付けるエントリ数 */
   MAX_ENTRIES_PER_MESSAGE: 64,
@@ -31,7 +37,7 @@ export const MAILBOX_LIMITS = {
   MAX_TOPICS: 2048,
 } as const;
 
-export type EntryRejectReason = RejectReason | 'too-large' | 'not-json' | 'not-a-packet';
+export type EntryRejectReason = RejectReason | 'too-large' | 'not-json' | 'not-a-packet' | 'bad-hint-pow';
 
 export interface EntryCheck {
   ok: boolean;
@@ -60,9 +66,32 @@ export function checkEntry(entry: Uint8Array, now: number = Date.now()): EntryCh
     return { ok: false, reason: 'too-large' };
   }
 
+  // ★ Slot 形式 (`hint_blob ‖ body_blob`) を先に試す。
+  //
+  //   Schrödinger 化以降、本体は索引 (Hint) と一緒に 1 つの Slot として
+  //   保管される。これはバイナリのエンベロープなので、素の JSON として
+  //   解釈しようとすると必ず失敗する。
+  //
+  //   ここを見落としていたため、**Schrödinger の PUT が受信側の検証で
+  //   全部 `not-json` として捨てられ、履歴が一切保管されなかった**
+  //   (実網ログ: `dropped 1 invalid entries (Some(NotJson))`)。
+  //   ローカル保管は handlePut を通らないため、単体テストでは表面化しない。
+  const slot = decodeSlotBlob(entry);
+  if (slot) {
+    // 索引側も PoW を払っていること。ここを素通しにすると、
+    // 本体だけ正しい Slot を大量に作って索引をフラッドできる。
+    if (!verifyHintPow(slot.hint)) return { ok: false, reason: 'bad-hint-pow' };
+    return checkPacketBytes(slot.body, now);
+  }
+
+  return checkPacketBytes(entry, now);
+}
+
+/** JSON 化された GossipPacket として検証する */
+function checkPacketBytes(bytes: Uint8Array, now: number): EntryCheck {
   let packet: GossipPacket;
   try {
-    packet = JsonBinary.parse<GossipPacket>(new TextDecoder().decode(entry));
+    packet = JsonBinary.parse<GossipPacket>(new TextDecoder().decode(bytes));
   } catch {
     return { ok: false, reason: 'not-json' };
   }

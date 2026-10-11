@@ -1,6 +1,9 @@
 import sodium from './sodium';
 import type { IIdentity, SignatureResult } from '../types';
 import { SecretVault, VAULT_PARAMS, type VaultParams } from '../storage/SecretVault';
+import { createLogger } from '../common/Logger';
+
+const log = createLogger('crypto.identity');
 
 /** トリップ鍵を保存できる最小のインターフェース */
 export interface SealedStore {
@@ -36,7 +39,7 @@ export class Identity implements IIdentity {
     const secret = SecretVault.open(record.sealed, passphrase);
     if (!secret) {
       // パスフレーズ違いか改竄。どちらであるかは区別しない。
-      console.warn(`[Identity] Could not unseal trip identity (wrong passphrase or tampered).`);
+      log.warn(`Could not unseal trip identity (wrong passphrase or tampered).`);
       return false;
     }
 
@@ -45,7 +48,7 @@ export class Identity implements IIdentity {
       privateKey: secret.slice(0, sodium.crypto_sign_SECRETKEYBYTES),
       keyType: 'ed25519',
     };
-    console.log(`[Identity] Recovered persistent trip identity.`);
+    log.debug(`Recovered persistent trip identity.`);
     return true;
   }
 
@@ -69,7 +72,7 @@ export class Identity implements IIdentity {
     secret.set(this.tripKeyPair.publicKey, sodium.crypto_sign_SECRETKEYBYTES);
 
     await store.saveSealed(TRIP_SLOT, SecretVault.seal(secret, passphrase, params));
-    console.log(
+    log.debug(
       `[Identity] Generated and sealed new trip identity (passphrase-protected: ${passphrase.length > 0}).`,
     );
     return this.tripDisplay;
@@ -81,7 +84,7 @@ export class Identity implements IIdentity {
   public async deleteTrip(store: SealedStore): Promise<void> {
     this.tripKeyPair = null;
     await store.deleteSealed(TRIP_SLOT);
-    console.log(`[Identity] Deleted trip identity.`);
+    log.debug(`Deleted trip identity.`);
   }
 
   /** トリップが設定されているか */

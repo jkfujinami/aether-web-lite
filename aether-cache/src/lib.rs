@@ -1,6 +1,7 @@
 pub mod crypto;
 pub mod network;
 pub mod gossip;
+pub mod protocol;
 pub mod storage;
 pub mod mailbox;
 pub mod node_key;

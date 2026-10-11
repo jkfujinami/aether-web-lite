@@ -5,6 +5,9 @@ import { useP2P } from '@/providers/P2PProvider';
 import { KeyManager } from '@/lib/crypto/KeyManager';
 import type { DAGPost } from '@/lib/logic/ThreadDAGManager';
 import type { ThreadStatus } from '@/lib/logic/types';
+import { createLogger } from '@/lib/common/Logger';
+
+const log = createLogger('ui.thread');
 
 const EMPTY_POSTS: DAGPost[] = [];
 const IDLE_STATUS: ThreadStatus = { phase: 'idle', message: '初期化中...', isSubmitting: false, powProgress: 0 };
@@ -23,14 +26,12 @@ export function useThread(boardId: string, threadId: string) {
 
   const subscribePosts = useCallback(
     (onChange: () => void) => {
-      console.log('[TRACE:7-useThread] subscribePosts: attaching listener');
       const wrapped = () => {
-        console.log('[TRACE:8-useThread] subscribePosts: onChange fired -> React will re-render');
+        log.trace('store changed -> re-render');
         onChange();
       };
       const unsub = threadOrchestrator?.subscribe(wrapped) ?? (() => {});
       return () => {
-        console.log('[TRACE:7-useThread] subscribePosts: detaching listener');
         unsub();
       };
     },
@@ -39,7 +40,6 @@ export function useThread(boardId: string, threadId: string) {
   const getPosts = useCallback(
     () => {
       const p = threadOrchestrator?.getPosts() ?? EMPTY_POSTS;
-      console.log(`[TRACE:9-useThread] getPosts snapshot read: ${p.length} posts`);
       return p;
     },
     [threadOrchestrator],

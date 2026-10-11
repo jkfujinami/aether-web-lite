@@ -10,12 +10,39 @@ import { TextEncoder as NodeTextEncoder, TextDecoder as NodeTextDecoder } from '
 import sodium from 'libsodium-wrappers-sumo';
 import { beforeAll } from 'vitest';
 
-// ── TextEncoder / TextDecoder ──
-// jsdom 環境では window が別レルムになり、jsdom 由来の TextEncoder が返す
-// Uint8Array が libsodium 側の `instanceof Uint8Array` を通らない
-// ("unsupported input type for message" になる)。Node のものに揃える。
-Object.defineProperty(globalThis, 'TextEncoder', { value: NodeTextEncoder, configurable: true, writable: true });
-Object.defineProperty(globalThis, 'TextDecoder', { value: NodeTextDecoder, configurable: true, writable: true });
+// ── TextEncoder / TextDecoder (★レルム跨ぎの是正) ──
+//
+// jsdom 環境では `globalThis.Uint8Array` が jsdom のものに差し替わる一方、
+// `TextEncoder` は (jsdom 由来でも node:util 由来でも) **Node レルムの**
+// Uint8Array を返す。結果として
+//
+//   new TextEncoder().encode(s) instanceof Uint8Array  → false
+//
+// となり、libsodium の入力型チェックが
+// `TypeError: unsupported input type for message` で落ちる。
+//
+// 「Node のものに揃える」のは解決にならない (むしろ逆方向)。
+// 実測: jsdom の TextEncoder も node:util の TextEncoder も、
+//       どちらも現行レルムの instanceof を通らなかった。
+//
+// 出力を現行レルムの Uint8Array へコピーして返す形に包む。
+// これは中身を変えないので、本番コード側には一切手を入れなくてよい。
+class RealmSafeTextEncoder extends NodeTextEncoder {
+  encode(input?: string) {
+    const src = super.encode(input);
+    // 長さ指定で確保すると現行レルムの ArrayBuffer が裏に付く
+    const out = new Uint8Array(src.length);
+    out.set(src);
+    return out;
+  }
+}
+
+Object.defineProperty(globalThis, 'TextEncoder', {
+  value: RealmSafeTextEncoder, configurable: true, writable: true,
+});
+Object.defineProperty(globalThis, 'TextDecoder', {
+  value: NodeTextDecoder, configurable: true, writable: true,
+});
 
 // ── crypto.getRandomValues / crypto.subtle ──
 if (typeof globalThis.crypto === 'undefined' || typeof globalThis.crypto.getRandomValues !== 'function') {

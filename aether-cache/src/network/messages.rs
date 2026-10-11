@@ -32,6 +32,37 @@ pub enum P2PMessage {
     RingInfo { neighbors: Vec<PeerRef> },
     #[serde(rename = "gossip")]
     Gossip { packet: GossipPacket },
+    /// Schrödinger Mailbox の索引。
+    ///
+    /// ★ キャッシュノードはこれを**復号できない**(板/スレッドの鍵を持たない)。
+    ///   中身は不透明なバイト列として中継するだけ。
+    ///   検証と識別子計算は `crate::protocol::hint` を参照。
+    #[serde(rename = "hint")]
+    Hint {
+        version: u8,
+        ttl: u8,
+        #[serde(rename = "blind_tag")]
+        blind_tag: JsonBytes,
+        nonce: JsonBytes,
+        #[serde(rename = "pow_nonce")]
+        pow_nonce: u64,
+        ciphertext: JsonBytes,
+    },
+
+    /// Hint の Stem フェーズ。1 対 1 で数ホップ運んでから HINT の全体配信へ移る。
+    /// 中身は Hint と同一 (不透明)。運び方だけが違う。
+    #[serde(rename = "hint-stem")]
+    HintStem {
+        version: u8,
+        ttl: u8,
+        #[serde(rename = "blind_tag")]
+        blind_tag: JsonBytes,
+        nonce: JsonBytes,
+        #[serde(rename = "pow_nonce")]
+        pow_nonce: u64,
+        ciphertext: JsonBytes,
+    },
+
     #[serde(rename = "stem")]
     /// Dandelion++ の Stem (茎) フェーズ。
     ///
@@ -50,6 +81,16 @@ pub enum P2PMessage {
         topic_hash: String,
         entries: Vec<JsonBytes>,
     },
+    /// PUT の Stem フェーズ。数ホップ運んでから、最後のホップが
+    /// 発信元の代わりに K-nearest へ置く。
+    /// 保管者が見る IP を発信元のものにしないために存在する。
+    #[serde(rename = "dht-put-stem")]
+    DhtPutStem {
+        #[serde(rename = "topicHash")]
+        topic_hash: String,
+        entries: Vec<JsonBytes>,
+    },
+
     #[serde(rename = "dht-get")]
     DhtGet {
         #[serde(rename = "topicHash")]

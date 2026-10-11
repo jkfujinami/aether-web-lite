@@ -1,6 +1,9 @@
 import type { IPeerManager, IMailbox, PeerId, IPeerConnection } from '../../types';
 import { RingPosition } from '../RingPosition';
 import { IndexedDBStore } from '../../storage/IndexedDBStore';
+import { createLogger } from '../../common/Logger';
+
+const log = createLogger('net.replication');
 
 /**
  * ReplicationManager
@@ -46,7 +49,7 @@ export class ReplicationManager {
     const allTopicHashes = await this.store.getAllTopicHashes();
     if (allTopicHashes.length === 0) return;
 
-    console.log(`[ReplicationManager] Starting rebalance for ${allTopicHashes.length} topics...`);
+    log.debug(`Starting rebalance for ${allTopicHashes.length} topics...`);
 
     for (const topicHash of allTopicHashes) {
       const topicPos = this.hashToPosition(topicHash);
@@ -60,12 +63,12 @@ export class ReplicationManager {
         try {
           this.mailbox.replicate(targetId, topicHash, entries);
         } catch (e) {
-          console.error(`[ReplicationManager] Failed to send replication to ${targetId}:`, e);
+          log.error(`Failed to send replication to ${targetId}:`, e);
         }
       }
     }
 
-    console.log(`[ReplicationManager] Rebalance complete.`);
+    log.debug(`Rebalance complete.`);
   }
 
   private hashToPosition(topicHashHex: string): number {

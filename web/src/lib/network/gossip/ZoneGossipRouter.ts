@@ -3,6 +3,9 @@ import { SeenCache } from './SeenCache';
 import { PacketValidator } from './PacketValidator';
 import { DandelionRouter } from './DandelionRouter';
 import { WireType } from '../wire/WireTypes';
+import { createLogger } from '../../common/Logger';
+
+const log = createLogger('net.gossip');
 
 /**
  * ZoneGossipRouter
@@ -48,7 +51,7 @@ import { WireType } from '../wire/WireTypes';
  *   - `flooded`   … 全隣人へ中継済みか (フラッディングの増幅を止める)
  *   - `delivered` … UI へ渡し済みか (中継の可否とは独立)
  *   - Stem は**どちらでも重複排除しない** (仕様 §8.2)。
- *     停止性は TTL の単調減少が担保する。ここで既読判定を入れると
+ *     停止性は各ホップの確率判定 (幾何分布) が担保する。ここで既読判定を入れると
  *     「既に知っていたか」を外から観測できるオラクルになり、
  *     Stem 経路 (2〜4 ノード) の特定 = 発信元特定に直結する。
  */
@@ -63,10 +66,21 @@ export class ZoneGossipRouter {
   private peerManager: IPeerManager;
   private zoneManager: IZoneManager;
 
-  constructor(peerManager: IPeerManager, dispatcher: IMessageDispatcher, zoneManager: IZoneManager) {
+  constructor(
+    peerManager: IPeerManager,
+    dispatcher: IMessageDispatcher,
+    zoneManager: IZoneManager,
+    /**
+     * ★ HintRouter と**同じインスタンス**を渡すこと。
+     *   別々にするとエポック対象が 2 つになり、観測者に渡す辺が 1 本増えて
+     *   §3.1 の前提 (作者パケットと中継パケットが同じ宛先へ行くので
+     *   区別できない) が崩れる。省略時は自前で作る (単体テスト用)。
+     */
+    dandelion?: DandelionRouter,
+  ) {
     this.peerManager = peerManager;
     this.zoneManager = zoneManager;
-    this.dandelion = new DandelionRouter(peerManager);
+    this.dandelion = dandelion ?? new DandelionRouter(peerManager);
 
     dispatcher.register(WireType.GOSSIP, (senderId, msg) => this.handleGossip(senderId, msg));
     dispatcher.register(WireType.STEM, (senderId, msg) => this.handleStem(senderId, msg));
@@ -89,7 +103,7 @@ export class ZoneGossipRouter {
     this.delivered.add(packet.packet_id);
     this.listeners.forEach(cb => cb(packet));
 
-    console.log(`[GossipRouter] Originating broadcast: ${packet.packet_id.substring(0, 8)} (Zone: ${packet.zone_id})`);
+    log.debug(() => `originating broadcast ${short(packet.packet_id)} zone=${packet.zone_id}`);
 
     // 1. Dandelion++ Stem 送信を試みる (匿名化)
     const echoed = await this.dandelion.publish(packet, useDandelion);
@@ -104,11 +118,11 @@ export class ZoneGossipRouter {
    * ローカル配信と中継はそれぞれ独立に冪等なので、何度呼んでも安全。
    */
   private fluffToZone(packet: GossipPacket): void {
-    console.log(`[TRACE:2.5-fluffToZone] packet_id=${packet?.packet_id?.substring(0, 8)}`);
+    log.trace(() => `fluff enter ${short(packet?.packet_id)}`);
     // Fluff 移行時にも必ず検証する。Stem 経路から入ってきた不正パケットを
     // ここで網に掛けないと、Fluff 地点が増幅器になる。
     if (!PacketValidator.validate(packet)) {
-      console.log(`[TRACE:2.5-fluffToZone] REJECTED by PacketValidator.validate packet_id=${packet?.packet_id?.substring(0, 8)}`);
+      log.debug(() => `fluff REJECTED (validate) ${short(packet?.packet_id)}`);
       return;
     }
 
@@ -134,15 +148,15 @@ export class ZoneGossipRouter {
    */
   private deliverLocal(packet: GossipPacket): void {
     if (this.delivered.has(packet.packet_id)) {
-      console.log(`[TRACE:3-deliverLocal] SKIPPED already delivered to UI packet_id=${packet.packet_id.substring(0, 8)}`);
+      log.trace(() => `deliver SKIP (already delivered) ${short(packet.packet_id)}`);
       return;
     }
     if (!this.zoneManager.isSubscribed(packet.zone_id)) {
-      console.log(`[TRACE:3-deliverLocal] DROPPED (zone not subscribed) packet_id=${packet.packet_id.substring(0, 8)} zone=${packet.zone_id} depth=${this.zoneManager.depth}`);
+      log.debug(() => `deliver DROP (zone not subscribed) ${short(packet.packet_id)} zone=${packet.zone_id} depth=${this.zoneManager.depth}`);
       return;
     }
     this.delivered.add(packet.packet_id);
-    console.log(`[TRACE:3-deliverLocal] delivering to ${this.listeners.length} listener(s) packet_id=${packet.packet_id.substring(0, 8)}`);
+    log.debug(() => `deliver -> ${this.listeners.length} listener(s) ${short(packet.packet_id)}`);
     this.listeners.forEach(cb => cb(packet));
   }
 
@@ -150,11 +164,11 @@ export class ZoneGossipRouter {
 
   private handleGossip(senderId: PeerId, msg: any) {
     const packet = msg?.packet;
-    console.log(`[TRACE:2-handleGossip] from=${senderId.substring(0, 8)} packet_id=${packet?.packet_id?.substring(0, 8)} zone=${packet?.zone_id}`);
+    log.trace(() => `GOSSIP from=${short(senderId)} ${short(packet?.packet_id)} zone=${packet?.zone_id}`);
 
     // 1. 基本検証 (CHK + PoW + サイズ + 時刻)。同期実行。
     if (!PacketValidator.validate(packet)) {
-      console.log(`[TRACE:2-handleGossip] REJECTED by PacketValidator.validate packet_id=${packet?.packet_id?.substring(0, 8)}`);
+      log.debug(() => `GOSSIP REJECTED (validate) from=${short(senderId)} ${short(packet?.packet_id)}`);
       return;
     }
 
@@ -172,12 +186,12 @@ export class ZoneGossipRouter {
   private handleStem(senderId: PeerId, msg: any) {
     const stem = msg as StemPacket;
     const packet = stem?.packet;
-    console.log(`[TRACE:2-handleStem] from=${senderId.substring(0, 8)} packet_id=${packet?.packet_id?.substring(0, 8)} zone=${stem?.zoneId}`);
+    log.trace(() => `STEM from=${short(senderId)} ${short(packet?.packet_id)} zone=${stem?.zoneId}`);
 
     // Stem 経路にも同じ検証を掛ける。旧実装は Stem 受信時に検証しておらず、
     // 不正パケットが Fluff 地点まで無検査で運ばれていた。
     if (!PacketValidator.validate(packet)) {
-      console.log(`[TRACE:2-handleStem] REJECTED by PacketValidator.validate packet_id=${packet?.packet_id?.substring(0, 8)}`);
+      log.debug(() => `STEM REJECTED (validate) from=${short(senderId)} ${short(packet?.packet_id)}`);
       return;
     }
 
@@ -199,10 +213,12 @@ export class ZoneGossipRouter {
     //   発信元自身が Fluff 地点 (hop_count=0 の出所) になり、
     //   Dandelion++ の目的そのものが無効になる。
     const decision = this.dandelion.handleStemPacket(senderId, stem);
-    console.log(`[TRACE:2-handleStem] decision=${decision.action} target=${decision.target?.substring(0, 8)} packet_id=${packet.packet_id.substring(0, 8)}`);
+    // ★ 転送先 peerId は TRACE でしか出さない。Stem 先は経路情報そのもので、
+    //   既定レベルで常時出していると、コンソールを見られるだけで経路が割れる。
+    log.trace(() => `STEM decision=${decision.action} target=${short(decision.target)} ${short(packet.packet_id)}`);
 
     if (decision.action === 'fluff') {
-      console.log(`[Dandelion] Fluffing stem packet into zone ${packet.zone_id}`);
+      log.debug(() => `STEM -> fluff, zone=${packet.zone_id} ${short(packet.packet_id)}`);
       this.fluffToZone(decision.packet as GossipPacket);
     } else if (decision.action === 'forward' && decision.target) {
       this.peerManager.sendMessage(decision.target, WireType.STEM, decision.packet);
@@ -217,7 +233,7 @@ export class ZoneGossipRouter {
    */
   private flood(packet: GossipPacket, excludePeerId: PeerId) {
     if (this.flooded.has(packet.packet_id)) {
-      console.log(`[TRACE:2.7-flood] SKIPPED already flooded packet_id=${packet.packet_id.substring(0, 8)}`);
+      log.trace(() => `flood SKIP (already flooded) ${short(packet.packet_id)}`);
       return;
     }
 
@@ -240,4 +256,9 @@ export class ZoneGossipRouter {
     this.flooded.destroy();
     this.delivered.destroy();
   }
+}
+
+/** ログ用の短縮表示。undefined でも落ちないようにしておく */
+function short(id: string | undefined | null): string {
+  return id ? id.substring(0, 8) : '?';
 }

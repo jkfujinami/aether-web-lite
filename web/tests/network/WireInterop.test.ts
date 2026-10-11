@@ -8,6 +8,7 @@ import { toBytes } from '@/lib/crypto/PowPolicy';
 import { NodeIdentity, NODE_ID_POW_FAST } from '@/lib/crypto/NodeIdentity';
 import { PacketValidator } from '@/lib/network/gossip/PacketValidator';
 import { checkEntry } from '@/lib/network/mailbox/MailboxEntry';
+import { hintId, parseHintPacket, verifyHintPow } from '@/lib/network/hint/HintPacket';
 
 /**
  * Rust → TypeScript のワイヤ相互運用テスト。
@@ -120,6 +121,26 @@ describe('Rust が符号化したフレームを TypeScript が読める', () =>
     expect(payload).not.toHaveProperty('stem_ttl');
   });
 
+  it('★Rust が符号化した HINT を TypeScript が読んで検証できる', () => {
+    const { type, payload } = decode('hint');
+    expect(type).toBe(WireType.HINT);
+
+    // ワイヤから来たものを必ず parse で固めてから触る
+    const hint = parseHintPacket(payload);
+    expect(hint, 'Rust の HINT が parseHintPacket を通らない').not.toBeNull();
+
+    expect(sodium.to_hex(hint!.blind_tag)).toBe(expected.hintBlindTag);
+    expect(sodium.to_hex(hint!.nonce)).toBe(expected.hintNonce);
+    expect(sodium.to_hex(hint!.ciphertext)).toBe(expected.hintCiphertext);
+
+    // ★ id が Rust 側と 1 ビットも違わないこと。
+    //   ここがズレると重複排除が効かず、同じ Hint が無限に往復する。
+    expect(hintId(hint!)).toBe(expected.hintId);
+
+    // ★ Rust が中継で TTL を減らしても PoW は通り続ける
+    expect(verifyHintPow(hint!)).toBe(true);
+  });
+
   it('★DHT_RES のエントリが TypeScript の検証を通る', () => {
     const { type, payload } = decode('dhtRes');
     expect(type).toBe(WireType.DHT_RES);
@@ -178,5 +199,32 @@ describe('往復', () => {
       const back = WireCodec.decode(reencoded);
       expect(back.type, name).toBe(type);
     }
+  });
+});
+
+/**
+ * ★ WireType を足したときに無言で壊れないことを固定する。
+ *
+ * 以前 WireCodec の decode が `0x10 <= t <= 0x52` と範囲をハードコードして
+ * おり、範囲外に WireType を足した瞬間に JSON フォールバックへ落ちて
+ * 「送っているのに相手が一切受け取らない」という形で壊れた。
+ * 症状が送信側に出ないため、実網でしか気付けない類の欠陥になる。
+ */
+describe('★WireCodec: 全 WireType が往復すること', () => {
+  it('★定義済みの全 WireType が decode で正しく識別される', () => {
+    const types = Object.values(WireType)
+      .filter((v): v is WireType => typeof v === 'number' && v !== WireType.UNKNOWN);
+
+    expect(types.length).toBeGreaterThan(10);
+    for (const t of types) {
+      const frame = WireCodec.encode(t, { probe: 1 });
+      const decoded = WireCodec.decode(frame);
+      expect(decoded.type, `WireType 0x${t.toString(16)} が識別されない`).toBe(t);
+    }
+  });
+
+  it('★未知のバイトは既知の型として誤認されない', () => {
+    const frame = new Uint8Array([0xf0, 0x01, 0x02]);
+    expect(() => WireCodec.decode(frame)).not.toThrow();
   });
 });

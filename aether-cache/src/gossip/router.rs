@@ -6,6 +6,7 @@ use crate::gossip::validator::{check_packet, now_ms, ValidateOptions};
 use crate::network::messages::{JsonBytes, P2PMessage};
 use crate::network::peer_manager::PeerManagerControl;
 use crate::network::rate_limiter::{Category, RateLimiter};
+use crate::protocol::hint::{HintView, HINT_POW_DIFFICULTY};
 use crate::{NetworkEvent, PeerManagerCommand};
 use rand::Rng;
 
@@ -22,7 +23,7 @@ const FLUFF_PROBABILITY: f64 = 0.3;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 /// GossipActor は経路制御・重複排除・Dandelion++ (Stem/Fluff) を担当する。
 ///
@@ -34,6 +35,9 @@ pub struct GossipActor {
     pow_params: NodeIdPowParams,
     /// 全隣人へ中継済みか。フラッディングの増幅を止める。
     flooded: SeenCache,
+    /// Hint を中継済みか。Gossip の `flooded` とは名前空間を分ける
+    /// (id の計算式が別なので混ぜる理由が無い)。
+    hint_seen: SeenCache,
     /// Mailbox へ引き渡し済みか。中継の可否とは独立に判定する。
     ///
     /// ★ 旧実装はこの 3 つを seen_cache ひとつで兼用しており、
@@ -66,6 +70,7 @@ impl GossipActor {
             identity,
             pow_params,
             flooded: SeenCache::new(50_000, 900),
+            hint_seen: SeenCache::new(50_000, 900),
             delivered: SeenCache::new(50_000, 900),
             rate_limiter: RateLimiter::new(),
             challenges: HashMap::new(),
@@ -138,8 +143,13 @@ impl GossipActor {
     fn category_of(msg: &P2PMessage) -> Option<Category> {
         match msg {
             P2PMessage::Hello { .. } | P2PMessage::Join { .. } => Some(Category::Handshake),
-            P2PMessage::Gossip { .. } | P2PMessage::Stem { .. } => Some(Category::Gossip),
-            P2PMessage::DhtPut { .. } => Some(Category::DhtPut),
+            P2PMessage::Gossip { .. }
+            | P2PMessage::Stem { .. }
+            | P2PMessage::Hint { .. }
+            | P2PMessage::HintStem { .. } => {
+                Some(Category::Gossip)
+            }
+            P2PMessage::DhtPut { .. } | P2PMessage::DhtPutStem { .. } => Some(Category::DhtPut),
             P2PMessage::DhtGet { .. } | P2PMessage::DhtRes { .. } => Some(Category::DhtGet),
             P2PMessage::PexRequest { .. } | P2PMessage::PexResponse { .. } => Some(Category::Pex),
             P2PMessage::SdpRelay { .. } | P2PMessage::IceRelay { .. } => Some(Category::Signaling),
@@ -210,6 +220,98 @@ impl GossipActor {
                 self.flood(Some(peer_id), packet);
             }
 
+            // ★ Hint は中身を読まずに中継する (Broadcast Veil)。
+            //   板/スレッドの鍵を持たないので復号はできないし、する必要もない。
+            //   中継するかどうかを内容で分岐させないことが、
+            //   受信者匿名性の土台になっている。
+            P2PMessage::Hint { version, ttl, blind_tag, nonce, pow_nonce, ciphertext } => {
+                let view = HintView {
+                    version,
+                    blind_tag: blind_tag.bytes(),
+                    nonce: nonce.bytes(),
+                    pow_nonce,
+                    ciphertext: ciphertext.bytes(),
+                };
+
+                // PoW は中継より先に検証する。素通しにすると
+                // 検証していないものを自分が増幅して撒くことになる。
+                if let Err(reason) = view.check(HINT_POW_DIFFICULTY) {
+                    debug!("[Hint] Dropped from {}: {:?}", short(&peer_id), reason);
+                    return;
+                }
+
+                let Some(id) = view.id() else { return };
+                if self.hint_seen.has(&id) {
+                    return;
+                }
+                self.hint_seen.add(id.clone());
+
+                // TTL を 1 減らして中継。0 になったらここで止める。
+                if ttl == 0 {
+                    trace!("[Hint] ttl exhausted for {}", &id[..8]);
+                    return;
+                }
+                debug!("[Hint] Relaying {} (ttl {} -> {})", &id[..8], ttl, ttl - 1);
+                let _ = self.pm_cmd_tx.send(PeerManagerCommand::Broadcast {
+                    exclude_peer_id: Some(peer_id),
+                    message: P2PMessage::Hint {
+                        version,
+                        ttl: ttl - 1,
+                        blind_tag,
+                        nonce,
+                        pow_nonce,
+                        ciphertext,
+                    },
+                });
+            }
+
+            // Hint の Stem。1 人へ転送を続けるか、Fluff (全体配信) へ移すか。
+            //
+            // ★ ここで「見たことがあるか」で分岐してはいけない。
+            //   分岐させると、攻撃者が Hint を送りつけて相手の反応を見るだけで
+            //   「既に知っていたか」を判定できるオラクルになる。
+            P2PMessage::HintStem { version, ttl, blind_tag, nonce, pow_nonce, ciphertext } => {
+                let view = HintView {
+                    version,
+                    blind_tag: blind_tag.bytes(),
+                    nonce: nonce.bytes(),
+                    pow_nonce,
+                    ciphertext: ciphertext.bytes(),
+                };
+                if let Err(reason) = view.check(HINT_POW_DIFFICULTY) {
+                    debug!("[Hint] Dropped stem from {}: {:?}", short(&peer_id), reason);
+                    return;
+                }
+
+                // 転送できる隣人が居ないなら Fluff に落とすしかない。
+                // ここを見落とすと転送が宛先無しで消え、Hint が黙って失われる。
+                let has_forward_target = self.verified.keys().any(|pid| pid != &peer_id);
+                let should_fluff =
+                    !has_forward_target || rand::thread_rng().gen_bool(FLUFF_PROBABILITY);
+
+                if should_fluff {
+                    let Some(id) = view.id() else { return };
+                    debug!("[Hint] Stem -> Fluff for {}", &id[..8]);
+                    self.hint_seen.add(id);
+                    // 全体配信へ。エコーを送信者に届けるため除外しない。
+                    let _ = self.pm_cmd_tx.send(PeerManagerCommand::Broadcast {
+                        exclude_peer_id: None,
+                        message: P2PMessage::Hint {
+                            version, ttl, blind_tag, nonce, pow_nonce, ciphertext,
+                        },
+                    });
+                } else {
+                    // 書き換えずにそのまま次の 1 人へ。書き換える値があると、
+                    // それが経路上の位置を示す手がかりになる。
+                    let _ = self.pm_cmd_tx.send(PeerManagerCommand::ForwardStem {
+                        exclude_peer_id: peer_id,
+                        message: P2PMessage::HintStem {
+                            version, ttl, blind_tag, nonce, pow_nonce, ciphertext,
+                        },
+                    });
+                }
+            }
+
             P2PMessage::Stem { packet, zone_id } => {
                 // Stem 経路にも同じ検証を掛ける。ここを素通しにすると
                 // Fluff 地点が増幅器になる。
@@ -240,12 +342,14 @@ impl GossipActor {
                     !has_forward_target || rand::thread_rng().gen_bool(FLUFF_PROBABILITY);
 
                 if should_fluff {
-                    info!("[Gossip] Stem -> Fluff transition for packet {}", &packet.packet_id[..8]);
+                    debug!("[Gossip] Stem -> Fluff transition for packet {}", &packet.packet_id[..8]);
                     self.deliver_to_mailbox(&peer_id, &packet);
                     // Dandelion++ のエコー確認を送信者に届けるため除外しない
                     self.flood(None, packet);
                 } else {
-                    info!("[Gossip] Stem forwarding packet {}", &packet.packet_id[..8]);
+                    // ★ 転送先は出さない。Stem 先は経路情報そのもので、
+                    //   ログに残すと発信元追跡の材料になる。
+                    trace!("[Gossip] Stem forwarding packet {}", &packet.packet_id[..8]);
                     // パケットは一切書き換えずにそのまま転送する。書き換える値が
                     // あると、それが経路上の位置を示す手がかりになる。
                     let _ = self.pm_cmd_tx.send(PeerManagerCommand::ForwardStem {
@@ -256,7 +360,7 @@ impl GossipActor {
             }
 
             P2PMessage::PexRequest { .. } => {
-                info!("[Gossip] Received PEX Request from {}", short(&peer_id));
+                debug!("[Gossip] Received PEX Request from {}", short(&peer_id));
                 let _ = self.pm_cmd_tx.send(PeerManagerCommand::SendPexResponse { peer_id });
             }
 
@@ -267,6 +371,35 @@ impl GossipActor {
                 });
             }
 
+            // PUT の Stem。転送を続けるか、自分が実行地点になるかを決める。
+            //
+            // ★ 実行地点になった場合は「全隣人へ DhtPut を撒く」形にする。
+            //   受け取った側はそれぞれ K-nearest 帰属検証を通すので、
+            //   担当外のノードは自分で弾く。ここで K-nearest を計算しないのは、
+            //   その判断がこのアクターの持ち物ではないため。
+            P2PMessage::DhtPutStem { topic_hash, entries } => {
+                // 転送できる隣人が居ないなら自分が実行地点になるしかない。
+                // ここを見落とすと転送が宛先無しで消え、PUT が黙って失われる。
+                let has_forward_target = self.verified.keys().any(|pid| pid != &peer_id);
+                let should_execute =
+                    !has_forward_target || rand::thread_rng().gen_bool(FLUFF_PROBABILITY);
+
+                if should_execute {
+                    debug!("[DHT] PUT stem -> executing for {}", &topic_hash[..8.min(topic_hash.len())]);
+                    let _ = self.pm_cmd_tx.send(PeerManagerCommand::Broadcast {
+                        exclude_peer_id: None,
+                        message: P2PMessage::DhtPut { topic_hash, entries },
+                    });
+                } else {
+                    // 書き換えずにそのまま次の 1 人へ
+                    trace!("[DHT] PUT stem forwarding");
+                    let _ = self.pm_cmd_tx.send(PeerManagerCommand::ForwardStem {
+                        exclude_peer_id: peer_id,
+                        message: P2PMessage::DhtPutStem { topic_hash, entries },
+                    });
+                }
+            }
+
             dht_msg @ (P2PMessage::DhtPut { .. } | P2PMessage::DhtGet { .. } | P2PMessage::DhtRes { .. }) => {
                 let _ = self.mailbox_tx.send(NetworkEvent::MessageReceived { peer_id, message: dht_msg });
             }
@@ -275,7 +408,7 @@ impl GossipActor {
                 // 送信元は「このメッセージが実際に届いた接続」から決める。
                 // ペイロードの senderId を採用すると詐称できる。
                 let _ = sender_id;
-                info!("[Gossip] Relaying SDP from {} to {}", short(&peer_id), short(&target_peer_id));
+                debug!("[Gossip] Relaying SDP from {} to {}", short(&peer_id), short(&target_peer_id));
                 let _ = self.pm_cmd_tx.send(PeerManagerCommand::SendMessage {
                     peer_id: target_peer_id.clone(),
                     message: P2PMessage::SdpRelay {
@@ -288,7 +421,7 @@ impl GossipActor {
 
             P2PMessage::IceRelay { target_peer_id, sender_id, candidate } => {
                 let _ = sender_id;
-                info!("[Gossip] Relaying ICE from {} to {}", short(&peer_id), short(&target_peer_id));
+                debug!("[Gossip] Relaying ICE from {} to {}", short(&peer_id), short(&target_peer_id));
                 let _ = self.pm_cmd_tx.send(PeerManagerCommand::SendMessage {
                     peer_id: target_peer_id.clone(),
                     message: P2PMessage::IceRelay {
@@ -331,7 +464,7 @@ impl GossipActor {
             return;
         }
         self.flooded.add(packet.packet_id.clone());
-        info!("[Gossip] Relaying packet {} (Fluff)", &packet.packet_id[..8]);
+        debug!("[Gossip] Relaying packet {} (Fluff)", &packet.packet_id[..8]);
         let _ = self.pm_cmd_tx.send(PeerManagerCommand::Broadcast {
             exclude_peer_id,
             message: P2PMessage::Gossip { packet },

@@ -37,6 +37,14 @@ fn frame(name: &str) -> Vec<u8> {
     hex::decode(hex_str).expect("frame must be valid hex")
 }
 
+/// ベクタのパケットは固定時刻なので、検証はその時刻基準で行う
+fn now_ms_for_vectors() -> u64 {
+    let P2PMessage::Gossip { packet } = decode("gossip") else {
+        panic!("expected Gossip");
+    };
+    packet.timestamp
+}
+
 fn decode(name: &str) -> P2PMessage {
     WireCodec::decode_v2(&frame(name))
         .unwrap_or_else(|e| panic!("failed to decode TS frame `{name}`: {e}"))
@@ -342,6 +350,18 @@ fn emit_rust_wire_frames_for_typescript() {
             },
         ),
         ("pexResponse", P2PMessage::PexResponse { peers: vec![PeerRef { id: peer_id }] }),
+        // Hint は Rust 側が中継のときに再符号化する。TS が読めることを保証する。
+        (
+            "hint",
+            P2PMessage::Hint {
+                version: 1,
+                ttl: 7,
+                blind_tag: JsonBytes::from_vec(hex::decode(expected("hintBlindTag")).unwrap()),
+                nonce: JsonBytes::from_vec(hex::decode(expected("hintNonce")).unwrap()),
+                pow_nonce: vectors()["wire"]["expected"]["hintPowNonce"].as_u64().unwrap(),
+                ciphertext: JsonBytes::from_vec(hex::decode(expected("hintCiphertext")).unwrap()),
+            },
+        ),
     ];
 
     let mut out = serde_json::Map::new();
@@ -371,6 +391,10 @@ fn emit_rust_wire_frames_for_typescript() {
     exp.insert("dhtTopicHash".into(), Value::String(expected("dhtTopicHash")));
     exp.insert("dhtEntry".into(), Value::String(expected("dhtEntry")));
     exp.insert("gossipHopCount".into(), Value::Number(packet.hop_count.into()));
+    exp.insert("hintId".into(), Value::String(expected("hintId")));
+    exp.insert("hintBlindTag".into(), Value::String(expected("hintBlindTag")));
+    exp.insert("hintNonce".into(), Value::String(expected("hintNonce")));
+    exp.insert("hintCiphertext".into(), Value::String(expected("hintCiphertext")));
     out.insert("expected".into(), Value::Object(exp));
 
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../web/tests/vectors/rust_wire_frames.json");
@@ -398,6 +422,153 @@ fn decodes_stem_from_typescript() {
             assert_eq!(hex::encode(packet.payload.bytes()), expected("gossipPayload"));
         }
         other => panic!("expected Stem, got {other:?}"),
+    }
+}
+
+/// ★ TypeScript が作った HINT を Rust が読めるか。
+///
+/// キャッシュノードは板/スレッドの鍵を持たないため復号はできない。
+/// 「形式が読める・id が一致する・PoW が通る」ところまでを確認する。
+#[test]
+fn decodes_hint_from_typescript() {
+    use aether_cache::protocol::hint::{HintView, HINT_POW_DIFFICULTY};
+
+    let v = vectors();
+    match decode("hint") {
+        P2PMessage::Hint { version, ttl, blind_tag, nonce, pow_nonce, ciphertext } => {
+            assert_eq!(version, 1);
+            assert!(ttl > 0, "放流直後の TTL は正");
+            assert_eq!(hex::encode(blind_tag.bytes()), expected("hintBlindTag"));
+            assert_eq!(hex::encode(nonce.bytes()), expected("hintNonce"));
+            assert_eq!(hex::encode(ciphertext.bytes()), expected("hintCiphertext"));
+            assert_eq!(pow_nonce, v["wire"]["expected"]["hintPowNonce"].as_u64().unwrap());
+
+            let view = HintView {
+                version,
+                blind_tag: blind_tag.bytes(),
+                nonce: nonce.bytes(),
+                pow_nonce,
+                ciphertext: ciphertext.bytes(),
+            };
+
+            // ★ id が TS 側と 1 ビットも違わないこと。
+            //   ここがズレると重複排除が効かず、同じ Hint が無限に往復する。
+            assert_eq!(view.id().unwrap(), expected("hintId"), "hint id が TS と一致しない");
+
+            // ★ TS が解いた PoW を Rust が受理すること
+            assert_eq!(
+                view.check(HINT_POW_DIFFICULTY),
+                Ok(()),
+                "TS が解いた Hint の PoW を Rust が弾いている"
+            );
+        }
+        other => panic!("expected Hint, got {other:?}"),
+    }
+}
+
+/// ★ TypeScript が作った HINT_STEM を Rust が読めるか。
+///
+/// 中身は HINT と同一で運び方だけが違う。ここがズレると
+/// 発信元の隠蔽 (Stem) が丸ごと落ちて直接 flood にフォールバックしてしまう。
+#[test]
+fn decodes_hint_stem_from_typescript() {
+    use aether_cache::protocol::hint::{HintView, HINT_POW_DIFFICULTY};
+
+    match decode("hintStem") {
+        P2PMessage::HintStem { version, blind_tag, nonce, pow_nonce, ciphertext, .. } => {
+            assert_eq!(hex::encode(blind_tag.bytes()), expected("hintBlindTag"));
+            let view = HintView {
+                version,
+                blind_tag: blind_tag.bytes(),
+                nonce: nonce.bytes(),
+                pow_nonce,
+                ciphertext: ciphertext.bytes(),
+            };
+            // HINT と同じ id になること (Stem→Fluff で同一物として扱われる)
+            assert_eq!(view.id().unwrap(), expected("hintId"));
+            assert_eq!(view.check(HINT_POW_DIFFICULTY), Ok(()));
+        }
+        other => panic!("expected HintStem, got {other:?}"),
+    }
+}
+
+/// ★ TypeScript が作った DHT_PUT_STEM を Rust が読めるか。
+///
+/// 中身は DHT_PUT と同一で運び方だけが違う。ここがズレると
+/// 発信元の隠蔽が丸ごと落ち、保管者に「この IP が置いた」が渡る。
+#[test]
+fn decodes_dht_put_stem_from_typescript() {
+    match decode("dhtPutStem") {
+        P2PMessage::DhtPutStem { topic_hash, entries } => {
+            assert_eq!(topic_hash, expected("dhtTopicHash"));
+            assert_eq!(entries.len(), 1);
+            assert_eq!(hex::encode(entries[0].bytes()), expected("dhtEntry"));
+        }
+        other => panic!("expected DhtPutStem, got {other:?}"),
+    }
+}
+
+/// ★ TypeScript が作った Slot (`hint_blob ‖ body_blob`) を Rust が受理するか。
+///
+/// ここが噛み合っていないと、**Schrödinger の PUT が受信側の検証で
+/// 全部 NotJson として捨てられ、履歴が一切保管されない**。
+/// ローカル保管は検証を通らないため単体テストでは表面化せず、
+/// 実網ログの `dropped 1 invalid entries (Some(NotJson))` で初めて出た。
+#[test]
+fn accepts_slot_blob_from_typescript() {
+    use aether_cache::mailbox::entry::check_entry;
+    use aether_cache::protocol::hint::slot;
+
+    let P2PMessage::DhtPut { entries, .. } = decode("dhtPutSlot") else {
+        panic!("expected DhtPut");
+    };
+    assert_eq!(entries.len(), 1);
+    let bytes = entries[0].bytes();
+
+    // Slot として解釈できること
+    let parsed = slot::decode(bytes).expect("TS の Slot を Rust が解釈できない");
+    assert_eq!(parsed.hint.blind_tag.len(), 4);
+
+    // 索引の PoW が通り、本体も検証を通ること
+    let packet = check_entry(bytes, now_ms_for_vectors())
+        .expect("TS が作った Slot を Rust が受理しない");
+    assert_eq!(packet.packet_id, expected("gossipPacketId"));
+}
+
+/// 索引の PoW を壊した Slot は受理しない
+#[test]
+fn rejects_slot_with_forged_hint_pow() {
+    use aether_cache::mailbox::entry::{check_entry, EntryReject};
+
+    let P2PMessage::DhtPut { entries, .. } = decode("dhtPutSlot") else {
+        panic!("expected DhtPut");
+    };
+    let mut bytes = entries[0].bytes().to_vec();
+    // pow_nonce は hint_blob の中: 4 + 1 + 1 + 4 + 12 の位置から 8 バイト
+    let pow_off = 4 + 1 + 1 + 4 + 12;
+    bytes[pow_off] ^= 0xFF;
+
+    assert_eq!(
+        check_entry(&bytes, now_ms_for_vectors()),
+        Err(EntryReject::BadHintPow),
+    );
+}
+
+/// ★ Hint は鍵無しでは中身が読めない (ワイヤ表現の確認)。
+///
+/// `P2PMessage::Hint` は不透明なバイト列しか持たず、
+/// Rust 側に復号の手段が無いことを型として固定する。
+#[test]
+fn hint_is_opaque_without_the_key() {
+    match decode("hint") {
+        P2PMessage::Hint { ciphertext, blind_tag, .. } => {
+            let ct = ciphertext.bytes();
+            // 平文が素通しなら印字可能文字が多くを占めるはず、という粗い確認
+            let printable = ct.iter().filter(|&&b| (0x20..0x7f).contains(&b)).count();
+            assert!(printable * 2 < ct.len(), "ciphertext に平文らしきものが混じっている");
+            assert_eq!(blind_tag.bytes().len(), 4);
+        }
+        other => panic!("expected Hint, got {other:?}"),
     }
 }
 

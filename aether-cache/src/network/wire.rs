@@ -23,9 +23,12 @@ pub enum WireType {
     // Gossip (0x4x)
     Gossip = 0x40,
     Stem = 0x41,
+    Hint = 0x42,
+    HintStem = 0x43,
     
     // DHT Mailbox (0x5x)
     DhtPut = 0x50,
+    DhtPutStem = 0x53,
     DhtGet = 0x51,
     DhtRes = 0x52,
     
@@ -46,7 +49,10 @@ impl From<u8> for WireType {
             0x31 => WireType::IceRelay,
             0x40 => WireType::Gossip,
             0x41 => WireType::Stem,
+            0x42 => WireType::Hint,
+            0x43 => WireType::HintStem,
             0x50 => WireType::DhtPut,
+            0x53 => WireType::DhtPutStem,
             0x51 => WireType::DhtGet,
             0x52 => WireType::DhtRes,
             _ => WireType::Unknown,
@@ -67,7 +73,10 @@ impl WireCodec {
             P2PMessage::RingInfo { .. } => WireType::RingInfo,
             P2PMessage::Gossip { .. } => WireType::Gossip,
             P2PMessage::Stem { .. } => WireType::Stem,
+            P2PMessage::Hint { .. } => WireType::Hint,
+            P2PMessage::HintStem { .. } => WireType::HintStem,
             P2PMessage::DhtPut { .. } => WireType::DhtPut,
+            P2PMessage::DhtPutStem { .. } => WireType::DhtPutStem,
             P2PMessage::DhtGet { .. } => WireType::DhtGet,
             P2PMessage::DhtRes { .. } => WireType::DhtRes,
             P2PMessage::PexRequest { .. } => WireType::PexRequest,

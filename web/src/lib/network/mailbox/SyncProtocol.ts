@@ -2,6 +2,9 @@ import type { IMailbox, ICryptoEngine, IPostStore, IKeyManager } from '../../typ
 import { KeyManager } from '../../crypto/KeyManager';
 import { PacketBuilder } from '../../crypto/PacketBuilder';
 import { JsonBinary } from '../../common/JsonBinary';
+import { createLogger } from '../../common/Logger';
+
+const log = createLogger('net.sync');
 
 /**
  * SyncProtocol
@@ -35,12 +38,12 @@ export class SyncProtocol {
     const topicHash = this.keyManager.deriveTopicHash(threadKey);
     const topicHashHex = KeyManager.toHex(topicHash);
 
-    console.log(`[SyncProtocol] Starting sync for board ${boardId} thread ${threadId} (topic: ${topicHashHex.substring(0,8)})`);
+    log.debug(`Starting sync for board ${boardId} thread ${threadId} (topic: ${topicHashHex.substring(0,8)})`);
 
     // 2. DHTから暗号化パケット群を取得
     const packets = await this.mailbox.fetch(topicHashHex);
     if (packets.length === 0) {
-      console.log(`[SyncProtocol] No past logs found in DHT for ${topicHashHex.substring(0,8)}`);
+      log.debug(`No past logs found in DHT for ${topicHashHex.substring(0,8)}`);
       return 0;
     }
 
@@ -68,19 +71,19 @@ export class SyncProtocol {
               thread_root: post.thread_root || threadId
             }
           }).catch((err) => {
-            console.error(`[SyncProtocol] Store save failed for sync packet ${currentPacketId}:`, err);
+            log.error(`Store save failed for sync packet ${currentPacketId}:`, err);
           });
           count++;
         } else {
-          console.warn(`[SyncProtocol] Packet ${currentPacketId || 'unknown'} decrypted to null (failed quickCheck, AEAD, or signature) in topic ${topicHashHex.substring(0,8)}`);
+          log.warn(`Packet ${currentPacketId || 'unknown'} decrypted to null (failed quickCheck, AEAD, or signature) in topic ${topicHashHex.substring(0,8)}`);
         }
       } catch (e) {
-        console.warn(`[SyncProtocol] Failed to process packet ${currentPacketId || 'unknown'} during sync:`, e);
+        log.warn(`Failed to process packet ${currentPacketId || 'unknown'} during sync:`, e);
         continue;
       }
     }
 
-    console.log(`[SyncProtocol] Sync finished. Restored ${count} posts for ${threadId}.`);
+    log.debug(`Sync finished. Restored ${count} posts for ${threadId}.`);
     return count;
   }
 }

@@ -11,6 +11,11 @@ import { JsonBinary } from '../common/JsonBinary';
 import { PacketBuilder } from '../crypto/PacketBuilder';
 import { KeyManager } from '../crypto/KeyManager';
 import { DifficultyEstimator } from '../crypto/DifficultyEstimator';
+import { createLogger } from '../common/Logger';
+import type { SchrodingerMailbox } from '../network/hint/SchrodingerMailbox';
+import type { OpenedHint } from '../network/hint/HintRouter';
+
+const log = createLogger('logic.thread');
 
 
 
@@ -40,6 +45,10 @@ export class ThreadOrchestrator {
   /** 実行中の fullSync。多重起動を防ぐ */
   private syncInFlight: Promise<void> | null = null;
   private syncDebounce: any = null;
+  /** 隣人が居る状態でこれだけ待ってから「1 件も無い」と判定する */
+  private static readonly EMPTY_VERDICT_GRACE_MS = 8000;
+  private firstPeerAt: number | null = null;
+  private emptyVerdictTimer: any = null;
 
 
 
@@ -53,8 +62,35 @@ export class ThreadOrchestrator {
     private identity: Identity,
     private zm: IZoneManager,
     private keyMgr: IKeyManager,
-    private syncProtocol: SyncProtocol
+    private syncProtocol: SyncProtocol,
+    /**
+     * Schrödinger Mailbox。**必須**にしてある。
+     * 省略可にすると、渡し忘れたときに新しい保管経路が黙って無効化され、
+     * 「動いているように見えて匿名性が無い」状態になる。
+     */
+    private schrodinger: SchrodingerMailbox,
   ) {}
+
+  /** このスレッドの Hint を引き当てるための鍵 ID */
+  private hintKeyId(threadId: string): string {
+    return `thread:${threadId}`;
+  }
+
+  /** Hint 経由で本体が取れたときの処理 */
+  private onHintBody = async (body: Uint8Array, hint: OpenedHint) => {
+    const { currentBoardId: b, currentThreadId: t, currentThreadKey: k } = this;
+    if (!b || !t || !k) return;
+    if (hint.keyId !== this.hintKeyId(t)) return;
+    try {
+      const packet = JSON.parse(new TextDecoder().decode(body), (_key, v) => {
+        if (v && v._type === 'Uint8Array') return new Uint8Array(v.data);
+        return v;
+      });
+      await this.handlePacketObject(b, t, k, packet, false);
+    } catch (e) {
+      log.warn('hint body parse error (skipping)', e);
+    }
+  };
 
   /** useSyncExternalStore の subscribe。購読解除関数を返すだけに徹する。 */
   public subscribe(listener: () => void): () => void {
@@ -77,14 +113,61 @@ export class ThreadOrchestrator {
   }
 
   private updateStatus(phase: ThreadStatus['phase'], message: string, isSubmitting: boolean = false, powProgress: number = 0) {
+    const cur = this.currentStatus;
+    // 同じ内容なら通知しない (空判定の再評価が頻繁に走るため)
+    if (cur.phase === phase && cur.message === message &&
+        (cur.isSubmitting ?? false) === isSubmitting && (cur.powProgress ?? 0) === powProgress) {
+      return;
+    }
     this.currentStatus = { phase, message, isSubmitting, powProgress };
     this.statusListeners.forEach(l => l());
+  }
+
+  /**
+   * 「レスが 1 件も無い」と表示してよいかを判定する。
+   *
+   * ★ 即断してはいけない。理由は BoardOrchestrator.refreshEmptyStatus と同じ。
+   *   Schrödinger 化後、履歴は非同期にしか届かないので、繋がった直後に
+   *   同期的に判定すると必ず「無い」と表示されてしまう。
+   */
+  private refreshEmptyStatus(): void {
+    if (this.currentStatus.isSubmitting) return;
+
+    if (this.emptyVerdictTimer) {
+      clearTimeout(this.emptyVerdictTimer);
+      this.emptyVerdictTimer = null;
+    }
+
+    if (this.dag.getCount() > 0) {
+      this.updateStatus('idle', '');
+      return;
+    }
+
+    if (this.pm.degree === 0) {
+      this.firstPeerAt = null;
+      this.updateStatus('idle', 'ネット接続待機中... 他の人がレスをすれば自動で反映されます。');
+      return;
+    }
+
+    if (this.firstPeerAt === null) this.firstPeerAt = Date.now();
+    const remaining = ThreadOrchestrator.EMPTY_VERDICT_GRACE_MS - (Date.now() - this.firstPeerAt);
+
+    if (remaining > 0) {
+      this.updateStatus('syncing', 'ピアと同期中...');
+      this.emptyVerdictTimer = setTimeout(() => {
+        this.emptyVerdictTimer = null;
+        this.refreshEmptyStatus();
+      }, remaining);
+      return;
+    }
+
+    this.updateStatus('idle', 'レスが1件もありませんでした。あなたが最初の投稿者になりませんか？');
   }
 
   /** スナップショットを作り直してから「変わった」と伝える */
   private notify() {
     this.snapshot = this.dag.getSortedPosts();
-    console.log(`[TRACE:6-notify] ThreadOrchestrator snapshot rebuilt: ${this.snapshot.length} posts, notifying ${this.listeners.size} listener(s)`);
+    log.debug(() => `notify: ${this.snapshot.length} posts -> ${this.listeners.size} listener(s)`);
     this.listeners.forEach(l => l());
   }
 
@@ -92,9 +175,9 @@ export class ThreadOrchestrator {
    * パケット（JSONオブジェクト）を処理し、DAGを更新する
    */
   public async handlePacketObject(boardId: string, threadId: string, threadKey: Uint8Array, packet: any, isFromDB: boolean) {
-    console.log(`[TRACE:4-handlePacketObject] ThreadOrchestrator enter packet_id=${packet?.packet_id?.substring(0, 8)} isFromDB=${isFromDB}`);
+    log.trace(() => `packet enter ${short(packet?.packet_id)} fromDB=${isFromDB}`);
     if (this.seenPacketIds.has(packet.packet_id)) {
-      console.log(`[TRACE:4-handlePacketObject] DROPPED already in seenPacketIds packet_id=${packet.packet_id.substring(0, 8)}`);
+      log.trace(() => `packet DROP (already seen) ${short(packet.packet_id)}`);
       return;
     }
     this.seenPacketIds.add(packet.packet_id);
@@ -102,7 +185,7 @@ export class ThreadOrchestrator {
     try {
       const post = await PacketBuilder.verifyAndDecrypt(packet, threadKey, this.cryptoEng);
       if (!post) {
-        console.warn(`[TRACE:4-handlePacketObject] DROPPED decrypted to null (failed quickCheck, AEAD, or signature) packet_id=${packet.packet_id}`);
+        log.debug(() => `packet DROP (decrypt failed: quickCheck/AEAD/signature) ${short(packet.packet_id)}`);
         return;
       }
 
@@ -117,9 +200,11 @@ export class ThreadOrchestrator {
         };
 
         const isNew = this.dag.addPost(dagPost);
-        console.log(`[TRACE:5-dag.addPost] packet_id=${packet.packet_id.substring(0, 8)} isNew=${isNew}`);
+        log.debug(() => `dag.addPost ${short(packet.packet_id)} isNew=${isNew}`);
         if (isNew) {
           this.notify();
+          // 1 件でも届いたら「無い」の表示を消す
+          this.refreshEmptyStatus();
 
           if (!isFromDB) {
               const rawPacketData = new TextEncoder().encode(JsonBinary.stringify(packet));
@@ -134,21 +219,21 @@ export class ThreadOrchestrator {
                   created_at: dagPost.created_at
                 }
               }).catch((err) => {
-                console.error(`[ThreadOrchestrator] DB Save failed for packet ${packet.packet_id}:`, err);
+                log.error(`DB Save failed for packet ${packet.packet_id}:`, err);
               });
           }
         } else {
-          console.log(`[ThreadOrchestrator] Packet ${packet.packet_id} already exists in DAG (skipped)`);
+          log.debug(`Packet ${packet.packet_id} already exists in DAG (skipped)`);
         }
       } else {
-        console.warn(`[ThreadOrchestrator] Packet ${packet.packet_id} skipped: metadata mismatch.`, {
+        log.warn(`Packet ${packet.packet_id} skipped: metadata mismatch.`, {
           expectedThread: threadId,
           actualThread: post.thread_id,
           postType: post.post_type
         });
       }
     } catch (e: any) {
-      console.error(`[ThreadOrchestrator] Error processing packet ${packet?.packet_id}:`, e);
+      log.error(`Error processing packet ${packet?.packet_id}:`, e);
     }
   }
 
@@ -176,6 +261,10 @@ export class ThreadOrchestrator {
     if (!this.isListening) {
       this.router.onMessage(this.onGossipPacket);
       this.pm.on('peer:connect', this.onPeerConnect);
+      // Hint の試行復号にスレッド鍵を渡す。
+      // 登録した時点で、手元に溜まっている Hint を HintRouter が開き直す。
+      this.schrodinger.addKey(this.hintKeyId(threadId), this.currentThreadKey);
+      this.schrodinger.onBody(this.onHintBody);
       this.isListening = true;
     }
 
@@ -218,8 +307,8 @@ export class ThreadOrchestrator {
 
     if (isOnline) {
       await this.fullSync(boardId, threadId, boardKey);
-    } else if (this.dag.getCount() === 0) {
-      this.updateStatus('idle', 'ネット接続待機中... 他の人がレスをすれば自動で反映されます。');
+    } else {
+      this.refreshEmptyStatus();
     }
   }
 
@@ -235,23 +324,32 @@ export class ThreadOrchestrator {
   }
 
   private async runFullSync(boardId: string, threadId: string, boardKey: Uint8Array): Promise<void> {
-    if (this.pm.degree === 0) return;
+    if (this.pm.degree === 0) {
+      this.refreshEmptyStatus();
+      return;
+    }
 
     this.updateStatus('syncing', 'ピアと同期中 (DHT同期)...');
     try {
-      const recoveredCount = await this.syncProtocol.syncThread(boardId, threadId, boardKey).catch(() => 0);
-      if (recoveredCount > 0 && this.currentThreadKey) {
-        // 新しいパケットがあればDBから読み直す
-        await this.loadInitialCache(boardId, threadId, this.currentThreadKey);
-      }
+      // ★ SyncProtocol による固定 topicHash からの一括取得は廃止した。
+      //
+      //   `deriveTopicHash(threadKey)` はスレッド鍵を持つ者なら誰でも計算できる。
+      //   これで GET を投げると、受けた K 人に
+      //   「この IP はこのスレを読んでいる」が直接漏れる。
+      //   しかも問い合わせ先はトピック座標が決めるので、そこに peerId を
+      //   グラインドした攻撃者はそのスレの全読者を観測できた。
+      //
+      //   板側は Phase 2 で塞いだが、スレッド側は SyncProtocol 経由で
+      //   残っていた (実網ログで発覚)。
+      //   履歴は板と同じく Hint 経由で届く:
+      //     - 接続時に隣人が送ってくるバックログ
+      //     - 保持者による定期再放流
+      //     - 鍵登録時に手元の Hint を開き直した分
       
-      if (this.dag.getCount() === 0) {
-        this.updateStatus('idle', 'レスが1件もありませんでした。あなたが最初の投稿者になりませんか？');
-      } else {
-        this.updateStatus('idle', '');
-      }
+      // 「無い」の判定は refreshEmptyStatus に一本化する (即断しない)
+      this.refreshEmptyStatus();
     } catch (e) {
-      console.warn('[ThreadOrchestrator] sync error:', e);
+      log.warn('[ThreadOrchestrator] sync error:', e);
       this.updateStatus('error', '同期中にエラーが発生しました');
     }
   }
@@ -263,7 +361,7 @@ export class ThreadOrchestrator {
     if (this.currentBoardId && this.currentThreadId && this.currentThreadKey) {
       await this.handlePacketObject(this.currentBoardId, this.currentThreadId, this.currentThreadKey, packet, false);
     } else {
-      console.log(`[TRACE:3.5-onGossipPacket] ThreadOrchestrator DROPPED not activated (currentThreadId=${this.currentThreadId}) packet_id=${packet?.packet_id?.substring(0, 8)}`);
+      log.trace(() => `gossip DROP (thread not activated, current=${this.currentThreadId}) ${short(packet?.packet_id)}`);
     }
   };
 
@@ -272,6 +370,10 @@ export class ThreadOrchestrator {
    */
   /** 接続が連続して張られたときに fullSync が何本も重ならないようデバウンスする */
   private onPeerConnect = () => {
+    // 新しい隣人は履歴を持っているかもしれない。空判定の猶予を引き直す。
+    if (this.dag.getCount() === 0) this.firstPeerAt = Date.now();
+    this.refreshEmptyStatus();
+
     if (!this.currentBoardId || !this.currentThreadId || !this.currentBoardKey) return;
     if (this.syncDebounce) clearTimeout(this.syncDebounce);
     this.syncDebounce = setTimeout(() => {
@@ -339,20 +441,22 @@ export class ThreadOrchestrator {
 
       // 物理送信 (バックグラウンド)
       this.router.broadcast(packet).catch((err: any) => {
-        console.error('ゴシップ送信に失敗:', err);
+        log.error('ゴシップ送信に失敗:', err);
       });
 
-      const topicHex = KeyManager.toHex(this.currentThreadTopicHash);
-
-      this.mailbox.publish(topicHex, rawPacketData).catch((err: any) => {
-        console.warn('[ThreadOrchestrator] Mailbox publish failed:', err);
+      // ★ 本体はランダムな Slot へ、その在り処は Hint で配る。
+      //   旧実装は `topicHash = SHA512(threadKey)` という固定鍵に置いていたが、
+      //   これはスレッド鍵を持つ者なら誰でも計算できるため、GET を受けた
+      //   K 人に「この IP はこのスレを読んでいる」が直接漏れていた。
+      this.schrodinger.publish(this.currentThreadKey, rawPacketData, Date.now()).catch((err: any) => {
+        log.warn('Schrodinger publish failed:', err);
       });
 
       this.updateStatus('idle', '計算完了！送信中...', false, 0);
       setTimeout(() => this.updateStatus('idle', ''), 3000);
 
     } catch (err: any) {
-      console.error('Failed to prepare packet:', err);
+      log.error('Failed to prepare packet:', err);
       this.updateStatus('error', '🔴 失敗: ' + err.toString());
     }
   }
@@ -376,9 +480,17 @@ export class ThreadOrchestrator {
    * メモリ状態をリセットする
    */
   public clear() {
+    this.firstPeerAt = null;
+    if (this.emptyVerdictTimer) {
+      clearTimeout(this.emptyVerdictTimer);
+      this.emptyVerdictTimer = null;
+    }
     if (this.syncDebounce) {
       clearTimeout(this.syncDebounce);
       this.syncDebounce = null;
+    }
+    if (this.currentThreadId) {
+      this.schrodinger.removeKey(this.hintKeyId(this.currentThreadId));
     }
     if (this.isListening) {
       this.router.offMessage(this.onGossipPacket);
@@ -398,4 +510,9 @@ export class ThreadOrchestrator {
     this.notify();
   }
 
+}
+
+/** ログ用の短縮表示。undefined でも落ちないようにしておく */
+function short(id: string | undefined | null): string {
+  return id ? id.substring(0, 8) : '?';
 }

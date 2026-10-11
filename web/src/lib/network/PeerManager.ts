@@ -19,6 +19,9 @@ import {
   type SignedNodeClaim,
 } from '../crypto/NodeIdentity';
 import { toBytes } from '../crypto/PowPolicy';
+import { createLogger } from '../common/Logger';
+
+const log = createLogger('net.peer');
 
 /** peerId は Bound Identity なので hex 32 文字に固定されている */
 const PEER_ID_RE = /^[0-9a-f]{32}$/;
@@ -108,7 +111,7 @@ export class PeerManager implements IPeerManager {
   private handleHello(peerId: PeerId, msg: any) {
     const challenge = toBytes(msg?.challenge);
     if (challenge.length === 0) {
-      console.warn(`[PeerManager] HELLO from ${peerId.substring(0, 8)} without challenge`);
+      log.warn(`HELLO from ${peerId.substring(0, 8)} without challenge`);
       return;
     }
     this.sendMessage(peerId, WireType.JOIN, this.identity.signClaim(challenge));
@@ -136,7 +139,7 @@ export class PeerManager implements IPeerManager {
 
     const expected = peer.challenge;
     if (!expected) {
-      console.warn(`[PeerManager] JOIN from ${peerId.substring(0, 8)} before HELLO was sent`);
+      log.warn(`JOIN from ${peerId.substring(0, 8)} before HELLO was sent`);
       return;
     }
 
@@ -151,7 +154,7 @@ export class PeerManager implements IPeerManager {
     // 名乗った peerId と、この接続の相手として認識している peerId が
     // 一致しなければならない。ここが緩いと「別人になりすました JOIN」が通る。
     if (claim.peerId !== peerId) {
-      console.warn(
+      log.warn(
         `[PeerManager] JOIN identity mismatch: connection=${peerId.substring(0, 8)} claimed=${String(claim.peerId).substring(0, 8)}`,
       );
       this.disconnect(peerId);
@@ -159,13 +162,13 @@ export class PeerManager implements IPeerManager {
     }
 
     if (!NodeIdentity.verifySignedClaim(claim, expected, this.powParams)) {
-      console.warn(`[PeerManager] JOIN verification failed for ${peerId.substring(0, 8)} — dropping peer`);
+      log.warn(`JOIN verification failed for ${peerId.substring(0, 8)} — dropping peer`);
       this.disconnect(peerId);
       return;
     }
 
     peer.markVerified();
-    console.log(
+    log.debug(
       `[PeerManager] Peer ${peerId.substring(0, 8)} verified (bound position: ${peer.position.toFixed(6)})`,
     );
     this.emit('peer:verified', peer);
@@ -193,21 +196,21 @@ export class PeerManager implements IPeerManager {
   }
 
   public async start(): Promise<void> {
-    console.log(`[PeerManager] Starting as ${this.myPeerId} (bound position: ${this.myPosition.toFixed(6)})`);
+    log.debug(`Starting as ${this.myPeerId} (bound position: ${this.myPosition.toFixed(6)})`);
 
     // 購読ゾーンは送らない。トラッカーに申告すると、そのピアが何に興味を
     // 持っているかをトラッカーと全ピアに晒すことになる (本家 18.6.2 の交差攻撃)。
     await this.signaling.connect({ claim: this.identity.claim() });
 
     setTimeout(() => {
-      console.log(`[PeerManager] Detaching from Tracker Server! Entering Fully Decentralized Mode.`);
+      log.debug(`Detaching from Tracker Server! Entering Fully Decentralized Mode.`);
       this.signaling.disconnect();
     }, 15_000);
   }
 
   private handleTrackerPeers(peers: Array<{ peerId: PeerId }>): void {
     if (!Array.isArray(peers)) return;
-    console.log(`[PeerManager] Received ${peers.length} peers from tracker`);
+    log.debug(`Received ${peers.length} peers from tracker`);
 
     // 旧実装はここで「共有ゾーン数が多い順」に並べ替えていた。
     // これはトラッカーに購読ゾーンを申告している前提の処理で、
@@ -222,7 +225,7 @@ export class PeerManager implements IPeerManager {
 
   private handleRelay(senderId: PeerId, msg: any): void {
     if (!PEER_ID_RE.test(senderId)) {
-      console.warn(`[PeerManager] Rejecting relay from malformed peerId`);
+      log.warn(`Rejecting relay from malformed peerId`);
       return;
     }
 
@@ -239,7 +242,7 @@ export class PeerManager implements IPeerManager {
     //   ICE は connected になるのに DataChannel が二度と open しない。
     //   offer は「張り直したい」という意思表示なので、古い接続を畳む。
     if (isOffer && this._peers.has(senderId)) {
-      console.log(`[PeerManager] Peer ${senderId.substring(0, 8)} re-offered; replacing stale connection`);
+      log.debug(`Peer ${senderId.substring(0, 8)} re-offered; replacing stale connection`);
       this.disconnect(senderId);
       // disconnect のクールダウンには入れない (正当な再接続なので)
       this.coolDowns.delete(senderId);
@@ -251,7 +254,7 @@ export class PeerManager implements IPeerManager {
       const isNewSession = isOffer || msg?.type === 'offer' || msg?.type === 'sdp-relay';
 
       if (isNewSession) {
-        console.log(`[PeerManager] Received Offer via relay from ${senderId.substring(0, 8)}`);
+        log.debug(`Received Offer via relay from ${senderId.substring(0, 8)}`);
         if (this.degree >= RING_MESH.MAX_DEGREE) {
           const evicted = this.evictLongRangeLink();
           if (!evicted) return;
@@ -285,7 +288,7 @@ export class PeerManager implements IPeerManager {
     // Bound Identity なので peerId の形式は固定。壊れた ID は座標計算も
     // 壊れるため、ここで確実に落とす。
     if (!PEER_ID_RE.test(peerId)) {
-      console.warn(`[PeerManager] Refusing to connect to malformed peerId`);
+      log.warn(`Refusing to connect to malformed peerId`);
       return undefined;
     }
     if (peerId === this.myPeerId) return undefined;
@@ -293,7 +296,7 @@ export class PeerManager implements IPeerManager {
     const existing = this._peers.get(peerId);
     if (existing) {
       if (existing.isConnected || existing.isConnecting) return existing;
-      console.log(`[PeerManager] Cleaning up zombie peer ${peerId.substring(0, 8)} before reconnect`);
+      log.debug(`Cleaning up zombie peer ${peerId.substring(0, 8)} before reconnect`);
       this.disconnect(peerId);
     }
 
@@ -369,7 +372,7 @@ export class PeerManager implements IPeerManager {
     // ハンドシェイクが完了しないピアは居座らせない
     setTimeout(() => {
       if (isStillCurrent() && !peer.isVerified) {
-        console.warn(`[PeerManager] Handshake timeout for ${peerId.substring(0, 8)} — dropping`);
+        log.warn(`Handshake timeout for ${peerId.substring(0, 8)} — dropping`);
         this.disconnect(peerId);
       }
     }, 30_000);
@@ -389,7 +392,7 @@ export class PeerManager implements IPeerManager {
       : WireCodec.decode(new TextEncoder().encode(data));
 
     if (decoded.type === WireType.UNKNOWN) {
-      console.warn(`[PeerManager] Dropped unknown wire message from ${peerId.substring(0, 8)}`);
+      log.warn(`Dropped unknown wire message from ${peerId.substring(0, 8)}`);
       return;
     }
 

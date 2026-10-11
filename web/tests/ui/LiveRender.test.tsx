@@ -20,6 +20,9 @@ import { PacketBuilder } from '@/lib/crypto/PacketBuilder';
 import { WireType } from '@/lib/network/wire/WireTypes';
 import { FakePeerManager, FakeZoneManager, FakeStore } from '../helpers/fakes';
 import { syncPowEngine, keyMgr } from '../helpers/packets';
+import { HintRouter } from '@/lib/network/hint/HintRouter';
+import { DandelionRouter } from '@/lib/network/gossip/DandelionRouter';
+import { SchrodingerMailbox } from '@/lib/network/hint/SchrodingerMailbox';
 
 /**
  * ★ React の描画そのものを検証する。
@@ -51,16 +54,21 @@ function makeCtx() {
   const zm = new FakeZoneManager();
   const router = new ZoneGossipRouter(pm, dispatcher, zm);
   const db = new FakeDb();
-  const mailbox = new DHTMailbox(pm, dispatcher, db as any);
+  const dandelion = new DandelionRouter(pm as any);
+  const mailbox = new DHTMailbox(pm, dispatcher, db as any, dandelion);
   const cryptoEng = new CryptoEngine();
   const identity = new Identity();
   const syncProtocol = new SyncProtocol(mailbox, cryptoEng, keyMgr, db as any);
 
+  const hintRouter = new HintRouter(pm as any, dispatcher, new DandelionRouter(pm as any));
+
+  const schrodinger = new SchrodingerMailbox(mailbox as any, hintRouter, pm as any);
+
   const boardOrchestrator = new BoardOrchestrator(
-    pm as any, db as any, mailbox, router, cryptoEng, syncPowEngine, identity, zm, keyMgr,
+    pm as any, db as any, mailbox, router, cryptoEng, syncPowEngine, identity, zm, keyMgr, schrodinger,
   );
   const threadOrchestrator = new ThreadOrchestrator(
-    pm as any, db as any, mailbox, router, cryptoEng, syncPowEngine, identity, zm, keyMgr, syncProtocol,
+    pm as any, db as any, mailbox, router, cryptoEng, syncPowEngine, identity, zm, keyMgr, syncProtocol, schrodinger,
   );
 
   return {

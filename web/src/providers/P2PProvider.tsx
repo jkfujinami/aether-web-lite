@@ -26,6 +26,10 @@ import { PoWEngine } from '@/lib/crypto/PoWEngine';
 import { Identity } from '@/lib/crypto/Identity';
 import { KeyManager } from '@/lib/crypto/KeyManager';
 import type { IPoWEngine, IKeyManager } from '@/lib/types';
+import { installConsoleHandle, createLogger } from '@/lib/common/Logger';
+import { DandelionRouter } from '@/lib/network/gossip/DandelionRouter';
+import { HintRouter } from '@/lib/network/hint/HintRouter';
+import { SchrodingerMailbox } from '@/lib/network/hint/SchrodingerMailbox';
 
 interface P2PContextState {
   pm: PeerManager | null;
@@ -40,6 +44,7 @@ interface P2PContextState {
   zm: ZoneManager | null;
   boardOrchestrator: BoardOrchestrator | null;
   threadOrchestrator: ThreadOrchestrator | null;
+  hintRouter: HintRouter | null;
   isReady: boolean;
 
 }
@@ -57,6 +62,7 @@ export const P2PContext = createContext<P2PContextState>({
   zm: null,
   boardOrchestrator: null,
   threadOrchestrator: null,
+  hintRouter: null,
   isReady: false,
 
 });
@@ -68,6 +74,8 @@ export const useP2P = () => useContext(P2PContext);
  * 本番コードは P2PProvider を使うこと。
  */
 export const P2PContextForTest = P2PContext;
+
+const log = createLogger('p2p');
 
 export function P2PProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<P2PContextState>({
@@ -83,6 +91,7 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
     zm: null,
     boardOrchestrator: null,
     threadOrchestrator: null,
+    hintRouter: null,
     isReady: false,
 
   });
@@ -94,6 +103,13 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (isInitializing.current) return;
     isInitializing.current = true;
+
+    // ブラウザのコンソールから実行中にログレベルを変えられるようにする。
+    //   aetherLog.set('net.gossip', 'trace')
+    //   aetherLog.show()
+    // 実網のデバッグでは「今動いている状態のまま」上げたいので、
+    // 再読み込み不要で効くことが重要。
+    installConsoleHandle();
 
     async function bootstrap() {
       try {
@@ -135,16 +151,30 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
         const identity = new Identity();
         await identity.initTrip(db);
         
-        const mailbox = new DHTMailbox(pm, dispatcher, db);
+        // ★ Dandelion は Gossip / Hint / PUT で共有する。
+        //   別インスタンスにするとエポック対象が増え、観測者に渡す辺が
+        //   その数だけ増えて §3.1 の前提が崩れる。
+        const dandelion = new DandelionRouter(pm);
+        const mailbox = new DHTMailbox(pm, dispatcher, db, dandelion);
         const replicationMgr = new ReplicationManager(mailbox, pm, db);
         const syncProtocol = new SyncProtocol(mailbox, cryptoEng, keyMgr, db);
 
-        const router = new ZoneGossipRouter(pm, dispatcher, zm);
+        // ★ Dandelion は Gossip と Hint で共有する。
+        //   別インスタンスにするとエポック対象が 2 つになり、
+        //   観測者に渡す辺が 1 本増えて匿名性の前提が崩れる。
+        const router = new ZoneGossipRouter(pm, dispatcher, zm, dandelion);
+        const hintRouter = new HintRouter(pm, dispatcher, dandelion);
+        // 時間分離は Adaptive 既定。網が小さいうちは遅延せず、
+        // 育つと自動的に効き始める (§18.4.5)。
+        const schrodinger = new SchrodingerMailbox(mailbox, hintRouter, pm, 'adaptive');
+        // 保持者による Hint の再放流。これが無いと、後から参加した人が
+        // 過去ログを一切発見できなくなる (§18.3-A)。
+        schrodinger.startReflood();
         const pex = new PEXHandler(pm, dispatcher);
         const maintainer = new RingMaintainer(pm, pex);
         const heartbeat = new Heartbeat(pm, dispatcher);
-        const boardOrchestrator = new BoardOrchestrator(pm, db, mailbox, router, cryptoEng, powEng, identity, zm, keyMgr);
-        const threadOrchestrator = new ThreadOrchestrator(pm, db, mailbox, router, cryptoEng, powEng, identity, zm, keyMgr, syncProtocol);
+        const boardOrchestrator = new BoardOrchestrator(pm, db, mailbox, router, cryptoEng, powEng, identity, zm, keyMgr, schrodinger);
+        const threadOrchestrator = new ThreadOrchestrator(pm, db, mailbox, router, cryptoEng, powEng, identity, zm, keyMgr, syncProtocol, schrodinger);
 
 
 
@@ -169,6 +199,7 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
           zm: zm,
           boardOrchestrator: boardOrchestrator,
           threadOrchestrator: threadOrchestrator,
+          hintRouter,
           isReady: true, // ここで UI 側がレンダリングを開始できる
 
         });

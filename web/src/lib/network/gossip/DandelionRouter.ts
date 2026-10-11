@@ -1,5 +1,8 @@
 import type { IPeerManager, PeerId, GossipPacket, StemPacket } from '../../types';
 import { WireType } from '../wire/WireTypes';
+import { createLogger } from '../../common/Logger';
+
+const log = createLogger('net.dandelion');
 
 /**
  * 仕様: docs/spec/step5_dandelion.md §「確定パラメータ」
@@ -74,18 +77,42 @@ export class DandelionRouter {
    * 自己発信パケットのステム送信開始
    */
   public async publish(packet: GossipPacket, useDandelion: boolean = true): Promise<boolean> {
+    return this.publishVia(
+      packet.packet_id,
+      (target) => this.sendToPeer(target, { type: 'stem', zoneId: packet.zone_id, packet }),
+      useDandelion,
+    );
+  }
+
+  /**
+   * ペイロードに依存しない Stem 発信。
+   *
+   * 「どのワイヤ形式で送るか」は呼び出し側が `send` の中で決める。
+   * DandelionRouter は**経路の判断 (相手選び・エポック・再送・エコー待ち) だけ**を持つ。
+   *
+   * ★ Gossip も Hint も同じインスタンスに乗せること。
+   *   別々の DandelionRouter を持たせるとエポック対象が 2 つになり、
+   *   観測者に渡す辺が 1 本増えて §3.1 の前提 (作者パケットと中継パケットが
+   *   同じ宛先へ行くので区別できない) が崩れる。
+   *
+   * @param id   エコー照合に使う識別子 (packet_id / hint id)
+   * @param send 選ばれた相手へ実際に送る処理
+   */
+  public async publishVia(
+    id: string,
+    send: (target: PeerId) => void,
+    useDandelion: boolean = true,
+  ): Promise<boolean> {
     if (!useDandelion || this.peerManager.degree === 0) {
       return false;
     }
 
     // ★ 再送は「発信元しか行わない」観測可能な振る舞いである。
     //
-    //   中継者は同じ packet_id を再送しない。したがって
-    //   「同じ packet_id を数秒あけて二度送ってくるノード = 発信元」
-    //   という指紋が成立し、攻撃者は受け取った Stem を握り潰す
-    //   (ブラックホール) だけでこれを誘発できる。
-    //   仕様 §5.1 の回数 (Stem 2 回 → Flood) を厳密に守り、
-    //   観測サンプルをこれ以上増やさない。
+    //   中継者は同じ id を再送しない。したがって
+    //   「同じものを数秒あけて二度送ってくるノード = 発信元」という指紋が
+    //   成立し、攻撃者は受け取った Stem を握り潰すだけでこれを誘発できる。
+    //   仕様 §5.1 の回数 (Stem 2 回 → Flood) を厳密に守る。
     //   同じ相手に二度当てないよう、試した相手は候補から外す。
     const tried = new Set<PeerId>();
 
@@ -98,24 +125,17 @@ export class DandelionRouter {
       const target = this.getStemTarget(pool);
       tried.add(target);
 
-      const stem: StemPacket = {
-        type: 'stem',
-        zoneId: packet.zone_id,
-        packet: packet
-      };
+      // ★ 送信先 peerId は TRACE 止まり。Stem 先は経路情報そのもの。
+      log.trace(() => `stemming ${id.substring(0, 8)} to ${target.substring(0, 8)}`);
+      send(target);
 
-      console.log(`[Dandelion] Stemming packet ${packet.packet_id.substring(0, 8)} to ${target.substring(0, 8)}`);
-
-      this.sendToPeer(target, stem);
-
-      // エコー待ち
-      const echoed = await this.waitForEcho(packet.packet_id);
+      const echoed = await this.waitForEcho(id);
       if (echoed) {
-        console.log(`[Dandelion] Echo confirmed for ${packet.packet_id.substring(0, 8)}!`);
+        log.debug(() => `echo confirmed for ${id.substring(0, 8)}`);
         return true;
       }
 
-      console.warn(`[Dandelion] Echo timeout for ${packet.packet_id.substring(0, 8)}. Retrying...`);
+      log.debug(() => `echo timeout for ${id.substring(0, 8)}, retrying`);
       this.resetTarget();
     }
 
@@ -126,31 +146,52 @@ export class DandelionRouter {
    * 中継処理
    * @param senderId パケットを送ってきた隣人のID
    */
-  public handleStemPacket(senderId: PeerId, stem: StemPacket): { action: 'forward' | 'fluff', target?: PeerId, packet: GossipPacket | StemPacket } {
+  /**
+   * 発信用の Stem 先を 1 人選ぶ。隣人が居なければ null。
+   *
+   * ★ 発信時は確率 Fluff を引かない。
+   *
+   *   発信元が実行地点 (Fluff 地点) になってしまうと、Stem に載せた意味が
+   *   丸ごと消える。中継者の判断 (`decideStem`) と発信の判断は別物。
+   *   `publishVia` も同じ理由で必ず送出する。
+   */
+  public pickOriginTarget(): PeerId | null {
+    // ★ 検証済み・接続中に限る。
+    //   PUT の Stem にはエコー再送が無いので、死んだ相手や未検証の相手を
+    //   選ぶとそこでデータが失われる (Gossip はエコー再送で復帰できる)。
+    const neighbors = Array.from(this.peerManager.peers.values())
+      .filter(p => p.isConnected && p.isVerified)
+      .map(p => p.peerId);
+    if (neighbors.length === 0) return null;
+    return this.getStemTarget(neighbors);
+  }
+
+  /**
+   * 中継の判断だけを行う (ペイロードを一切見ない)。
+   *
+   * ★ ホップカウンタは見ない (廃止済み)。各ホップで独立に確率を引くだけ。
+   *   幾何分布は無記憶なので、この判定からは「経路上の位置」が漏れない。
+   *   転送先がいない場合も Fluff に落とす (でないとパケットが黙って消える)。
+   */
+  public decideStem(senderId: PeerId): { action: 'fluff' } | { action: 'forward'; target: PeerId } {
     const neighbors = Array.from(this.peerManager.peers.keys())
         .filter(pid => pid !== senderId); // 送り主を候補から外す (§5.2)
 
-    // Fluff 判定。
-    //
-    // ★ ホップカウンタは見ない (廃止済み)。各ホップで独立に確率を引くだけ。
-    //   幾何分布は無記憶なので、この判定からは「経路上の位置」が漏れない。
-    //   転送先がいない場合もここで Fluff に落とす。
     if (Math.random() < DANDELION_CONFIG.FLUFF_PROBABILITY || neighbors.length === 0) {
-      return {
-        action: 'fluff',
-        packet: { ...stem.packet, hop_count: 0 }
-      };
+      return { action: 'fluff' };
     }
+    return { action: 'forward', target: this.getStemTarget(neighbors, senderId) };
+  }
 
-    // Stem 続行: 次の 1 人へそのまま転送する。
+  /** Gossip 用の薄いラッパ。判断は decideStem に委譲する。 */
+  public handleStemPacket(senderId: PeerId, stem: StemPacket): { action: 'forward' | 'fluff', target?: PeerId, packet: GossipPacket | StemPacket } {
+    const decision = this.decideStem(senderId);
+    if (decision.action === 'fluff') {
+      return { action: 'fluff', packet: { ...stem.packet, hop_count: 0 } };
+    }
     // パケットは一切書き換えない —— 書き換える値があると、それが
     // 経路上の位置を示す手がかりになる。
-    const nextTarget = this.getStemTarget(neighbors, senderId);
-    return {
-      action: 'forward',
-      target: nextTarget,
-      packet: stem
-    };
+    return { action: 'forward', target: decision.target, packet: stem };
   }
 
   /**

@@ -1,6 +1,9 @@
 import type { PeerId, IPeerManager, IMessageDispatcher } from '../types';
 import { RING_MESH } from '../constants';
 import { WireType } from './wire/WireTypes';
+import { createLogger } from '../common/Logger';
+
+const log = createLogger('net.pex');
 
 const PEER_ID_RE = /^[0-9a-f]{32}$/;
 
@@ -60,7 +63,7 @@ export class PEXHandler {
 
   private handlePexResponse(senderPeerId: PeerId, msg: any) {
     if (!msg || !Array.isArray(msg.peers)) {
-      console.warn(`[PEXHandler] Invalid PEX_RESPONSE from ${senderPeerId.substring(0, 8)}`);
+      log.warn(`Invalid PEX_RESPONSE from ${senderPeerId.substring(0, 8)}`);
       return;
     }
 

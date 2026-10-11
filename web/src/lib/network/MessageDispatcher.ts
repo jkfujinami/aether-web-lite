@@ -1,4 +1,7 @@
 import type { IMessageDispatcher, PeerId } from '../types';
+import { createLogger } from '../common/Logger';
+
+const log = createLogger('net.dispatch');
 
 /**
  * MessageDispatcher: WireType に基づいてメッセージを適切なハンドラに配信する。
@@ -22,7 +25,9 @@ export class MessageDispatcher implements IMessageDispatcher {
    */
   public dispatch(peerId: PeerId, type: number, payload: any): void {
     const typeHandlers = this.handlers.get(type);
-    console.log(`[TRACE:1-dispatch] type=0x${type.toString(16)} from=${peerId.substring(0, 8)} handlers=${typeHandlers?.size ?? 0}`);
+    // 全受信メッセージが通る最ホットパス。遅延評価にして、
+    // レベルが届かない限り文字列を組み立てないようにする。
+    log.trace(() => `recv type=0x${type.toString(16)} from=${peerId.substring(0, 8)} handlers=${typeHandlers?.size ?? 0}`);
 
     if (!typeHandlers || typeHandlers.size === 0) {
       // 未登録のメッセージ種別が届いた場合はデバッグ用に記録（必要に応じて）
@@ -33,7 +38,7 @@ export class MessageDispatcher implements IMessageDispatcher {
       try {
         handler(peerId, payload);
       } catch (err) {
-        console.error(`[MessageDispatcher] Error in handler for WireType 0x${type.toString(16)} from ${peerId}:`, err);
+        log.error(`Error in handler for WireType 0x${type.toString(16)} from ${peerId}:`, err);
       }
     }
   }
@@ -47,4 +52,9 @@ export class MessageDispatcher implements IMessageDispatcher {
       typeHandlers.delete(handler);
     }
   }
+}
+
+/** ログ用の短縮表示。undefined でも落ちないようにしておく */
+function short(id: string | undefined | null): string {
+  return id ? id.substring(0, 8) : '?';
 }

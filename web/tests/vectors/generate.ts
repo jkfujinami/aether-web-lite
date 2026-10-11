@@ -26,6 +26,9 @@ import { NodeIdentity, NODE_ID_POW_FAST } from '../../src/lib/crypto/NodeIdentit
 import { WireCodec } from '../../src/lib/network/wire/WireCodec';
 import { WireType } from '../../src/lib/network/wire/WireTypes';
 import { JsonBinary } from '../../src/lib/common/JsonBinary';
+import { buildHint } from '../../src/lib/network/hint/HintCrypto';
+import { hintId } from '../../src/lib/network/hint/HintPacket';
+import { encodeSlotBlob } from '../../src/lib/network/hint/SlotBlob';
 
 async function main() {
   await sodium.ready;
@@ -70,6 +73,18 @@ async function main() {
     payload: header.payload,
   };
   const mailboxEntry = new TextEncoder().encode(JsonBinary.stringify(gossipPacket));
+
+  // ── Hint (Schrödinger Mailbox の索引) ──
+  // 固定シードで決定的に作る (ベクタが毎回変わると差分が読めない)
+  const hintBoardKey = new Uint8Array(32).fill(0x5a);
+  const hintSlotNonce = new Uint8Array(32).fill(0x3c);
+  const hintPacket = buildHint(
+    hintBoardKey,
+    { nonce: hintSlotNonce, message_id: 7, timestamp: 1_700_000_000_000 },
+    // ベクタは決定的でなければ差分が読めない。ここでだけ nonce を固定する。
+    { unsafeFixedNonceForVectors: new Uint8Array(12).fill(0x11) },
+  );
+  const hintIdHex = hintId(hintPacket);
 
   const vectors = {
     _comment:
@@ -140,6 +155,25 @@ async function main() {
             packet: gossipPacket,
           }),
         ),
+        // HINT は鍵を持たない Rust 側にとって不透明なバイト列。
+        // Rust は形式検証・id 計算・PoW 検証・中継だけを行う。
+        hint: sodium.to_hex(WireCodec.encode(WireType.HINT, hintPacket)),
+        // HINT_STEM は中身が HINT と同一で、運び方だけが違う
+        hintStem: sodium.to_hex(WireCodec.encode(WireType.HINT_STEM, hintPacket)),
+        // Slot 形式 (`hint_blob ‖ body_blob`)。Rust が受理できることを固定する。
+        dhtPutSlot: sodium.to_hex(
+          WireCodec.encode(WireType.DHT_PUT, {
+            topicHash: 'cd'.repeat(32),
+            entries: [encodeSlotBlob(hintPacket, mailboxEntry)],
+          }),
+        ),
+        // PUT の Stem。中身は DHT_PUT と同一で、運び方だけが違う。
+        dhtPutStem: sodium.to_hex(
+          WireCodec.encode(WireType.DHT_PUT_STEM, {
+            topicHash: 'ab'.repeat(32),
+            entries: [mailboxEntry],
+          }),
+        ),
         dhtPut: sodium.to_hex(
           WireCodec.encode(WireType.DHT_PUT, {
             topicHash: 'ab'.repeat(32),
@@ -160,6 +194,12 @@ async function main() {
         signature: sodium.to_hex(signature),
         gossipPacketId: gossipPacket.packet_id,
         stemZoneId: gossipPacket.zone_id,
+        /** Rust 側が同じ id を計算できることの照合用 */
+        hintId: hintIdHex,
+        hintBlindTag: sodium.to_hex(hintPacket.blind_tag),
+        hintNonce: sodium.to_hex(hintPacket.nonce),
+        hintPowNonce: hintPacket.pow_nonce,
+        hintCiphertext: sodium.to_hex(hintPacket.ciphertext),
         gossipPayload: sodium.to_hex(gossipPacket.payload),
         gossipNonce: sodium.to_hex(gossipPacket.nonce),
         dhtTopicHash: 'ab'.repeat(32),
