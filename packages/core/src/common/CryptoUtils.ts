@@ -4,7 +4,19 @@ export class CryptoUtils {
    * @param length 指定がない場合は10文字
    */
   static generateId(length: number = 10): string {
-    return Math.random().toString(36).substring(2, 2 + length);
+    // ★ Math.random は使わない。V8 の Math.random (xorshift128+) は数個の出力から
+    //   内部状態を復元でき、網に出た ID 同士 (要求 ID・スレッド ID など) から
+    //   「同じ端末が作った」ことを結び付けられてしまう。
+    const alphabet = '0123456789abcdefghijklmnopqrstuvwxyz';
+    const out: string[] = [];
+    const buf = new Uint8Array(length * 2);
+    while (out.length < length) {
+      crypto.getRandomValues(buf);
+      for (const b of buf) {
+        if (b < 252 && out.length < length) out.push(alphabet[b % 36]); // 252 = 36 * 7 (偏りを消す)
+      }
+    }
+    return out.join('');
   }
 
   /**

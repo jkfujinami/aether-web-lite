@@ -2,6 +2,7 @@ import type { DHTMailbox } from '../mailbox/DHTMailbox';
 import type { IPeerManager, IPeerConnection } from '../../types';
 import type { HintRouter, OpenedHint } from './HintRouter';
 import { Encoding } from '../../common/Encoding';
+import { roundToMinute } from '../../crypto/PacketBuilder';
 import { createLogger } from '../../common/Logger';
 import { buildHint, mailboxKeyFromNonce, newMailboxSlot, type HintPayload } from './HintCrypto';
 import { encodeHint, hintId, type HintPacket } from './HintPacket';
@@ -168,7 +169,8 @@ export class SchrodingerMailbox {
     exitSlot: { topicHash: string; hint: Uint8Array };
   } {
     const { nonce, mailboxKey } = newMailboxSlot();
-    const payload: HintPayload = { nonce, message_id: messageId, timestamp: Date.now() };
+    // Hint の中身は鍵を持つ全員に見えるので、時刻は分単位に丸める (A5)
+    const payload: HintPayload = { nonce, message_id: messageId, timestamp: roundToMinute(Date.now()) };
     const hint = buildHint(k, payload);
     const keyHex = Encoding.toHex(mailboxKey);
     log.info(() => `prepared slot=${keyHex.substring(0, 8)} hint=${hintId(hint).substring(0, 8)} msg=${messageId}`);

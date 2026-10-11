@@ -38,26 +38,45 @@ export class Heartbeat {
   /**
    * 全ピアに対して Ping を送信する
    */
+  /**
+   * ★ ping に自分の時計の値を載せない (A5)。
+   *   旧実装は Date.now() をそのまま送っており、全隣人が端末の時計のずれ
+   *   (クロックスキュー) を精密に測れた。これはセッションや ID を変えても
+   *   同じ端末だと結び付ける指紋になる。乱数の nonce を送り、往復時間は
+   *   手元の送信時刻表から求める。フィールド名 ts はワイヤ互換のために残す。
+   */
   private pingAll(): void {
     const now = Date.now();
     for (const [peerId, peer] of this.peerManager.peers) {
       if (peer.isConnected) {
-        this.peerManager.sendMessage(peerId, WireType.PING, { ts: now });
+        const nonce = crypto.getRandomValues(new Uint32Array(1))[0];
+        this.sent.set(`${peerId}:${nonce}`, now);
+        this.peerManager.sendMessage(peerId, WireType.PING, { ts: nonce });
       }
     }
+    // 返事の来なかった古い記録を捨てる
+    for (const [key, at] of this.sent) {
+      if (now - at > this.interval * 2) this.sent.delete(key);
+    }
   }
+
+  /** 送った ping の nonce → 送信時刻 */
+  private sent = new Map<string, number>();
 
   /** ── Dispatcher Handlers ── */
 
   private handlePing(peerId: PeerId, msg: any): void {
+    // 相手の値は数値だけ echo する (任意のオブジェクトを反射させない)
+    if (typeof msg?.ts !== 'number' || !Number.isFinite(msg.ts)) return;
     this.peerManager.sendMessage(peerId, WireType.PONG, { ts: msg.ts });
   }
 
   private handlePong(peerId: PeerId, msg: any): void {
+    const key = `${peerId}:${msg?.ts}`;
+    const sentAt = this.sent.get(key);
+    if (sentAt === undefined) return; // 自分が送っていない値は信用しない
+    this.sent.delete(key);
     const peer = this.peerManager.peers.get(peerId);
-    if (peer && typeof msg.ts === 'number') {
-      const rtt = Date.now() - msg.ts;
-      (peer as any).rtt = rtt;
-    }
+    if (peer) (peer as any).rtt = Date.now() - sentAt;
   }
 }

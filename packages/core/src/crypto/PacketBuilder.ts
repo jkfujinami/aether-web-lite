@@ -35,7 +35,11 @@ export class PacketBuilder {
     // タイムスタンプは PoW のコミット対象なので、探索の *前に* 一度だけ確定させる。
     // 旧実装は Date.now() を署名層とパケットヘッダで別々に呼んでおり、
     // PoW 計算に掛かった時間だけ両者がずれていた。
-    const now = Date.now();
+    //
+    // ★ 分単位に切り捨てる (A5)。ヘッダの時刻は網の全員に見える。ミリ秒精度だと
+    //   端末の時計のずれ (クロックスキュー) が指紋になり、送信の瞬間とも
+    //   結び付けやすくなる。署名層の created_at も同じ値にそろえる。
+    const now = roundToMinute(Date.now());
 
     // Step 1: 署名層
     const signedDataObj: any = {
@@ -262,4 +266,9 @@ function verifyTripSignature(innerPayload: any, signedData: Uint8Array): Uint8Ar
   } catch {
     return false;
   }
+}
+
+/** 時刻を分単位に切り捨てる (網に出す時刻の精度を落とす) */
+export function roundToMinute(ms: number): number {
+  return Math.floor(ms / 60_000) * 60_000;
 }

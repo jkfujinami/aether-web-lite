@@ -14,6 +14,7 @@ import { POW_POLICY } from '../crypto/PowPolicy';
 import { createLogger } from '../common/Logger';
 import type { SchrodingerMailbox } from '../network/hint/SchrodingerMailbox';
 import type { OpenedHint } from '../network/hint/HintRouter';
+import { randomMessageId } from './BoardOrchestrator';
 
 const log = createLogger('logic.thread');
 
@@ -403,7 +404,10 @@ export class ThreadOrchestrator {
       const currentWeight = this.dag.getMaxCumulativePow();
       const nextWeight = currentWeight + powDifficulty;
 
-      const postNumber = this.dag.getCount();
+      // ★ post_number は 0 固定 (A5)。旧実装は「手元の DAG に何件見えているか」を
+      //   入れていた。鍵を持つ全員に見えるので、作者の閲覧状況 (どこまで受信していたか)
+      //   の指紋になる。表示は DAG の順序から付けるので、この値は使っていない。
+      const postNumber = 0;
       const packet = await PacketBuilder.build(
         text, this.currentThreadKey, this.identity, this.cryptoEng,
         this.powEng, this.keyMgr, this.currentBoardId, this.currentThreadId,
@@ -413,7 +417,8 @@ export class ThreadOrchestrator {
 
       // Immediately reflect the reply in local state rather than waiting for
       // the gossip loopback to come back through verifyAndDecrypt.
-      const now = Date.now();
+      // 表示上の時刻も、網に出したパケットと同じ (分単位に丸めた) 値にそろえる
+      const now = packet.timestamp;
       const dagPost: DAGPost = {
         packet_id: packet.packet_id,
         content: text,
@@ -444,7 +449,7 @@ export class ThreadOrchestrator {
       //   旧実装は `topicHash = SHA512(threadKey)` という固定鍵に置いていたが、
       //   これはスレッド鍵を持つ者なら誰でも計算できるため、GET を受けた
       //   K 人に「この IP はこのスレを読んでいる」が直接漏れていた。
-      this.sendAnonymously(packet, this.currentThreadKey, Date.now(), rawPacketData.length);
+      this.sendAnonymously(packet, this.currentThreadKey, randomMessageId(), rawPacketData.length);
 
       this.updateStatus('idle', '計算完了！送信中...', false, 0);
       setTimeout(() => this.updateStatus('idle', ''), 3000);

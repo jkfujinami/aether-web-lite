@@ -10,6 +10,7 @@ import { KeyManager } from '../crypto/KeyManager';
 import { POW_POLICY } from '../crypto/PowPolicy';
 import { BOARD_META_THREAD_ID, BoardStatus } from './types';
 import { createLogger } from '../common/Logger';
+import { CryptoUtils } from '../common/CryptoUtils';
 import type { SchrodingerMailbox } from '../network/hint/SchrodingerMailbox';
 import type { OpenedHint } from '../network/hint/HintRouter';
 
@@ -467,7 +468,8 @@ export class BoardOrchestrator {
     this.updateStatus('submitting', 'スレッドを構築中...', true, 30);
 
     try {
-      const threadId = Math.random().toString(36).substring(2, 12);
+      // スレッド ID は網に出るので暗号論的乱数で作る (Math.random は状態を復元され得る)
+      const threadId = CryptoUtils.generateId(10);
       const threadKey = KeyManager.deriveThreadKey(boardKey, threadId);
       
       // 🌟 板のメタデータ（スレッド作成通知）なので、スレッドのゾーンではなく「板のゾーン」にブロードキャストする
@@ -500,7 +502,8 @@ export class BoardOrchestrator {
       //   画面に出ないまま固まって見えた。
       //   ThreadOrchestrator.submitReply は元から非同期送信だったので、
       //   スレ立てだけが取り残されていた。
-      const savedAt = Date.now();
+      // 表示上の作成時刻は、網に出したパケットと同じ (分単位に丸めた) 値にそろえる
+      const savedAt = packet.timestamp;
       this.mergeThread(
         { thread_id: threadId, board_id: boardId, content: title, post_type: 1, created_at: savedAt },
         packet.packet_id,
@@ -523,7 +526,7 @@ export class BoardOrchestrator {
       }).catch(() => {});
 
       // ── ここから先はネットワークへの送出。UI を待たせない。 ──
-      this.sendAnonymously(packet, boardKey, savedAt, rawPacketData.length);
+      this.sendAnonymously(packet, boardKey, randomMessageId(), rawPacketData.length);
 
       this.updateStatus('idle', '', false, 0);
       return threadId;
@@ -594,4 +597,13 @@ export class BoardOrchestrator {
 /** ログ用の短縮表示。undefined でも落ちないようにしておく */
 function short(id: string | undefined | null): string {
   return id ? id.substring(0, 8) : '?';
+}
+
+/**
+ * Hint の message_id。鍵を持つ全員に見えるので、時刻ではなく乱数にする (A5)。
+ * 2^48 未満の安全な整数。
+ */
+export function randomMessageId(): number {
+  const b = crypto.getRandomValues(new Uint8Array(6));
+  return b.reduce((acc, x) => acc * 256 + x, 0);
 }
