@@ -218,43 +218,37 @@ export class DandelionRouter {
       return false;
     }
 
-    // ★ 再送は「発信元しか行わない」観測可能な振る舞いである。
+    // ★ 平文 Stem は 1 回だけ送り、再送しない。
     //
-    //   中継者は同じ id を再送しない。したがって
-    //   「同じものを数秒あけて二度送ってくるノード = 発信元」という指紋が
-    //   成立し、攻撃者は受け取った Stem を握り潰すだけでこれを誘発できる。
-    //   仕様 §5.1 の回数 (Stem 2 回 → Flood) を厳密に守る。
-    //   同じ相手に二度当てないよう、試した相手は候補から外す。
-    const tried = new Set<PeerId>();
+    //   再送は「発信元しか行わない」観測可能な振る舞いである。中継者は同じ id を
+    //   再送しないので、「同じバイト列を数秒あけて別の隣人へ送るノード = 発信元」
+    //   という指紋が成立し、攻撃者は Stem を握り潰すだけでこれを誘発できた。
+    //
+    // ★ タイムアウトでエポックを壊さない・隣人を罰しない。
+    //
+    //   旧実装はタイムアウトのたびに resetTarget() で Stem 先を引き直していた。
+    //   これは getStemTarget のコメントが「対策済み」とするエポック破壊攻撃そのもので、
+    //   下流の攻撃者は捨て続けるだけで「自分が Stem 先に選ばれる」まで
+    //   引き直しを強制できた。さらに落としたのが下流でも、無実の直接の
+    //   Stem 先に 25 点のペナルティが付き、4 回で正規の隣人が BAN された
+    //   (陥れによる Eclipse)。どちらも削除した。
+    const neighbors = Array.from(this.peerManager.peers.values())
+      .filter(p => p.isConnected && p.isVerified)
+      .map(p => p.peerId);
+    if (neighbors.length === 0) return false;
 
-    for (let attempt = 0; attempt < DANDELION_CONFIG.MAX_RETRIES; attempt++) {
-      const all = Array.from(this.peerManager.peers.keys());
-      if (all.length === 0) return false;
-      const fresh = all.filter(p => !tried.has(p));
-      const pool = fresh.length > 0 ? fresh : all;
+    const target = this.getStemTarget(neighbors);
+    // ★ 送信先 peerId は TRACE 止まり。Stem 先は経路情報そのもの。
+    log.trace(() => `stemming ${id.substring(0, 8)} to ${target.substring(0, 8)}`);
+    send(target);
 
-      const target = this.getStemTarget(pool);
-      tried.add(target);
-
-      // ★ 送信先 peerId は TRACE 止まり。Stem 先は経路情報そのもの。
-      log.trace(() => `stemming ${id.substring(0, 8)} to ${target.substring(0, 8)}`);
-      send(target);
-
-      const echoed = await this.waitForEcho(id);
-      if (echoed) {
-        log.debug(() => `echo confirmed for ${id.substring(0, 8)}`);
-        return true;
-      }
-
-      log.debug(() => `echo timeout for ${id.substring(0, 8)}, retrying`);
-      // Stem委託先がパケットをドロップした疑いがあるためペナルティを加算
-      if ((this.peerManager as any)?.misbehavior?.recordViolation) {
-        (this.peerManager as any).misbehavior.recordViolation(target, 25, 'Stem packet dropped (echo timeout)');
-      }
-      this.resetTarget();
+    const echoed = await this.waitForEcho(id);
+    if (echoed) {
+      log.debug(() => `echo confirmed for ${id.substring(0, 8)}`);
+    } else {
+      log.debug(() => `echo timeout for ${id.substring(0, 8)} (no retransmission)`);
     }
-
-    return false;
+    return echoed;
   }
 
   /**
@@ -373,10 +367,6 @@ export class DandelionRouter {
   /** テストまたは特定環境向けのエコータイムアウト上書き (ms) */
   public echoTimeoutMs?: number;
 
-  private resetTarget() {
-    this.stemTarget = null;
-  }
-
   /**
    * Guard Sticky Pinning:
    * 直結隣人から第1ホップ (Guard) を選定し、エポック期間 (または切断されるまで) 固定する。
@@ -416,7 +406,11 @@ export class DandelionRouter {
     const timeoutDuration = this.echoTimeoutMs ?? jitteredEchoTimeout();
     return new Promise((resolve) => {
       const timeout = setTimeout(() => {
-        this.listeners.delete(key);
+        // 自分のコールバックだけを外す。キーごと消すと、同じ id を待つ
+        // 他の待機者のエコーまで取りこぼす。
+        const remaining = (this.listeners.get(key) ?? []).filter(cb => cb !== callback);
+        if (remaining.length > 0) this.listeners.set(key, remaining);
+        else this.listeners.delete(key);
         resolve(false);
       }, timeoutDuration);
 

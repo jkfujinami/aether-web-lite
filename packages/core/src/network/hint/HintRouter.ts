@@ -139,10 +139,21 @@ export class HintRouter {
    *
    *   Stem で数ホップ運んでから誰かが Fluff (全体配信) に移すので、
    *   ネットワークからは Fluff 地点が発信元に見える。
-   *   Stem が失敗した場合は可用性を優先して直接 flood にフォールバックする
-   *   (仕様 §5.1 と同じ判断。届かないより匿名性が下がる方がまし)。
+   *
+   * ★ Fail-Closed: Stem が失敗しても**絶対に直接 flood しない**。
+   *
+   *   旧実装は可用性を優先して直接 flood にフォールバックしていた。
+   *   攻撃者は自分宛ての HINT_STEM を握り潰すだけで、発信元に
+   *   「自分の IP から全隣人へ Hint を直射する」ことを強制できた
+   *   (ドロップ誘発ダウングレード)。Hint は投稿の在り処そのものなので、
+   *   これは「誰が書いたか」の告白と同じになる。
+   *
+   *   Hint は Slot に同梱されて保管されるため、ここで落としても
+   *   保持者の再放流 (§18.3-A) で後から必ず配られる。可用性の損失は遅延だけ。
+   *
+   * @returns Stem が Fluff まで届いたか
    */
-  public async originate(hint: HintPacket, id: string): Promise<void> {
+  public async originate(hint: HintPacket, id: string): Promise<boolean> {
     // 自分が作ったものを自分に通知しても意味が無い。戻ってきたときの
     // 二重通知も防げる。中継の記録 (flooded) はここでは触らない ——
     // flood() は冒頭で flooded を見るので、先に入れると 1 通も外へ出ない。
@@ -152,10 +163,10 @@ export class HintRouter {
     const echoed = await this.dandelion.publishVia(id, (target) => {
       this.peerManager.sendMessage(target, WireType.HINT_STEM, hint);
     });
-    if (echoed) return;
-
-    log.debug(() => `stem failed for ${id.substring(0, 8)}, falling back to direct flood`);
-    this.flood(hint, this.peerManager.myPeerId);
+    if (!echoed) {
+      log.warn(`hint stem failed for ${id.substring(0, 8)}; dropping (fail-closed, holders will reflood)`);
+    }
+    return echoed;
   }
 
   /**
