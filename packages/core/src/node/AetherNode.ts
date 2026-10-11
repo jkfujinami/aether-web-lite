@@ -39,6 +39,19 @@ export interface AetherNodeConfig {
   autoStart?: boolean;
   /** オニオン回路のパラメータ (テスト用に遅延を縮めるときなど) */
   circuit?: OnionCircuitOptions;
+  /**
+   * ノード identity (peerId) の扱い。
+   *
+   * - 'ephemeral' (既定): 起動ごとに採掘し直し、保存しない。セッションを跨いで
+   *   同一端末だと紐付けられない。起動時に数秒の採掘が掛かる。
+   * - 'persistent': パスフレーズで封印して保存する。`passphrase` が必須。
+   */
+  identityMode?: 'ephemeral' | 'persistent';
+  /**
+   * 端末に保存する秘密 (ノード鍵・トリップ鍵) の封印に使うパスフレーズ。
+   * 空文字では何も永続化しない。
+   */
+  passphrase?: string;
 }
 
 /**
@@ -146,7 +159,10 @@ export class AetherNode {
     }
 
     // 2. Bound Identity
-    const nodeIdentity = await NodeIdentityStore.loadOrMine(db);
+    const passphrase = config.passphrase ?? '';
+    const nodeIdentity = config.identityMode === 'persistent'
+      ? await NodeIdentityStore.loadOrMine(db, passphrase)
+      : await NodeIdentityStore.mineEphemeral(db);
     log.info(() => `Node identity initialized: ${nodeIdentity.peerId} pos=${nodeIdentity.position}`);
 
     // 3. エンジン群
@@ -169,7 +185,7 @@ export class AetherNode {
     peerManager.setZoneManager(zoneManager);
 
     const identity = new Identity();
-    await identity.initTrip(db);
+    await identity.initTrip(db, passphrase);
 
     const dandelion = new DandelionRouter(peerManager);
     const circuit = new OnionCircuit(peerManager, dispatcher, dandelion, config.circuit);

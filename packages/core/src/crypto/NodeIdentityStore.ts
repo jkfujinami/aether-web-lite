@@ -19,16 +19,46 @@ const NODE_SLOT = 'node';
  */
 export class NodeIdentityStore {
   /**
+   * 使い捨ての identity を採掘する (保存しない)。既定はこちら。
+   *
+   * ★ peerId を端末に永続化すると、トラッカーと全隣人がそれを見るので、
+   *   IP や VPN を変えても全セッションが同一端末として紐付く (H4)。
+   *   起動のたびに採掘し直す (既定パラメータで数秒) 代わりに、
+   *   セッションを跨いだ追跡の手掛かりを消す。
+   *
+   *   以前の版が保存した**パスフレーズで保護されていない**ノード鍵が
+   *   端末に残っていれば消す (押収時に読める状態で残さない)。
+   */
+  static async mineEphemeral(
+    store: SealedStore,
+    params: NodeIdPowParams = NODE_ID_POW,
+  ): Promise<NodeIdentity> {
+    await sodium.ready;
+    const record = await store.getSealed(NODE_SLOT).catch(() => undefined);
+    if (record && record.sealed?.protected !== true) {
+      await store.deleteSealed(NODE_SLOT).catch(() => undefined);
+      log.warn(`Removed an unprotected persisted node identity from this device.`);
+    }
+    return NodeIdentity.mine(params);
+  }
+
+  /**
    * 保存済みの identity を復元する。無ければ採掘して保存する。
    *
-   * @param passphrase 封印のパスフレーズ。未設定なら空文字。
+   * ★ パスフレーズ必須。空のパスフレーズでの封印は秘匿性ゼロ (誰でも開ける) なので、
+   *   「保護されているつもりで保護されていない」鍵を端末に置かせない。
+   *
+   * @param passphrase 封印のパスフレーズ (空文字は不可)
    */
   static async loadOrMine(
     store: SealedStore,
-    passphrase: string = '',
+    passphrase: string,
     params: NodeIdPowParams = NODE_ID_POW,
     vaultParams: VaultParams = VAULT_PARAMS,
   ): Promise<NodeIdentity> {
+    if (typeof passphrase !== 'string' || passphrase.length === 0) {
+      throw new RangeError('NodeIdentityStore.loadOrMine: a non-empty passphrase is required to persist the node identity');
+    }
     await sodium.ready;
 
     const restored = await NodeIdentityStore.tryLoad(store, passphrase, params);

@@ -42,6 +42,12 @@ export class Identity implements IIdentity {
       log.warn(`Could not unseal trip identity (wrong passphrase or tampered).`);
       return false;
     }
+    if (record.sealed?.protected !== true) {
+      log.warn(
+        `Trip identity on this device is NOT passphrase-protected; anyone with the device can read it. ` +
+        `Re-seal it with resealTrip().`,
+      );
+    }
 
     this.tripKeyPair = {
       publicKey: secret.slice(sodium.crypto_sign_SECRETKEYBYTES),
@@ -60,9 +66,14 @@ export class Identity implements IIdentity {
    */
   public async generateTrip(
     store: SealedStore,
-    passphrase: string = '',
+    passphrase: string,
     params: VaultParams = VAULT_PARAMS,
   ): Promise<string> {
+    // 空のパスフレーズでの封印は秘匿性ゼロ。押収されれば過去の全投稿が
+    // このトリップで紐付くので、保護なしでは永続化させない (H4)。
+    if (typeof passphrase !== 'string' || passphrase.length === 0) {
+      throw new RangeError('Identity.generateTrip: a non-empty passphrase is required');
+    }
     this.tripKeyPair = sodium.crypto_sign_keypair();
 
     const secret = new Uint8Array(
@@ -76,6 +87,26 @@ export class Identity implements IIdentity {
       `[Identity] Generated and sealed new trip identity (passphrase-protected: ${passphrase.length > 0}).`,
     );
     return this.tripDisplay;
+  }
+
+  /**
+   * 現在のトリップを新しいパスフレーズで封印し直す (保護なしで保存された旧データの移行用)。
+   */
+  public async resealTrip(
+    store: SealedStore,
+    newPassphrase: string,
+    params: VaultParams = VAULT_PARAMS,
+  ): Promise<void> {
+    if (!this.tripKeyPair) throw new Error('Identity.resealTrip: no trip loaded');
+    if (typeof newPassphrase !== 'string' || newPassphrase.length === 0) {
+      throw new RangeError('Identity.resealTrip: a non-empty passphrase is required');
+    }
+    const secret = new Uint8Array(
+      sodium.crypto_sign_SECRETKEYBYTES + sodium.crypto_sign_PUBLICKEYBYTES,
+    );
+    secret.set(this.tripKeyPair.privateKey, 0);
+    secret.set(this.tripKeyPair.publicKey, sodium.crypto_sign_SECRETKEYBYTES);
+    await store.saveSealed(TRIP_SLOT, SecretVault.seal(secret, newPassphrase, params));
   }
 
   /**
