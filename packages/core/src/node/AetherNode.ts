@@ -77,6 +77,7 @@ export class AetherNode {
   public readonly threadOrchestrator: ThreadOrchestrator;
 
   private isStarted = false;
+  private isDestroyed = false;
 
   private constructor(
     params: {
@@ -254,6 +255,9 @@ export class AetherNode {
    * P2P ネットワークへ参加し、バックグラウンドメンテナを起動する。
    */
   public async start(): Promise<void> {
+    if (this.isDestroyed) {
+      throw new Error('AetherNode: a stopped node cannot be restarted; create a new one');
+    }
     if (this.isStarted) return;
     this.isStarted = true;
 
@@ -274,16 +278,30 @@ export class AetherNode {
   /**
    * ノードの全通信を停止し、リソースを解放する。
    */
+  /**
+   * ノードの全通信を止め、全タイマーを解放する。停止は終端で、再開はできない。
+   *
+   * ★ 旧実装は Schrödinger の再放流を止めて接続を切るだけだった。
+   *   PeerManager の再アナウンスタイマーが生き残り、停止後も 30 秒ごとに
+   *   トラッカーへ peerId と IP を再登録して接続を張り直していた。
+   *   heartbeat / maintainer / replication / zone / 各ルータのタイマーも残っていた。
+   */
   public async stop(): Promise<void> {
-    if (!this.isStarted) return;
+    if (this.isDestroyed) return;
+    this.isDestroyed = true;
     this.isStarted = false;
 
+    this.boardOrchestrator.clear();
+    this.threadOrchestrator.clear();
     this.schrodinger.destroy();
-    this.circuit.stop();
-    for (const peerId of this.peerManager.peers.keys()) {
-      this.peerManager.disconnect(peerId);
-    }
-    this.signaling.disconnect();
+    this.circuit.destroy();
+    this.heartbeat.stop();
+    this.maintainer.destroy();
+    this.replicationManager.destroy();
+    this.zoneManager.destroy();
+    this.gossipRouter.destroy();
+    this.hintRouter.destroy();
+    this.peerManager.stop(); // 再アナウンス停止・トラッカー切断・全ピア切断
     log.info(() => 'AetherNode stopped');
   }
 

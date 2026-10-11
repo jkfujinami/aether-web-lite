@@ -18,6 +18,8 @@ export class ReplicationManager {
   
   // 頻繁な接続変化によるバーストを防ぐためのデバウンスタイマー
   private rebalanceTimer: any = null;
+  private periodicTimer: ReturnType<typeof setInterval>;
+  private destroyed = false;
 
   constructor(mailbox: IMailbox, peerManager: IPeerManager, store: IndexedDBStore) {
     this.mailbox = mailbox;
@@ -29,13 +31,21 @@ export class ReplicationManager {
     this.peerManager.on('peer:disconnect', () => this.planRebalance());
 
     // 定期的なバックアップチェック（念のため）
-    setInterval(() => this.planRebalance(), 300_000); // 5分ごと
+    this.periodicTimer = setInterval(() => this.planRebalance(), 300_000); // 5分ごと
+  }
+
+  public destroy(): void {
+    clearInterval(this.periodicTimer);
+    if (this.rebalanceTimer) clearTimeout(this.rebalanceTimer);
+    this.rebalanceTimer = null;
+    this.destroyed = true;
   }
 
   /**
    * 再配分を計画する（デバウンス付き）
    */
   private planRebalance() {
+    if (this.destroyed) return;
     if (this.rebalanceTimer) clearTimeout(this.rebalanceTimer);
     this.rebalanceTimer = setTimeout(() => this.executeRebalance(), 10_000); // 10秒待機
   }

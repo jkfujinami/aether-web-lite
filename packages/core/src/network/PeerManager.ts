@@ -108,6 +108,9 @@ export class PeerManager implements IPeerManager {
   private identity: NodeIdentity;
   public readonly misbehavior: PeerMisbehaviorManager;
   private reannounceTimer: any = null;
+  private detachTimer: ReturnType<typeof setTimeout> | null = null;
+  /** stop() 済みか。停止後は新規接続も再アナウンスもしない */
+  private stopped = false;
   private readonly allowMissingDtlsFingerprint: boolean;
 
   public readonly myPeerId: PeerId;
@@ -360,9 +363,12 @@ export class PeerManager implements IPeerManager {
 
     // 購読ゾーンは送らない。トラッカーに申告すると、そのピアが何に興味を
     // 持っているかをトラッカーと全ピアに晒すことになる (本家 18.6.2 の交差攻撃)。
+    this.stopped = false;
     await this.signaling.connect({ claim: this.identity.claim() });
 
-    setTimeout(() => {
+    if (this.detachTimer) clearTimeout(this.detachTimer);
+    this.detachTimer = setTimeout(() => {
+      this.detachTimer = null;
       log.debug(`Detaching from Tracker Server! Entering Fully Decentralized Mode.`);
       this.signaling.disconnect();
     }, 15_000);
@@ -370,6 +376,7 @@ export class PeerManager implements IPeerManager {
     // 接続数低下時または孤立防止の動的再アナウンス (Adaptive Re-announce)
     if (this.reannounceTimer) clearInterval(this.reannounceTimer);
     this.reannounceTimer = setInterval(() => {
+      if (this.stopped) return;
       if (this.degree < 4 && !this.signaling.isConnected) {
         log.info(`Degree dropped to ${this.degree} (< 4). Reconnecting to tracker for network repair.`);
         this.signaling.connect({ claim: this.identity.claim() }).catch((err) => {
@@ -379,11 +386,24 @@ export class PeerManager implements IPeerManager {
     }, 30_000);
   }
 
+  /**
+   * 停止。以後トラッカーへの再アナウンスも新規接続も行わない。
+   *
+   * ★ 旧実装の AetherNode.stop() はこれを呼んでおらず、停止後も 30 秒ごとに
+   *   「次数 < 4」を検出してトラッカーへ peerId と IP を再登録し、接続を
+   *   張り直していた。利用者が「止めた」と思った後も網に参加し続けていた。
+   */
   public stop(): void {
+    this.stopped = true;
     if (this.reannounceTimer) {
       clearInterval(this.reannounceTimer);
       this.reannounceTimer = null;
     }
+    if (this.detachTimer) {
+      clearTimeout(this.detachTimer);
+      this.detachTimer = null;
+    }
+    this.pendingSignals.clear();
     this.signaling.disconnect();
     for (const peerId of Array.from(this._peers.keys())) {
       this.disconnect(peerId);
@@ -391,6 +411,7 @@ export class PeerManager implements IPeerManager {
   }
 
   private handleTrackerPeers(peers: Array<{ peerId: PeerId }>): void {
+    if (this.stopped) return;
     if (!Array.isArray(peers)) return;
     log.debug(`Received ${peers.length} peers from tracker`);
 
@@ -409,6 +430,7 @@ export class PeerManager implements IPeerManager {
    * @param viaPeerId DataChannel 越しに中継されてきた場合、その中継者
    */
   private handleRelay(senderId: PeerId, msg: any, viaPeerId?: PeerId): void {
+    if (this.stopped) return;
     if (this.misbehavior.isBanned(senderId)) {
       return;
     }
@@ -488,6 +510,7 @@ export class PeerManager implements IPeerManager {
   }
 
   public connect(peerId: PeerId, initiator: boolean = true, viaPeerId?: PeerId): WebRTCPeer | undefined {
+    if (this.stopped) return undefined;
     if (this.misbehavior.isBanned(peerId)) {
       log.warn(`Refusing connection to banned peer ${peerId.substring(0, 8)}`);
       return undefined;

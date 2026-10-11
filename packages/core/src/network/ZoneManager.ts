@@ -12,13 +12,20 @@ export class ZoneManager {
   private peerManager: IPeerManager;
   private networkSize: number = 10; // 初期推定値
   private depthDecreaseTimer: ReturnType<typeof setTimeout> | null = null;
+  private recomputeTimer: ReturnType<typeof setInterval>;
 
   constructor(peerManager: IPeerManager) {
     this.peerManager = peerManager;
     this.initSubscribedZones();
 
     // 1分ごとに depth を再計算 (§5.7)
-    setInterval(() => this.recomputeDepth(), 60_000);
+    this.recomputeTimer = setInterval(() => this.recomputeDepth(), 60_000);
+  }
+
+  public destroy(): void {
+    clearInterval(this.recomputeTimer);
+    if (this.depthDecreaseTimer) clearTimeout(this.depthDecreaseTimer);
+    this.depthDecreaseTimer = null;
   }
 
   public get depth(): number { return this._depth; }

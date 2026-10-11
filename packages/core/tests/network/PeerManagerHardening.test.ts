@@ -152,4 +152,21 @@ describe('PeerManager 要塞化 (Hardening Integration Tests)', () => {
       expect(delivered).toBe(0);
     });
   });
+
+  it('stop() 後はトラッカーへの再アナウンスも新規接続も行わない (H5)', async () => {
+    vi.useFakeTimers();
+    try {
+      await peerManagerA.start();
+      expect(mockSignaling.connect).toHaveBeenCalledTimes(1);
+
+      peerManagerA.stop();
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+
+      // 次数 0 のままでも、停止後は再アナウンスしない
+      expect(mockSignaling.connect).toHaveBeenCalledTimes(1);
+      expect(peerManagerA.connect('beef0000000000000000000000000001', true)).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
