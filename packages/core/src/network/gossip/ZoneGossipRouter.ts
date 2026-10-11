@@ -175,10 +175,18 @@ export class ZoneGossipRouter {
   }
 
   /**
-   * フラッディング。hop_count をインクリメントして全隣人へ転送する。
+   * フラッディング。全隣人へ転送する。
    *
    * 送信先をゾーンで絞らないのが要点 (Broadcast Veil)。
    * 同じパケットを二度中継しないための判定はここだけが行う (flooded)。
+   *
+   * ★ hop_count は増やさず、常に 0 で送る (H6)。
+   *
+   *   旧実装は中継のたびに +1 していたため、hop_count=1 を受け取れば
+   *   「送ってきた隣人が Fluff 地点 (出口)」と確定し、複数のスパイが値を
+   *   突き合わせれば出口の位置を三角測量できた。出口が分かれば作者の候補は
+   *   その周辺に絞られる。フィールドはワイヤ互換のために残すが、情報は載せない。
+   *   停止性は flooded (重複排除) と PacketValidator の時刻検査 (15 分) が担う。
    */
   private flood(packet: GossipPacket, excludePeerId: PeerId) {
     if (this.flooded.has(packet.packet_id)) {
@@ -186,10 +194,7 @@ export class ZoneGossipRouter {
       return;
     }
 
-    const relayPacket: GossipPacket = { ...packet, hop_count: packet.hop_count + 1 };
-
-    // hop_count 上限に達したパケットはここで止める
-    if (relayPacket.hop_count > PacketValidator.MAX_HOP_COUNT) return;
+    const relayPacket: GossipPacket = { ...packet, hop_count: 0 };
 
     this.flooded.add(packet.packet_id);
     const payload = { packet: relayPacket };

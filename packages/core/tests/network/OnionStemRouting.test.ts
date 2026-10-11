@@ -4,7 +4,7 @@ import { OnionRouter, SEALED_EXIT_LAYER_SIZE } from '../../src/crypto/OnionRoute
 import { WireType } from '../../src/network/wire/WireTypes';
 import { WireCodec } from '../../src/network/wire/WireCodec';
 import { buildHint } from '../../src/network/hint/HintCrypto';
-import { hintId } from '../../src/network/hint/HintPacket';
+import { hintId, HINT_INITIAL_TTL } from '../../src/network/hint/HintPacket';
 import sodium from '../../src/crypto/sodium';
 import {
   createSimNode, link, unlink, startAll, stopAll, sleep, makePacket, type SimNode,
@@ -61,6 +61,10 @@ describe('Onion 回路 (cover traffic / 固定長出口層 / Fail-Closed)', () =
     await sleep(50);
 
     expect(dave.received.map(p => p.packet_id)).toContain(packet.packet_id);
+    // hop_count は出口からの距離を漏らさない (H6)
+    const gossips = nodes.flatMap(n => n.inbox).filter(m => m.type === WireType.GOSSIP);
+    expect(gossips.length).toBeGreaterThan(0);
+    for (const g of gossips) expect(g.payload.packet.hop_count).toBe(0);
     // Alice から Bob へ平文の GOSSIP は一切出ていない
     expect(bob.inbox.some(m => m.from === alice.identity.peerId && m.type === WireType.GOSSIP)).toBe(false);
   });
@@ -149,6 +153,10 @@ describe('Onion 回路 (cover traffic / 固定長出口層 / Fail-Closed)', () =
 
     expect(bob.inbox.some(m => m.from === alice.identity.peerId && m.type === WireType.HINT)).toBe(false);
     expect(dave.inbox.some(m => m.type === WireType.HINT)).toBe(true);
+    // ttl は出口からの距離を漏らさない (H6)
+    for (const m of nodes.flatMap(n => n.inbox).filter(m => m.type === WireType.HINT)) {
+      expect(m.payload.ttl).toBe(HINT_INITIAL_TTL);
+    }
   });
 
   it('同じセルを再送しても中継は 1 回だけ (リプレイ耐性)', async () => {

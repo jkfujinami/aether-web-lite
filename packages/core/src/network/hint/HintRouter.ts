@@ -6,8 +6,8 @@ import { createLogger } from '../../common/Logger';
 import type { OnionCircuit } from '../onion/OnionCircuit';
 import {
   decodeHint,
-  decrementHintTtl,
   encodeHint,
+  HINT_INITIAL_TTL,
   hintId,
   parseHintPacket,
   verifyHintPow,
@@ -298,8 +298,14 @@ export class HintRouter {
   }
 
   /**
-   * 全隣人へ中継する。TTL を 1 減らし、0 になったら止める。
-   * 同じ Hint を二度中継しない判定はここだけが行う。
+   * 全隣人へ中継する。同じ Hint を二度中継しない判定はここだけが行う。
+   *
+   * ★ TTL は減らさず、常に初期値で送る (H6)。
+   *
+   *   旧実装は中継のたびに 1 減らしていたため、受け取った ttl から
+   *   「Fluff 地点 (出口) まであと何ホップか」が分かった (ttl=7 なら送り主が出口)。
+   *   ttl は id にコミットされていないのでワイヤ互換のために残すが、情報は載せない。
+   *   停止性は flooded (重複排除) が担う。
    */
   private flood(hint: HintPacket, excludePeerId: PeerId): void {
     const id = hintId(hint);
@@ -308,11 +314,7 @@ export class HintRouter {
       return;
     }
 
-    const relayed = decrementHintTtl(hint);
-    if (!relayed) {
-      log.trace(() => `HINT ttl exhausted ${id.substring(0, 8)}`);
-      return;
-    }
+    const relayed: HintPacket = { ...hint, ttl: HINT_INITIAL_TTL };
 
     this.flooded.add(id);
     for (const peer of this.peerManager.peers.values()) {
