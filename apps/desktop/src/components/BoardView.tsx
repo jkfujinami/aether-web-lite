@@ -8,24 +8,44 @@ const log = createLogger('ui.board');
 
 export default function BoardView({
   boardId,
-  boardKeyBase64
 }: {
   boardId: string;
-  boardKeyBase64?: string;
 }) {
-  const { threads, status, submitThread, powProgress, isSubmitting, boardKeyBase64: loadedKey } = useBoard(boardId);
+  const { threads, status, submitThread, powProgress, isSubmitting, shareCode } = useBoard(boardId);
   const [showForm, setShowForm] = useState(false);
   const [titleInput, setTitleInput] = useState('');
+  const [copied, setCopied] = useState(false);
 
   log.trace(() => `BoardView render: ${threads.length} threads`);
 
-  const currentKey = loadedKey || boardKeyBase64;
+  const copyShareCode = async () => {
+    if (!shareCode) return;
+    try {
+      await navigator.clipboard.writeText(shareCode);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // クリップボードが使えない環境では何もしない
+    }
+  };
 
   return (
     <div className="column-content">
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
         <h1 style={{ fontSize: '20px' }}>板: {boardId}</h1>
-        <button className="btn" style={{ fontSize: '12px' }} onClick={() => setShowForm(true)}>新スレを立てる</button>
+        <div style={{ display: 'flex', gap: '8px' }}>
+          {shareCode && (
+            <button
+              className="btn"
+              style={{ fontSize: '12px' }}
+              onClick={copyShareCode}
+              title="この板の鍵を含みます。信頼できる相手にだけ渡してください"
+            >
+              {copied ? 'コピーしました' : '共有コードをコピー'}
+            </button>
+          )}
+          <button className="btn" style={{ fontSize: '12px' }} onClick={() => setShowForm(true)}>新スレを立てる</button>
+        </div>
       </div>
 
       {showForm && (
@@ -65,7 +85,7 @@ export default function BoardView({
         {status && <div style={{ color: 'var(--text-dim)', padding: '20px 0' }}>{status}</div>}
 
         {threads.map((t: ThreadMeta) => {
-          const url = `#board=${boardId}&thread=${t.thread_id}${currentKey ? `&key=${currentKey}` : ''}`;
+          const url = `#board=${boardId}&thread=${t.thread_id}`;
           const heat = Math.floor(t.max_pow || 0);
           const score = ThreadRanker.calculateScore(t.max_pow || 0, t.created_at);
 

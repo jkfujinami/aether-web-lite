@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useRef, useCallback, useSyncExternalStore } from 'react';
+import { useEffect, useState, useCallback, useSyncExternalStore } from 'react';
 import { useP2P } from '@/providers/P2PProvider';
-import { KeyManager, ThreadRanker, type ThreadMeta, type BoardStatus, createLogger } from '@aether/core';
+import { ThreadRanker, type ThreadMeta, type BoardStatus, createLogger } from '@aether/core';
+import { resolveBoardKey, shareCode } from '@/lib/boardKeys';
 
 const log = createLogger('ui.board');
 
@@ -26,9 +27,9 @@ const IDLE_STATUS: BoardStatus = { phase: 'idle', message: '初期化中...', is
  * 必要があり、その責任は BoardOrchestrator 側のキャッシュが負っている。
  */
 export function useBoard(boardId: string) {
-  const { boardOrchestrator, isReady } = useP2P();
+  const { boardOrchestrator, isReady, db } = useP2P();
 
-  const boardKey = useRef<Uint8Array | null>(null);
+  const [boardKey, setBoardKey] = useState<Uint8Array | null>(null);
 
   const subscribeThreads = useCallback(
     (onChange: () => void) => {
@@ -63,38 +64,32 @@ export function useBoard(boardId: string) {
   const threads = useSyncExternalStore(subscribeThreads, getThreads, () => EMPTY_THREADS);
   const status = useSyncExternalStore(subscribeStatus, getStatus, () => IDLE_STATUS);
 
-  // BoardKey の解決 (レンダー結果に影響しないので ref のまま)
+  // 板の鍵の解決。鍵は URL ではなく、暗号化された端末 DB から引く。
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const hashParams = new URLSearchParams(window.location.hash.substring(1));
-    const base64Key = hashParams.get('key');
-
-    if (base64Key) {
-      boardKey.current = KeyManager.fromBase64(base64Key);
-    } else if (boardId === 'vip') {
-      boardKey.current = KeyManager.cryptoHash(
-        new TextEncoder().encode('AETHER_LITE_VIP_DEFAULT_SEED'),
-      ).slice(0, 32);
-    }
-  }, [boardId]);
+    let cancelled = false;
+    setBoardKey(null);
+    resolveBoardKey(boardId, db).then((key) => {
+      if (!cancelled) setBoardKey(key);
+    });
+    return () => { cancelled = true; };
+  }, [boardId, db]);
 
   // 板の活性化。アンマウント時に購読を畳む。
   useEffect(() => {
-    if (!isReady || !boardOrchestrator || !boardKey.current) return;
-    boardOrchestrator.activate(boardId, boardKey.current);
+    if (!isReady || !boardOrchestrator || !boardKey) return;
+    boardOrchestrator.activate(boardId, boardKey);
     return () => {
       boardOrchestrator.clear();
     };
-  }, [boardId, boardOrchestrator, isReady]);
+  }, [boardId, boardOrchestrator, isReady, boardKey]);
 
   const submitThread = async (title: string, onFail?: (m: string) => void) => {
-    if (!boardOrchestrator || !boardKey.current) return;
+    if (!boardOrchestrator || !boardKey) return;
 
-    const threadId = await boardOrchestrator.submitThread(boardId, boardKey.current, title);
+    const threadId = await boardOrchestrator.submitThread(boardId, boardKey, title);
 
     if (threadId) {
-      const keyB64 = KeyManager.toBase64(boardKey.current);
-      window.location.hash = `#board=${boardId}&thread=${threadId}&key=${keyB64}`;
+      window.location.hash = `#board=${boardId}&thread=${threadId}`;
     } else if (onFail) {
       onFail('スレッドの作成に失敗しました');
     }
@@ -112,6 +107,9 @@ export function useBoard(boardId: string) {
     isSubmitting: status.isSubmitting ?? false,
     powProgress: status.powProgress ?? 0,
     submitThread,
-    boardKeyBase64: boardKey.current ? KeyManager.toBase64(boardKey.current) : null,
+    /** この板の鍵を持っているか (無ければ読めない) */
+    hasKey: boardKey !== null,
+    /** 他の人に渡す共有コード (利用者が明示的にコピーしたときだけ使う) */
+    shareCode: boardKey ? shareCode(boardId, boardKey) : null,
   };
 }

@@ -7,8 +7,26 @@ import sodium from 'libsodium-wrappers-sumo';
 import { AppHeader } from '../src/components/AppHeader';
 import BoardView from '../src/components/BoardView';
 import ThreadView from '../src/components/ThreadView';
-import App from '../src/App';
-import { P2PProvider } from '../src/providers/P2PProvider';
+import App, { RouterView } from '../src/App';
+import { P2PProvider, P2PContextForTest } from '../src/providers/P2PProvider';
+
+/** ロック解除済みの最小のコンテキスト (ノード無し) */
+function readyContext(): any {
+  return {
+    node: null,
+    boardOrchestrator: null,
+    threadOrchestrator: null,
+    pm: null,
+    identity: null,
+    db: null,
+    isReady: false,
+    lockState: 'ready',
+    unlockError: null,
+    unlock: async () => {},
+    resetAll: async () => {},
+    panicWipe: async () => {},
+  };
+}
 import { KeyManager, Identity } from '@aether/core';
 
 describe('Desktop UI Rendering & Workflows (AETHER Specification)', () => {
@@ -35,17 +53,46 @@ describe('Desktop UI Rendering & Workflows (AETHER Specification)', () => {
       expect(screen.getByText(/Peers:/)).toBeTruthy();
     });
 
-    it('秘密の板作成ボタンを押すと、暗号的に安全な鍵付きURLハッシュが生成される', () => {
+    it('秘密の板を作ると、鍵は暗号化 DB に保存され、URL には板 ID だけが載る', async () => {
+      const saveBoard = vi.fn().mockResolvedValue(undefined);
+      const db: any = { saveBoard, listBoards: vi.fn().mockResolvedValue([]) };
+      render(
+        <P2PContextForTest.Provider value={{ ...readyContext(), db }}>
+          <AppHeader />
+        </P2PContextForTest.Provider>,
+      );
+
+      fireEvent.click(screen.getByText('+ 秘密の板を作る'));
+
+      await waitFor(() => expect(window.location.hash).toMatch(/^#board=[0-9a-f]+$/));
+      expect(saveBoard).toHaveBeenCalledTimes(1);
+      const [boardId, key] = saveBoard.mock.calls[0];
+      expect(window.location.hash).toBe(`#board=${boardId}`);
+      expect(key).toBeInstanceOf(Uint8Array);
+      expect(key.length).toBe(32);
+    });
+
+    it('ロック解除前 (DB が無い) は秘密の板を作れない', () => {
       render(
         <P2PProvider>
           <AppHeader />
         </P2PProvider>,
       );
+      expect((screen.getByText('+ 秘密の板を作る') as HTMLButtonElement).disabled).toBe(true);
+    });
 
-      const createBtn = screen.getByText('+ 秘密の板を作る');
-      fireEvent.click(createBtn);
+    it('緊急消去は 2 回押さないと実行されない', async () => {
+      const panicWipe = vi.fn().mockResolvedValue(undefined);
+      render(
+        <P2PContextForTest.Provider value={{ ...readyContext(), panicWipe }}>
+          <AppHeader />
+        </P2PContextForTest.Provider>,
+      );
 
-      expect(window.location.hash).toMatch(/^#board=[a-z0-9]+&key=[A-Za-z0-9_-]+/);
+      fireEvent.click(screen.getByText('緊急消去'));
+      expect(panicWipe).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByText('もう一度押すと全消去'));
+      await waitFor(() => expect(panicWipe).toHaveBeenCalledTimes(1));
     });
   });
 
@@ -144,10 +191,34 @@ describe('Desktop UI Rendering & Workflows (AETHER Specification)', () => {
   });
 
   describe('Desktop App Whole Integration', () => {
-    it('初期URLハッシュなしで起動した際、自動的に #board=vip へフォールバックして描画される', async () => {
+    it('起動するとまずパスワード画面が出て、ロック解除まで板は表示されない', async () => {
+      render(<App />);
+
+      await waitFor(() => {
+        expect(screen.getByText('パスワードを設定')).toBeTruthy();
+      });
+      expect(screen.queryByText('板: vip')).toBeNull();
+    });
+
+    it('初回設定では短いパスワードと確認の不一致を弾く', async () => {
+      render(<App />);
+      await waitFor(() => screen.getByText('パスワードを設定'));
+
+      fireEvent.change(screen.getByLabelText('パスワード'), { target: { value: 'short' } });
+      fireEvent.change(screen.getByLabelText('パスワード (確認)'), { target: { value: 'short' } });
+      fireEvent.click(screen.getByText('設定して開始'));
+      await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/8 文字以上/));
+
+      fireEvent.change(screen.getByLabelText('パスワード'), { target: { value: 'long enough pass' } });
+      fireEvent.change(screen.getByLabelText('パスワード (確認)'), { target: { value: 'different pass!!' } });
+      fireEvent.click(screen.getByText('設定して開始'));
+      await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/一致しません/));
+    });
+
+    it('初期URLハッシュなしで開いた際、自動的に #board=vip へフォールバックして描画される', async () => {
       window.location.hash = '';
 
-      render(<App />);
+      render(<P2PProvider><RouterView /></P2PProvider>);
 
       await waitFor(() => {
         expect(window.location.hash).toBe('#board=vip');
@@ -157,9 +228,18 @@ describe('Desktop UI Rendering & Workflows (AETHER Specification)', () => {
       expect(screen.getByText('板: vip')).toBeTruthy();
     });
 
+    it('鍵付きのリンクで開いても、URL から鍵が消える', async () => {
+      window.location.hash = '#board=abc123&key=AAAA';
+      render(<P2PProvider><RouterView /></P2PProvider>);
+
+      await waitFor(() => {
+        expect(window.location.hash).toBe('#board=abc123');
+      });
+    });
+
     it('ハッシュ変更により BoardView と ThreadView の切り替えが正しく反映される', async () => {
       window.location.hash = '#board=vip';
-      render(<App />);
+      render(<P2PProvider><RouterView /></P2PProvider>);
 
       expect(screen.getByText('板: vip')).toBeTruthy();
 

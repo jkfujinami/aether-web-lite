@@ -51,7 +51,6 @@ class FakeStore {
   }
   async getPosts() { return []; }
   async getThreads() { return []; }
-  async getRecentTimestamps() { return []; }
 }
 
 class FakePeerManager {
@@ -98,13 +97,15 @@ function setupHarness() {
   const zm = new FakeZoneManager() as unknown as IZoneManager;
   const db = new FakeStore();
   const dandelion = new DandelionRouter(pm);
-  const mailbox = new DHTMailbox(pm, dispatcher, db as any, dandelion);
-  const router = new ZoneGossipRouter(pm, dispatcher, zm, dandelion);
+  // 送信は検証の対象外 (受信して描画されることだけを見る)。回路は送信を受け付けるだけのスタブ
+  const circuit: any = { onExit: () => {}, send: async () => true, start: () => {}, stop: () => {} };
+  const mailbox = new DHTMailbox(pm, dispatcher, db as any, circuit);
+  const router = new ZoneGossipRouter(pm, dispatcher, zm, dandelion, circuit);
   const cryptoEng = new CryptoEngine();
   const identity = new Identity();
   const syncProtocol = new SyncProtocol(mailbox, cryptoEng, fakeKeyMgr, db as any);
-  const hintRouter = new HintRouter(pm, dispatcher, dandelion);
-  const schrodinger = new SchrodingerMailbox(mailbox, hintRouter, pm, 'instant');
+  const hintRouter = new HintRouter(pm, dispatcher, dandelion, circuit);
+  const schrodinger = new SchrodingerMailbox(mailbox, hintRouter, pm, 'disabled');
 
   const boardOrchestrator = new BoardOrchestrator(
     pm,
@@ -140,7 +141,13 @@ function setupHarness() {
       threadOrchestrator,
       pm: pm as any,
       identity,
+      db: null,
       isReady: true,
+      lockState: 'ready',
+      unlockError: null,
+      unlock: async () => {},
+      resetAll: async () => {},
+      panicWipe: async () => {},
     },
     dispatcher,
     hintRouter,
@@ -176,11 +183,14 @@ describe('DesktopLiveRender: ネットワークから届いたパケットが DO
   it('★Schrödinger Mailbox (Hint + Slot) 経由で届いたスレッドが確実に開封され DOM に現れる', async () => {
     const { ctx, hintRouter, db } = setupHarness();
 
-    render(
-      <Wrap value={ctx}>
-        <BoardView boardId={BOARD_ID} />
-      </Wrap>,
-    );
+    // 板の鍵の解決は非同期なので、描画に伴う effect の完了まで act の中で待つ
+    await act(async () => {
+      render(
+        <Wrap value={ctx}>
+          <BoardView boardId={BOARD_ID} />
+        </Wrap>,
+      );
+    });
 
     expect(screen.queryByText('P2P Hint経由で受信した重要スレッド')).toBeNull();
 
@@ -235,11 +245,14 @@ describe('DesktopLiveRender: ネットワークから届いたパケットが DO
   it('★鍵が異なる (別板/不正) Hint は開封されず DOM に現れない', async () => {
     const { ctx, hintRouter, db } = setupHarness();
 
-    render(
-      <Wrap value={ctx}>
-        <BoardView boardId={BOARD_ID} />
-      </Wrap>,
-    );
+    // 板の鍵の解決は非同期なので、描画に伴う effect の完了まで act の中で待つ
+    await act(async () => {
+      render(
+        <Wrap value={ctx}>
+          <BoardView boardId={BOARD_ID} />
+        </Wrap>,
+      );
+    });
 
     const wrongKey = new Uint8Array(BOARD_KEY);
     wrongKey[0] ^= 0xaa; // 意図的に鍵を破壊
@@ -281,11 +294,14 @@ describe('DesktopLiveRender: ネットワークから届いたパケットが DO
   it('★Gossip で流れてきた新着スレッドがリアルタイムに DOM に反映される', async () => {
     const { ctx, dispatcher } = setupHarness();
 
-    render(
-      <Wrap value={ctx}>
-        <BoardView boardId={BOARD_ID} />
-      </Wrap>,
-    );
+    // 板の鍵の解決は非同期なので、描画に伴う effect の完了まで act の中で待つ
+    await act(async () => {
+      render(
+        <Wrap value={ctx}>
+          <BoardView boardId={BOARD_ID} />
+        </Wrap>,
+      );
+    });
 
     const packet = await PacketBuilder.build(
       'Gossip生中継スレッド',
@@ -321,11 +337,14 @@ describe('DesktopLiveRender: ネットワークから届いたパケットが DO
     const threadId = 'thread-live-target';
     const threadKey = KeyManager.deriveThreadKey(BOARD_KEY, threadId);
 
-    render(
-      <Wrap value={ctx}>
-        <ThreadView boardId={BOARD_ID} threadId={threadId} />
-      </Wrap>,
-    );
+    // 板の鍵の解決は非同期なので、描画に伴う effect の完了まで act の中で待つ
+    await act(async () => {
+      render(
+        <Wrap value={ctx}>
+          <ThreadView boardId={BOARD_ID} threadId={threadId} />
+        </Wrap>,
+      );
+    });
 
     const postPacket = await PacketBuilder.build(
       'リアルタイム着信レス: こんにちは',

@@ -9,11 +9,9 @@ const log = createLogger('ui.thread');
 export default function ThreadView({
   boardId,
   threadId,
-  boardKeyBase64
 }: {
   boardId: string;
   threadId: string;
-  boardKeyBase64?: string;
 }) {
   const {
     posts, status, submitReply,
@@ -54,7 +52,7 @@ export default function ThreadView({
     <div className="view-container thread-view column-content">
       <div style={{ marginBottom: '20px' }}>
         <button
-          onClick={() => { window.location.hash = `#board=${boardId}${boardKeyBase64 ? `&key=${boardKeyBase64}` : ''}`; }}
+          onClick={() => { window.location.hash = `#board=${boardId}`; }}
           style={{ background: 'none', border: 'none', padding: 0, color: 'var(--text-dim)', textDecoration: 'none', cursor: 'pointer', fontSize: 'inherit' }}
         >
           ← 板に戻る

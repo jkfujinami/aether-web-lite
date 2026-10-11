@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useCallback, useSyncExternalStore } from 'react';
+import { useEffect, useState, useCallback, useSyncExternalStore } from 'react';
 import { useP2P } from '@/providers/P2PProvider';
-import { KeyManager, type DAGPost, type ThreadStatus, createLogger } from '@aether/core';
+import { type DAGPost, type ThreadStatus, createLogger } from '@aether/core';
+import { resolveBoardKey } from '@/lib/boardKeys';
 
 const log = createLogger('ui.thread');
 
@@ -19,7 +20,7 @@ const IDLE_STATUS: ThreadStatus = { phase: 'idle', message: '初期化中...', i
  * 「受信はできているのに画面が更新されない」という形で表面化する。
  */
 export function useThread(boardId: string, threadId: string) {
-  const { isReady, threadOrchestrator } = useP2P();
+  const { isReady, threadOrchestrator, db } = useP2P();
 
   const subscribePosts = useCallback(
     (onChange: () => void) => {
@@ -54,29 +55,26 @@ export function useThread(boardId: string, threadId: string) {
   const posts = useSyncExternalStore(subscribePosts, getPosts, () => EMPTY_POSTS);
   const statusObj = useSyncExternalStore(subscribeStatus, getStatus, () => IDLE_STATUS);
 
+  // 板の鍵の解決。鍵は URL ではなく、暗号化された端末 DB から引く。
+  const [boardKey, setBoardKey] = useState<Uint8Array | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    setBoardKey(null);
+    resolveBoardKey(boardId, db).then((key) => {
+      if (!cancelled) setBoardKey(key);
+    });
+    return () => { cancelled = true; };
+  }, [boardId, db]);
+
   // スレッドの活性化。アンマウント時に購読を畳む。
   useEffect(() => {
-    if (!isReady || !threadOrchestrator || typeof window === 'undefined') return;
-
-    const hashParams = new URLSearchParams(window.location.hash.substring(1));
-    const base64Key = hashParams.get('key');
-
-    let bKey: Uint8Array | null = null;
-    if (base64Key) {
-      bKey = KeyManager.fromBase64(base64Key);
-    } else if (boardId === 'vip') {
-      bKey = KeyManager.cryptoHash(
-        new TextEncoder().encode('AETHER_LITE_VIP_DEFAULT_SEED'),
-      ).slice(0, 32);
-    }
-
-    if (!bKey) return;
-    threadOrchestrator.activate(boardId, threadId, bKey);
+    if (!isReady || !threadOrchestrator || !boardKey) return;
+    threadOrchestrator.activate(boardId, threadId, boardKey);
 
     return () => {
       threadOrchestrator.clear();
     };
-  }, [boardId, threadId, isReady, threadOrchestrator]);
+  }, [boardId, threadId, isReady, threadOrchestrator, boardKey]);
 
   const submitReply = async (text: string) => {
     if (!text || !threadOrchestrator) return;
