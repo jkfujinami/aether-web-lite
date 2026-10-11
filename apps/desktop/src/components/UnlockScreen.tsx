@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from 'react';
 import { useP2P, MIN_PASSPHRASE_LENGTH } from '@/providers/P2PProvider';
+import { SecurityInfo } from './SecurityInfo';
 
 /**
  * パスワード画面。
@@ -89,6 +90,15 @@ export function UnlockScreen() {
           <div role="alert" style={{ color: '#ef4444', fontSize: '12px', marginTop: '10px' }}>
             {localError || unlockError}
           </div>
+        )}
+
+        {isSetup && (
+          <details style={{ marginTop: '16px' }} open>
+            <summary style={{ fontSize: '12px', cursor: 'pointer' }}>AETHER で守れること・守れないこと</summary>
+            <div style={{ marginTop: '8px' }}>
+              <SecurityInfo compact />
+            </div>
+          </details>
         )}
 
         {!isSetup && (

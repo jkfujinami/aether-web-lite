@@ -82,6 +82,28 @@ describe('Desktop UI Rendering & Workflows (AETHER Specification)', () => {
       expect((screen.getByText('+ 秘密の板を作る') as HTMLButtonElement).disabled).toBe(true);
     });
 
+    it('トリップ使用中は「投稿同士が紐付く」警告を出す', () => {
+      const identity: any = { hasTrip: true, tripDisplay: '◆abcdefg' };
+      render(
+        <P2PContextForTest.Provider value={{ ...readyContext(), identity }}>
+          <AppHeader />
+        </P2PContextForTest.Provider>,
+      );
+      expect(screen.getByRole('note').textContent).toMatch(/投稿同士が紐付きます/);
+    });
+
+    it('「安全性について」で守れないことを明示する', () => {
+      render(
+        <P2PContextForTest.Provider value={readyContext()}>
+          <AppHeader />
+        </P2PContextForTest.Provider>,
+      );
+      fireEvent.click(screen.getByText('安全性について'));
+      expect(screen.getByText('守れないこと')).toBeTruthy();
+      expect(screen.getByText(/国全体の通信を監視できる相手/)).toBeTruthy();
+      expect(screen.getByText(/IP アドレスは接続先の端末と通信事業者/)).toBeTruthy();
+    });
+
     it('ロックボタンで lock が呼ばれる (データは消さない)', async () => {
       const lock = vi.fn().mockResolvedValue(undefined);
       const panicWipe = vi.fn();
@@ -212,6 +234,8 @@ describe('Desktop UI Rendering & Workflows (AETHER Specification)', () => {
         expect(screen.getByText('パスワードを設定')).toBeTruthy();
       });
       expect(screen.queryByText('板: vip')).toBeNull();
+      // 初回設定の画面で、守れないことを先に読めるようにしてある
+      expect(screen.getByText('守れないこと')).toBeTruthy();
     });
 
     it('トレイからのロック命令でパスワード画面に戻る', async () => {

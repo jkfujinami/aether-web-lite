@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { useP2P } from '@/providers/P2PProvider';
 import { KeyManager, type BoardRecord } from '@aether/core';
 import { DEFAULT_BOARD_ID, newBoardId, parseShareCode } from '@/lib/boardKeys';
+import { SecurityInfo } from './SecurityInfo';
 
 export function AppHeader() {
   const { node, identity, db, panicWipe, lock } = useP2P();
@@ -11,6 +12,7 @@ export function AppHeader() {
   const [importText, setImportText] = useState('');
   const [importError, setImportError] = useState<string | null>(null);
   const [confirmWipe, setConfirmWipe] = useState(false);
+  const [showSecurity, setShowSecurity] = useState(false);
 
   useEffect(() => {
     if (!node) return;
@@ -121,8 +123,25 @@ export function AppHeader() {
         {identity && (
           <div style={{ color: 'var(--text-dim)', fontFamily: 'monospace' }}>
             Trip: <span style={{ color: '#d1a65d' }}>{identity.tripDisplay || '名無し'}</span>
+            {identity.hasTrip && (
+              <span
+                role="note"
+                title="トリップを付けた投稿同士は、同じ人物のものとして紐付きます。継続して投稿すると、オンラインだった時間帯との突き合わせで候補を絞られる材料にもなります。"
+                style={{ marginLeft: '6px', color: '#eab308' }}
+              >
+                ⚠ 投稿同士が紐付きます
+              </span>
+            )}
           </div>
         )}
+
+        <button
+          className="btn"
+          onClick={() => setShowSecurity((v) => !v)}
+          style={{ padding: '3px 10px', fontSize: '11px' }}
+        >
+          安全性について
+        </button>
 
         <button
           className="btn"
@@ -142,6 +161,15 @@ export function AppHeader() {
           {confirmWipe ? 'もう一度押すと全消去' : '緊急消去'}
         </button>
       </div>
+
+      {showSecurity && (
+        <div className="card" style={{ position: 'absolute', top: '50px', right: '15px', zIndex: 10, width: '420px' }}>
+          <SecurityInfo />
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '10px' }}>
+            <button className="btn" onClick={() => setShowSecurity(false)}>閉じる</button>
+          </div>
+        </div>
+      )}
 
       {showImport && (
         <div className="card" style={{ position: 'absolute', top: '50px', left: '15px', zIndex: 10, width: '360px' }}>
