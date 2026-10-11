@@ -2,6 +2,7 @@ import type { PeerId, IPeerManager, IMessageDispatcher } from '../types';
 import { RING_MESH } from '../constants';
 import { WireType } from './wire/WireTypes';
 import { createLogger } from '../common/Logger';
+import { secureRandomIndex } from './gossip/DandelionRouter';
 
 const log = createLogger('net.pex');
 
@@ -44,15 +45,23 @@ export class PEXHandler {
   /** ── Dispatcher Handlers ── */
 
   private handlePexRequest(senderPeerId: PeerId, _msg: any) {
+    // 検証済みの claim (pubkey + NodeId PoW) を添える。受け手はこれで
+    // 「自分の隣人の隣人」をオニオンの出口候補として検証付きで知る。
+    // pubkey と powCounter はどちらも JOIN で誰にでも開示している公開情報。
     const candidates = Array.from(this.peerManager.peers.values())
       .filter(p => p.peerId !== senderPeerId && p.isConnected && p.isVerified)
-      .map(p => ({ id: p.peerId }));
+      .map(p => {
+        const peer = p as any;
+        return peer.pubkey instanceof Uint8Array && typeof peer.powCounter === 'number'
+          ? { id: p.peerId, pubkey: peer.pubkey as Uint8Array, powCounter: peer.powCounter as number }
+          : { id: p.peerId };
+      });
 
     // ランダムに間引いてから上限で切る。先頭 N 件固定だと、
     // 早期に接続した攻撃者ノードが永久に紹介され続ける
     // (本家 18.7-④ が Rust 側で指摘したのと同じ罠)。
     for (let i = candidates.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
+      const j = secureRandomIndex(i + 1);
       [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
     }
 
@@ -75,7 +84,10 @@ export class PEXHandler {
 
       const existing = this.peerManager.peers.get(id);
       if (existing && (existing.isConnected || (existing as any).isConnecting)) continue;
-      if (this.peerManager.degree >= RING_MESH.MAX_DEGREE) break;
+      // 次数に空きがあるか、自分で選んだ (outbound) 接続が目標に満たない間は張りに行く。
+      // 後者は枠が埋まっていても行う (検証後に inbound と入れ替わる)。
+      const outbound = this.peerManager.outboundCount ?? 0;
+      if (this.peerManager.degree >= RING_MESH.MAX_DEGREE && outbound >= RING_MESH.OUTBOUND_TARGET) break;
 
       // position は渡さない。PeerManager が peerId から導出する。
       this.peerManager.connect(id, true, senderPeerId);

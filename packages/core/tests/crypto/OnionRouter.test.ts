@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import sodium, { sodiumReady } from '../../src/crypto/sodium';
-import { OnionRouter, type OnionHop } from '../../src/crypto/OnionRouter';
+import { OnionRouter, SEALED_EXIT_LAYER_SIZE, type OnionHop } from '../../src/crypto/OnionRouter';
 import type { GossipPacket } from '../../src/types';
 
 describe('OnionRouter (3-Hop Onion Stem 暗号化・多段復号)', () => {
@@ -12,13 +12,14 @@ describe('OnionRouter (3-Hop Onion Stem 暗号化・多段復号)', () => {
     const kp = sodium.crypto_sign_keypair();
     return {
       name,
-      peerId: `${name.repeat(4)}0000000000000000000000000000`.substring(0, 32),
+      peerId: Buffer.from(sodium.randombytes_buf(16)).toString('hex'),
       pubkey: kp.publicKey,
       privkey: kp.privateKey,
     };
   }
 
-  const dummyPacket: GossipPacket = {
+  // 経路の暗号化だけを見るので、中身は検証を通らない形でよい (型は合わせない)
+  const dummyPacket = {
     packet_id: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
     zone_id: 1,
     timestamp: Date.now(),
@@ -31,7 +32,7 @@ describe('OnionRouter (3-Hop Onion Stem 暗号化・多段復号)', () => {
       content: 'Aether Onion Anonymous Message',
       author: 'vip',
     },
-  };
+  } as unknown as GossipPacket;
 
   it('1ホップ (直接暗号化) のラップとアンラップが正しく動作する', () => {
     const exitNode = createMockNode('exit');
@@ -76,7 +77,8 @@ describe('OnionRouter (3-Hop Onion Stem 暗号化・多段復号)', () => {
     expect(illegalUnwrap).toBeNull();
 
     // ── 第 2 ホップ: RelayNode が復号 ──
-    const hop2Result = OnionRouter.unwrap(hop1Result.innerOnion, relayNode.pubkey, relayNode.privkey);
+    // 中継は innerOnion を固定長セルに詰め直してから次へ送る
+    const hop2Result = OnionRouter.unwrap(OnionRouter.padCell(hop1Result.innerOnion), relayNode.pubkey, relayNode.privkey);
     expect(hop2Result).not.toBeNull();
     expect(hop2Result?.type).toBe('relay');
     if (hop2Result?.type !== 'relay') return;
@@ -84,7 +86,7 @@ describe('OnionRouter (3-Hop Onion Stem 暗号化・多段復号)', () => {
 
     // ── 第 3 ホップ: ExitNode が復号 ──
     // 最終出口ノードがアンラップすると、平文の GossipPacket が現れ Fluff を開始できる
-    const hop3Result = OnionRouter.unwrap(hop2Result.innerOnion, exitNode.pubkey, exitNode.privkey);
+    const hop3Result = OnionRouter.unwrap(OnionRouter.padCell(hop2Result.innerOnion), exitNode.pubkey, exitNode.privkey);
     expect(hop3Result).not.toBeNull();
     expect(hop3Result?.type).toBe('exit_fluff');
     if (hop3Result?.type !== 'exit_fluff') return;
@@ -110,5 +112,56 @@ describe('OnionRouter (3-Hop Onion Stem 暗号化・多段復号)', () => {
     corruptedOnion[10] ^= 0xff;
     const corruptResult = OnionRouter.unwrap(corruptedOnion, nodeA.pubkey, nodeA.privkey);
     expect(corruptResult).toBeNull();
+  });
+
+  it('固定長セル以外 (生の暗号文・長さ違い) は受け付けない', () => {
+    const node = createMockNode('node');
+    const onion = OnionRouter.wrapStem(dummyPacket, [{ peerId: node.peerId, pubkey: node.pubkey }]);
+    const raw = OnionRouter.unpadCell(onion)!;
+    expect(OnionRouter.unwrap(raw, node.pubkey, node.privkey)).toBeNull();
+    expect(OnionRouter.unwrap(onion.subarray(0, onion.length - 1), node.pubkey, node.privkey)).toBeNull();
+  });
+
+  it('出口層は固定長: drop と最大サイズの投稿で Guard に見える長さが同じ', () => {
+    const guard = createMockNode('guar');
+    const exit = createMockNode('exit');
+    const hops: OnionHop[] = [
+      { peerId: guard.peerId, pubkey: guard.pubkey },
+      { peerId: exit.peerId, pubkey: exit.pubkey },
+    ];
+    const bigPacket: any = {
+      ...dummyPacket,
+      payload: new Uint8Array(2048),
+      nonce: new Uint8Array(12),
+      pow_nonce: Number.MAX_SAFE_INTEGER,
+      timestamp: Number.MAX_SAFE_INTEGER,
+    };
+    const real = OnionRouter.wrapCircuit(
+      { type: 'exit_fluff', zoneId: 1, packet: bigPacket, slot: { topicHash: 'f'.repeat(64), hint: new Uint8Array(110) } },
+      hops,
+    );
+    const cover = OnionRouter.wrapCircuit({ type: 'drop' }, hops);
+
+    const a = OnionRouter.unwrap(real, guard.pubkey, guard.privkey);
+    const b = OnionRouter.unwrap(cover, guard.pubkey, guard.privkey);
+    expect(a?.type).toBe('relay');
+    expect(b?.type).toBe('relay');
+    if (a?.type !== 'relay' || b?.type !== 'relay') return;
+    expect(a.innerOnion.byteLength).toBe(SEALED_EXIT_LAYER_SIZE);
+    expect(b.innerOnion.byteLength).toBe(SEALED_EXIT_LAYER_SIZE);
+
+    const exitView = OnionRouter.unwrap(OnionRouter.padCell(a.innerOnion), exit.pubkey, exit.privkey);
+    expect(exitView?.type).toBe('exit_fluff');
+    const coverView = OnionRouter.unwrap(OnionRouter.padCell(b.innerOnion), exit.pubkey, exit.privkey);
+    expect(coverView?.type).toBe('drop');
+  });
+
+  it('relay 層の宛先が peerId 形式でなければ拒否する', () => {
+    const node = createMockNode('node');
+    const bad = OnionRouter.wrapCircuit({ type: 'drop' }, [
+      { peerId: node.peerId, pubkey: node.pubkey },
+      { peerId: 'not-a-peer-id', pubkey: node.pubkey },
+    ]);
+    expect(OnionRouter.unwrap(bad, node.pubkey, node.privkey)).toBeNull();
   });
 });

@@ -1,0 +1,77 @@
+name: CI
+
+# すべての push と PR で、共有プロトコル (core)・共有画面 (ui)・Desktop・Web を
+# 型検査・テスト・ビルドする。どれか 1 つでも落ちたらマージしない前提。
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NEXT_TELEMETRY_DISABLED: '1'
+  # Electron 本体のダウンロードは不要 (テストとビルドだけ)
+  ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      # Desktop と Web は core の dist を参照するので先に作る
+      - name: Build core
+        run: npm run build:core
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test core
+        run: npm run test:core
+
+      - name: Test ui
+        run: npm run test:ui
+
+      - name: Test tracker
+        run: npm run test:tracker
+
+      - name: Test desktop
+        run: npm run test:desktop
+
+      - name: Test web
+        run: npm run test:web
+
+      - name: Guard maintainer CLI builds
+        run: npm --workspace=@aether/core run build:cli
+
+      - name: Build desktop
+        run: npm --workspace=@aether/desktop exec -- vite build
+
+      - name: Build web
+        run: npm --workspace=web run build
+
+      # 本番ビルドを配信し、2 つのブラウザが解錠 → トラッカー登録 (所有証明) → WebRTC で
+      # 繋がるところまでを確かめる
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: E2E (web)
+        run: npm --workspace=web run e2e
+
+      # テストやビルドが追跡中のファイルを書き換えていないこと (生成物の取り込み漏れ・混入を防ぐ)
+      - name: Working tree is clean
+        run: git diff --exit-code && test -z "$(git status --porcelain)"

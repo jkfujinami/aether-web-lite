@@ -1,11 +1,10 @@
-import type { IPeerManager, PeerId, GossipPacket, StemPacket, IMessageDispatcher, IZoneManager } from '../../types';
+import type { IPeerManager, PeerId, GossipPacket, IMessageDispatcher, IZoneManager } from '../../types';
 import { SeenCache } from './SeenCache';
 import { PacketValidator } from './PacketValidator';
-import { DandelionRouter } from './DandelionRouter';
+import type { DandelionRouter } from './DandelionRouter';
+import type { OnionCircuit } from '../onion/OnionCircuit';
 import { WireType } from '../wire/WireTypes';
 import { createLogger } from '../../common/Logger';
-import { OnionRouter } from '../../crypto/OnionRouter';
-import { Encoding } from '../../common/Encoding';
 
 const log = createLogger('net.gossip');
 
@@ -52,27 +51,10 @@ const log = createLogger('net.gossip');
  * 現在は用途ごとに分離してある:
  *   - `flooded`   … 全隣人へ中継済みか (フラッディングの増幅を止める)
  *   - `delivered` … UI へ渡し済みか (中継の可否とは独立)
- *   - Stem は**どちらでも重複排除しない** (仕様 §8.2)。
- *     停止性は各ホップの確率判定 (幾何分布) が担保する。ここで既読判定を入れると
- *     「既に知っていたか」を外から観測できるオラクルになり、
- *     Stem 経路 (2〜4 ノード) の特定 = 発信元特定に直結する。
+ *
+ * ★ 平文 Stem は廃止した。作者の発信は {@link OnionCircuit} の固定長セルで運ばれ、
+ *   出口が exit_fluff を受け取った時点で Fluff に入る。
  */
-/**
- * 指数分布に従うランダム遅延 (ms) を算出 (Laplacian / Poisson Jitter)
- * 平均 lambdaMs (既定: 40ms)、下限 minMs (10ms)、上限 maxMs (120ms)。
- * 人間の知覚 (100〜200ms) を妨げず、パケット伝播のミリ秒タイミング相関を破壊する。
- */
-export function calculateExponentialDelay(lambdaMs: number = 40, minMs: number = 10, maxMs: number = 120): number {
-  if (lambdaMs <= 0) return 0;
-  const u = Math.random();
-  const raw = -Math.log(Math.max(1e-6, 1 - u)) * lambdaMs;
-  return Math.min(maxMs, Math.max(minMs, Math.round(raw)));
-}
-
-export interface ZoneGossipRouterOptions {
-  stemRelayDelayMs?: number;
-}
-
 export class ZoneGossipRouter {
   /** 全隣人へ中継 (flood) 済みか。フラッディングの増幅を止める。 */
   private flooded = new SeenCache();
@@ -80,41 +62,21 @@ export class ZoneGossipRouter {
   private delivered = new SeenCache();
 
   private listeners: Array<(packet: GossipPacket) => void> = [];
-  private dandelion: DandelionRouter;
-  private peerManager: IPeerManager;
-  private zoneManager: IZoneManager;
-  public stemRelayDelayMs: number = 40;
-
-  /** 中継遅延タイマーの同時保留上限 (DoS / メモリ枯渇攻撃の防御) */
-  private static readonly MAX_PENDING_RELAYS = 128;
-  /** 保留中の遅延タイマー集合 (ノード破棄時のクリーンアップ用) */
-  private pendingRelays = new Set<NodeJS.Timeout | number>();
 
   constructor(
-    peerManager: IPeerManager,
+    private peerManager: IPeerManager,
     dispatcher: IMessageDispatcher,
-    zoneManager: IZoneManager,
-    /**
-     * ★ HintRouter と**同じインスタンス**を渡すこと。
-     *   別々にするとエポック対象が 2 つになり、観測者に渡す辺が 1 本増えて
-     *   §3.1 の前提 (作者パケットと中継パケットが同じ宛先へ行くので
-     *   区別できない) が崩れる。省略時は自前で作る (単体テスト用)。
-     */
-    dandelion?: DandelionRouter,
-    options?: ZoneGossipRouterOptions,
+    private zoneManager: IZoneManager,
+    /** HintRouter / OnionCircuit と**同じインスタンス**を渡すこと (エコーと Guard を共有する) */
+    private dandelion: DandelionRouter,
+    /** 作者の発信はすべてこの回路に載せる */
+    private circuit: OnionCircuit,
   ) {
-    this.peerManager = peerManager;
-    this.zoneManager = zoneManager;
-    this.dandelion = dandelion ?? new DandelionRouter(peerManager);
-    if (options?.stemRelayDelayMs !== undefined) {
-      this.stemRelayDelayMs = options.stemRelayDelayMs;
-    }
-
     dispatcher.register(WireType.GOSSIP, (senderId, msg) => this.handleGossip(senderId, msg));
-    dispatcher.register(WireType.STEM, (senderId, msg) => this.handleStem(senderId, msg));
-    dispatcher.register(WireType.ONION_STEM, (senderId, msg) => this.handleOnionStem(senderId, msg));
+    circuit.onExit('exit_fluff', (payload) => {
+      if (payload.type === 'exit_fluff') this.handleExitFluff(payload.packet);
+    });
   }
-
 
   public onMessage(handler: (packet: GossipPacket) => void) {
     this.listeners.push(handler);
@@ -125,60 +87,48 @@ export class ZoneGossipRouter {
   }
 
   /**
-   * 自己発信またはUIからの手動再送
+   * 自己発信。
+   *
+   * ★ オニオン回路以外の経路は持たない (Fail-Closed)。
+   *
+   *   旧実装は「匿名化フラグ無しなら平文 flood」「隣人が 2 人未満なら平文 Stem」
+   *   「失敗したら Guard を交代して再試行」という分岐を持っていた。どれも
+   *   攻撃者が隣人を減らす・セルを捨てるだけで誘発でき、作者の IP から
+   *   平文を出させるか、Guard の座を回させる手段になっていた。
+   *
+   * @param opts.slot 出口に本体の保管も任せる場合の Schrödinger Slot
+   * @returns 網に現れたこと (エコー) を確認できたか
    */
-  public async broadcast(packet: GossipPacket, useDandelion: boolean = true): Promise<void> {
+  public async broadcast(
+    packet: GossipPacket,
+    opts: { slot?: { topicHash: string; hint: Uint8Array } } = {},
+  ): Promise<boolean> {
     // ネットワークに流す前に、まず自分のUIに即座に通知する
     // (ゾーン購読に関係なく、自分の投稿は必ず自分に見える)
     this.delivered.add(packet.packet_id);
     this.listeners.forEach(cb => cb(packet));
 
-    log.debug(() => `originating broadcast ${short(packet.packet_id)} zone=${packet.zone_id}`);
-
-    // 匿名化フラグが無効な場合のみ、直接平文フラッド (明示的オプトイン)
-    if (!useDandelion) {
-      this.flood(packet, this.peerManager.myPeerId);
-      return;
+    log.debug(() => `originating broadcast ${short(packet.packet_id)} via onion circuit`);
+    const ok = await this.circuit.send(
+      { type: 'exit_fluff', zoneId: packet.zone_id, packet, slot: opts.slot },
+      packet.packet_id,
+    );
+    if (!ok) {
+      log.error(`onion delivery failed for ${short(packet.packet_id)}; dropped (fail-closed, no plaintext fallback)`);
     }
-
-    // 1. Dandelion++ / Onion Stem 送信 (第1サーキット)
-    let echoed = await this.dandelion.publish(packet, true);
-    if (echoed) return;
-
-    // 2. 妨害または経路断絶を検知: Guard Pin をリセットし、別経路で最終再試行 (Circuit Rebuild)
-    log.warn(`onion stem failed for ${short(packet.packet_id)}, rebuilding circuit via fresh guard`);
-    this.dandelion.resetPinnedGuard();
-    echoed = await this.dandelion.publish(packet, true);
-    if (echoed) return;
-
-    // 3. 【Fail-Closed】オニオン失敗時は絶対に平文 flood へフォールバックしない。
-    //    親切心での平文フォールバックは、敵対的スパイによる「ドロップ誘発ダウングレード攻撃」
-    //    で発信元が生 IP を全隣人に告白させられる致命的な穴になるため、安全にドロップする。
-    log.error(`onion stem delivery failed completely for ${short(packet.packet_id)}. Dropping to prevent deanonymization.`);
+    return ok;
   }
 
   /**
-   * Fluff (拡散フェーズ) へ移行する。
-   * ローカル配信と中継はそれぞれ独立に冪等なので、何度呼んでも安全。
+   * 出口として受け取ったパケットを Fluff (全体配信) する。
    */
-  private fluffToZone(packet: GossipPacket): void {
-    log.trace(() => `fluff enter ${short(packet?.packet_id)}`);
-    // Fluff 移行時にも必ず検証する。Stem 経路から入ってきた不正パケットを
-    // ここで網に掛けないと、Fluff 地点が増幅器になる。
+  private handleExitFluff(packet: GossipPacket): void {
     if (!PacketValidator.validate(packet)) {
-      log.debug(() => `fluff REJECTED (validate) ${short(packet?.packet_id)}`);
+      log.debug(() => `exit fluff REJECTED (validate) ${short(packet?.packet_id)}`);
       return;
     }
-
-    // ★ エコーは「パケットが Fluff 段階に入った」ことの確認なので、
-    //   自分自身が Fluff した時点で確定させる。
-    //
-    //   flood() は送信元を除外するため、自分が撒いた Fluff は隣人同士で
-    //   転送し合うだけで自分には返ってこない。handleGossip でしか
-    //   notifyEcho を呼んでいないと、自分で Fluff したのにエコーが返らず、
-    //   発信元が 5 秒 × 3 回のリトライを空回りさせることになる。
+    log.debug(() => `exit -> FLUFF zone=${packet.zone_id} ${short(packet.packet_id)}`);
     this.dandelion.notifyEcho(packet.packet_id);
-
     this.deliverLocal(packet);
     this.flood(packet, this.peerManager.myPeerId);
   }
@@ -186,9 +136,6 @@ export class ZoneGossipRouter {
   /**
    * ローカル配信の判断。ここだけがゾーン購読を見る。
    * 外部からは観測できない純粋にローカルな判断なので、交差攻撃の材料にならない。
-   *
-   * 「UI へ届けたか」の判定はこのメソッドだけが行う (delivered)。
-   * 呼び出し元は中継状態を気にせず毎回呼んでよい。
    */
   private deliverLocal(packet: GossipPacket): void {
     if (this.delivered.has(packet.packet_id)) {
@@ -216,7 +163,7 @@ export class ZoneGossipRouter {
       return;
     }
 
-    // エコー通知 (Dandelion用) は何よりも先に。ここで発信元のリトライが止まる。
+    // エコー通知は何よりも先に。ここで発信元の待ち合わせが解ける。
     this.dandelion.notifyEcho(packet.packet_id);
 
     // 2. ローカル配信 (購読ゾーンのみ)。中継状態とは独立に必ず試みる。
@@ -227,131 +174,19 @@ export class ZoneGossipRouter {
     this.flood(packet, senderId);
   }
 
-  private handleStem(senderId: PeerId, msg: any) {
-    const stem = msg as StemPacket;
-    const packet = stem?.packet;
-    log.trace(() => `STEM from=${short(senderId)} ${short(packet?.packet_id)} zone=${stem?.zoneId}`);
-
-    // Stem 経路にも同じ検証を掛ける。旧実装は Stem 受信時に検証しておらず、
-    // 不正パケットが Fluff 地点まで無検査で運ばれていた。
-    if (!PacketValidator.validate(packet)) {
-      log.debug(() => `STEM REJECTED (validate) from=${short(senderId)} ${short(packet?.packet_id)}`);
-      return;
-    }
-
-    // ★ Stem では packet_id による重複排除を一切しない (仕様 §8.2)。
-    //
-    //   停止性は各ホップの確率判定が担保する。経路長は幾何分布に従い
-    //   平均 1/FLUFF_PROBABILITY ホップ (p=0.3 で 3.33)、50 ホップ到達確率は
-    //   0.7^50 ≈ 2e-8。加えて timestamp が MAX_TIME_DRIFT (15分) を超えると
-    //   PacketValidator が落とすため、病的な循環も必ず止まる。
-    //   増幅も起きない (Stem は 1 通受けて 1 通出すだけで、
-    //   Fluff 側の増幅は flooded キャッシュが 1 回に抑える)。
-    //
-    //   ここで「見たことがあるか」で分岐してはいけない。分岐させると、
-    //   攻撃者が任意のパケットを Stem として送りつけ、相手が即座に Fluff
-    //   (= 全隣人へのブロードキャスト) を返すかどうかを見るだけで
-    //   「この相手はそのパケットを既に知っていたか」を判定できてしまう。
-    //   Stem 経路は 2〜4 ノードしかないため、これは発信元特定に直結する。
-    //   加えて、自分の Stem が一周して戻ってきたときに自分が Fluff すると、
-    //   発信元自身が Fluff 地点 (hop_count=0 の出所) になり、
-    //   Dandelion++ の目的そのものが無効になる。
-    const decision = this.dandelion.handleStemPacket(senderId, stem);
-    // ★ 転送先 peerId は TRACE でしか出さない。Stem 先は経路情報そのもので、
-    //   既定レベルで常時出していると、コンソールを見られるだけで経路が割れる。
-    log.trace(() => `STEM decision=${decision.action} target=${short(decision.target)} ${short(packet.packet_id)}`);
-
-    if (decision.action === 'fluff') {
-      log.debug(() => `STEM -> fluff, zone=${packet.zone_id} ${short(packet.packet_id)}`);
-      this.fluffToZone(decision.packet as GossipPacket);
-    } else if (decision.action === 'forward' && decision.target) {
-      this.peerManager.sendMessage(decision.target, WireType.STEM, decision.packet);
-    }
-  }
-
   /**
-   * 多段オニオン暗号化された Stem パケットの処理 (Onion Stem Routing)。
-   *
-   * 自ノードの秘密鍵で 1 枚皮を剥き、
-   * - relay (中継指示) なら中身を読まずに次ホップへ転送
-   * - exit_fluff (出口指示) なら平文 GossipPacket を取り出して広域 Fluff を開始
-   */
-  private handleOnionStem(senderId: PeerId, msg: any) {
-    const rawBytes = msg?.onionBytes;
-    if (!rawBytes) return;
-
-    const onionBytes = typeof rawBytes === 'string'
-      ? Encoding.fromHex(rawBytes)
-      : rawBytes instanceof Uint8Array ? rawBytes : null;
-
-    if (!onionBytes) return;
-
-    const nodeIdentity = (this.peerManager as any)?.nodeIdentity;
-    if (!nodeIdentity) return;
-
-    const secret = nodeIdentity.exportSecret();
-    const result = OnionRouter.unwrap(onionBytes, secret.pubkey, secret.privkey);
-    if (!result) {
-      log.debug(`ONION_STEM unwrap failed (not for us or corrupted) from=${short(senderId)}`);
-      return;
-    }
-
-    if (result.type === 'relay') {
-      log.trace(() => `ONION_STEM relay -> ${short(result.nextHop)}`);
-      // 中継パケットを固定長セル (CELL_SIZE = 3800B) に再パディング
-      const padded = OnionRouter.padCell(result.innerOnion);
-      const delay = calculateExponentialDelay(this.stemRelayDelayMs);
-
-      // キュー枯渇攻撃の防御: 保留中の中継タイマー数が上限に達している場合は安全にドロップ
-      if (this.pendingRelays.size >= ZoneGossipRouter.MAX_PENDING_RELAYS) {
-        log.warn(`ONION_STEM relay dropped: pending queue full (${this.pendingRelays.size})`);
-        return;
-      }
-
-      let timerId: any = null;
-      const forward = () => {
-        if (timerId !== null) {
-          this.pendingRelays.delete(timerId);
-        }
-
-        // 送信直前に次ホップが現在も接続中か確認 (切断時のクラッシュ・無駄なバッファリング防止)
-        const peer = this.peerManager.peers.get(result.nextHop);
-        if (!peer || !peer.isConnected) {
-          log.debug(() => `ONION_STEM relay skipped: nextHop ${short(result.nextHop)} disconnected`);
-          return;
-        }
-
-        this.peerManager.sendMessage(result.nextHop, WireType.ONION_STEM, {
-          onionBytes: padded, // 単一フレームで送出するためバイナリ Uint8Array を直接渡す
-        });
-      };
-
-      if (delay > 0) {
-        timerId = setTimeout(forward, delay);
-        this.pendingRelays.add(timerId);
-      } else {
-        forward();
-      }
-    } else if (result.type === 'exit_fluff') {
-      const packet = result.packet;
-      log.debug(() => `ONION_STEM exit -> FLUFF zone=${packet.zone_id} ${short(packet.packet_id)}`);
-
-      if (!PacketValidator.validate(packet)) {
-        log.warn(`ONION_STEM exit packet validation failed: ${short(packet.packet_id)}`);
-        return;
-      }
-
-      this.dandelion.notifyEcho(packet.packet_id);
-      this.deliverLocal(packet);
-      this.fluffToZone(packet);
-    }
-  }
-
-  /**
-   * フラッディング。hop_count をインクリメントして全隣人へ転送する。
+   * フラッディング。全隣人へ転送する。
    *
    * 送信先をゾーンで絞らないのが要点 (Broadcast Veil)。
    * 同じパケットを二度中継しないための判定はここだけが行う (flooded)。
+   *
+   * ★ hop_count は増やさず、常に 0 で送る (H6)。
+   *
+   *   旧実装は中継のたびに +1 していたため、hop_count=1 を受け取れば
+   *   「送ってきた隣人が Fluff 地点 (出口)」と確定し、複数のスパイが値を
+   *   突き合わせれば出口の位置を三角測量できた。出口が分かれば作者の候補は
+   *   その周辺に絞られる。フィールドはワイヤ互換のために残すが、情報は載せない。
+   *   停止性は flooded (重複排除) と PacketValidator の時刻検査 (15 分) が担う。
    */
   private flood(packet: GossipPacket, excludePeerId: PeerId) {
     if (this.flooded.has(packet.packet_id)) {
@@ -359,10 +194,7 @@ export class ZoneGossipRouter {
       return;
     }
 
-    const relayPacket: GossipPacket = { ...packet, hop_count: packet.hop_count + 1 };
-
-    // hop_count 上限に達したパケットはここで止める
-    if (relayPacket.hop_count > PacketValidator.MAX_HOP_COUNT) return;
+    const relayPacket: GossipPacket = { ...packet, hop_count: 0 };
 
     this.flooded.add(packet.packet_id);
     const payload = { packet: relayPacket };
@@ -375,10 +207,6 @@ export class ZoneGossipRouter {
   }
 
   public destroy() {
-    for (const timer of this.pendingRelays) {
-      clearTimeout(timer as any);
-    }
-    this.pendingRelays.clear();
     this.flooded.destroy();
     this.delivered.destroy();
   }

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AetherNode } from '../src/node/AetherNode';
 import { IndexedDBStore } from '../src/storage/IndexedDBStore';
+import { VAULT_PARAMS_FAST } from '../src/storage/SecretVault';
 import 'fake-indexeddb/auto';
 
 describe('AetherNode Facade', () => {
@@ -14,9 +15,11 @@ describe('AetherNode Facade', () => {
 
     const node = await AetherNode.create({
       db,
-      signalingUrl: 'ws://localhost:9999/ws',
-      releaseMode: 'instant',
+      trackerUrl: 'ws://localhost:9999/ws',
+      releaseMode: 'disabled',
       autoStart: false,
+      passphrase: 'test-passphrase',
+      vaultParams: VAULT_PARAMS_FAST,
     });
 
     expect(node).toBeDefined();
@@ -37,5 +40,10 @@ describe('AetherNode Facade', () => {
     // 停止処理の呼び出し確認
     await node.stop();
     expect(node.running).toBe(false);
+  });
+
+  it('パスワード無しでは起動しない (ローカルデータは必ず暗号化する)', async () => {
+    const db = new IndexedDBStore('NoPassDB_' + Date.now());
+    await expect(AetherNode.create({ db, autoStart: false })).rejects.toThrow(RangeError);
   });
 });

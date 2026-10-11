@@ -31,10 +31,23 @@ export const MAILBOX_LIMITS = {
   MAX_ENTRY_BYTES: 16 * 1024,
   /** 1 メッセージで受け付けるエントリ数 */
   MAX_ENTRIES_PER_MESSAGE: 64,
-  /** 1 トピックあたりの保持エントリ数 */
-  MAX_ENTRIES_PER_TOPIC: 512,
+  /**
+   * 1 トピックあたりの保持エントリ数。
+   *
+   * ★ Schrödinger 化後、トピック (= mailbox_key) は投稿ごとにランダムで、
+   *   1 トピックに入る正規のエントリは 1 件 (Slot) だけ。旧値 512 は
+   *   板/スレの固定座標に全投稿を積んでいた頃の名残で、
+   *   2048 トピック × 512 件 × 16KB ≒ 17GB まで書き込ませられた (H7)。
+   */
+  MAX_ENTRIES_PER_TOPIC: 4,
   /** 保持するトピック総数 */
-  MAX_TOPICS: 2048,
+  MAX_TOPICS: 4096,
+  /** 保管の総量の上限 (bytes) */
+  MAX_TOTAL_BYTES: 64 * 1024 * 1024,
+  /** 1 ピアから 1 時間に受け入れる量の上限 (bytes) */
+  MAX_BYTES_PER_PEER_PER_HOUR: 8 * 1024 * 1024,
+  /** この期間更新の無いトピックは消す (ms) */
+  RETENTION_MS: 30 * 24 * 60 * 60 * 1000,
 } as const;
 
 export type EntryRejectReason = RejectReason | 'too-large' | 'not-json' | 'not-a-packet' | 'bad-hint-pow';

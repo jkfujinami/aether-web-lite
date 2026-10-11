@@ -76,7 +76,16 @@ const NODE_ID_SALT = new Uint8Array([
 
 const PEER_ID_DOMAIN = new TextEncoder().encode('AETHER/v3/peerid');
 const POSITION_DOMAIN = new TextEncoder().encode('AETHER/v3/position');
-const JOIN_DOMAIN = new TextEncoder().encode('AETHER/v3/join');
+/**
+ * v4: 署名対象を「この接続」に束縛した。v3 の署名 (challenge のみ) は受理しない。
+ * ドメインを変えておくことで、旧クライアントとのハンドシェイクは確実に失敗する (fail-closed)。
+ */
+const JOIN_DOMAIN = new TextEncoder().encode('AETHER/v4/join');
+/**
+ * トラッカーへの登録の署名ドメイン。P2P の JOIN とは分ける
+ * (どちらかの署名を、もう一方の検証に流用されないように)。
+ */
+const TRACKER_JOIN_DOMAIN = new TextEncoder().encode('AETHER/v1/tracker-join');
 
 /** peerId のバイト長 (hex 表記では 32 文字) */
 export const PEER_ID_BYTES = 16;
@@ -119,8 +128,75 @@ export interface NodeClaim {
 export interface SignedNodeClaim extends NodeClaim {
   /** 相手から受け取った challenge をそのまま echo する */
   challenge: Uint8Array;
-  /** Ed25519(JOIN_DOMAIN ‖ challenge) */
+  /** Ed25519(joinMessage(...))。{@link JoinBinding} を参照 */
   signature: Uint8Array;
+}
+
+/**
+ * JOIN 署名を束縛する「この接続」の文脈。
+ *
+ * ★ 旧実装 (v3) は Ed25519(JOIN_DOMAIN ‖ challenge) しか署名していなかった。
+ *   challenge はどの接続から来たものかを何も表さないので、攻撃者 M は
+ *     1. T から受け取った challenge を、自分が正規ノード V へ送る HELLO に流用し
+ *     2. V が返した署名付き JOIN をそのまま T へ転送する
+ *   だけで、T に「M の端点 = V」と信じ込ませられた (中継型 MITM / identity misbinding)。
+ *   NodeId PoW を一切払わずに任意の正規 ID の座標を占有でき、Bound Identity が無効化された。
+ *
+ *   v4 では、署名対象に
+ *     - 検証者 (challenge を出した側) の peerId
+ *     - 署名者自身の peerId
+ *     - 両側の DTLS 証明書フィンガープリント (SDP の a=fingerprint)
+ *   を含める。DTLS の秘密鍵はブラウザから持ち出せないので、別の接続で得た署名を
+ *   この接続に流用することができない (M が DTLS を終端すると指紋が食い違う)。
+ *
+ * 署名側と検証側は同じ値を「自分の視点」から組み立てる:
+ *   - signerFingerprint   : 署名者の DTLS 指紋 (署名側から見て local、検証側から見て remote)
+ *   - verifierFingerprint : 検証者の DTLS 指紋 (署名側から見て remote、検証側から見て local)
+ */
+export interface JoinBinding {
+  /** challenge を出した側 (検証者) の peerId */
+  verifierId: string;
+  /** 署名者の DTLS 指紋 */
+  signerFingerprint: string;
+  /** 検証者の DTLS 指紋 */
+  verifierFingerprint: string;
+}
+
+function lengthPrefixed(text: string): Uint8Array {
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.length > 0xffff) throw new RangeError('JoinBinding field too long');
+  const out = new Uint8Array(2 + bytes.length);
+  new DataView(out.buffer).setUint16(0, bytes.length, false);
+  out.set(bytes, 2);
+  return out;
+}
+
+/** JOIN 署名の正準メッセージ。フィールド境界は長さ前置きで固定する */
+export function joinMessage(challenge: Uint8Array, signerId: string, binding: JoinBinding): Uint8Array {
+  return concat([
+    JOIN_DOMAIN,
+    challenge,
+    lengthPrefixed(binding.verifierId),
+    lengthPrefixed(signerId),
+    lengthPrefixed(binding.signerFingerprint),
+    lengthPrefixed(binding.verifierFingerprint),
+  ]);
+}
+
+/**
+ * トラッカー登録の正準メッセージ。
+ *
+ *   domain ‖ nonce (32 バイト, トラッカーが接続ごとに出す) ‖ lp(peerId) ‖ lp(trackerHost)
+ *
+ * trackerHost は「署名者が接続したつもりのトラッカー」のホスト名 (小文字、既定以外のポートを含む)。
+ * これを含めないと、悪意あるトラッカー A が別のトラッカー B の nonce を中継して署名を得て、
+ * 利用者になりすまして B に登録できてしまう。
+ */
+export function trackerJoinMessage(nonce: Uint8Array, peerId: string, trackerHost: string): Uint8Array {
+  if (nonce.length !== CHALLENGE_BYTES) {
+    throw new RangeError(`trackerJoinMessage: nonce must be ${CHALLENGE_BYTES} bytes`);
+  }
+  return concat([TRACKER_JOIN_DOMAIN, nonce, lengthPrefixed(peerId), lengthPrefixed(trackerHost.toLowerCase())]);
 }
 
 export class NodeIdentity {
@@ -209,27 +285,37 @@ export class NodeIdentity {
   static verifySignedClaim(
     claim: SignedNodeClaim,
     expectedChallenge: Uint8Array,
+    binding: JoinBinding,
     params: NodeIdPowParams = NODE_ID_POW,
   ): boolean {
-    if (!NodeIdentity.verifyClaim(claim, params)) return false;
-
-    const challenge = claim.challenge instanceof Uint8Array ? claim.challenge : null;
-    const signature = claim.signature instanceof Uint8Array ? claim.signature : null;
+    const challenge = claim?.challenge instanceof Uint8Array ? claim.challenge : null;
+    const signature = claim?.signature instanceof Uint8Array ? claim.signature : null;
     if (!challenge || !signature) return false;
+    if (expectedChallenge.length !== CHALLENGE_BYTES) return false;
     if (challenge.length !== expectedChallenge.length) return false;
+    if (signature.length !== sodium.crypto_sign_BYTES) return false;
 
     // タイミング差で challenge を推測されないよう定数時間比較を使う
     if (!sodium.memcmp(challenge, expectedChallenge)) return false;
 
+    // 安価な署名検査を先に通し、重い NodeId PoW (Argon2id) は最後に回す
+    if (typeof claim.peerId !== 'string') return false;
+    if (!(claim.pubkey instanceof Uint8Array) || claim.pubkey.length !== sodium.crypto_sign_PUBLICKEYBYTES) {
+      return false;
+    }
+    let signatureOk = false;
     try {
-      return sodium.crypto_sign_verify_detached(
+      signatureOk = sodium.crypto_sign_verify_detached(
         signature,
-        concat([JOIN_DOMAIN, challenge]),
+        joinMessage(challenge, claim.peerId, binding),
         claim.pubkey,
       );
     } catch {
       return false;
     }
+    if (!signatureOk) return false;
+
+    return NodeIdentity.verifyClaim(claim, params);
   }
 
   /** 検証する側が送るチャレンジを生成する */
@@ -278,13 +364,58 @@ export class NodeIdentity {
     return { peerId: this.peerId, pubkey: this.pubkey, powCounter: this.powCounter };
   }
 
-  /** 相手のチャレンジに署名した主張 (P2P の JOIN) */
-  signClaim(challenge: Uint8Array): SignedNodeClaim {
+  /**
+   * 相手のチャレンジに署名した主張 (P2P の JOIN)。
+   *
+   * challenge は固定長しか受け付けない。任意長のバイト列に署名して返すと、
+   * 署名オラクルとして悪用される余地が広がる。
+   */
+  signClaim(challenge: Uint8Array, binding: JoinBinding): SignedNodeClaim {
+    if (challenge.length !== CHALLENGE_BYTES) {
+      throw new RangeError(`signClaim: challenge must be ${CHALLENGE_BYTES} bytes`);
+    }
     return {
       ...this.claim(),
       challenge,
-      signature: sodium.crypto_sign_detached(concat([JOIN_DOMAIN, challenge]), this.privkey),
+      signature: sodium.crypto_sign_detached(joinMessage(challenge, this.peerId, binding), this.privkey),
     };
+  }
+
+  /**
+   * トラッカーへの登録の所有証明。トラッカーが接続ごとに出す nonce と、
+   * 接続先のホスト名に署名する ({@link trackerJoinMessage})。
+   */
+  signTrackerJoin(nonce: Uint8Array, trackerHost: string): Uint8Array {
+    return sodium.crypto_sign_detached(trackerJoinMessage(nonce, this.peerId, trackerHost), this.privkey);
+  }
+
+  /**
+   * トラッカー側の検証。Bound Identity (peerId = hash(pubkey) + NodeId PoW) に加えて、
+   * その公開鍵の秘密鍵で、この接続の nonce とこのトラッカーのホスト名に署名していること。
+   *
+   * ★ peerId・pubkey・powCounter は公開情報 (P2P の JOIN で全隣人に渡る) なので、
+   *   それだけを確かめても他人の ID での登録を防げない。署名が必須。
+   */
+  static verifyTrackerJoin(
+    claim: NodeClaim,
+    nonce: Uint8Array,
+    trackerHost: string,
+    signature: Uint8Array,
+    params: NodeIdPowParams = NODE_ID_POW,
+  ): boolean {
+    if (!(nonce instanceof Uint8Array) || nonce.length !== CHALLENGE_BYTES) return false;
+    if (!(signature instanceof Uint8Array) || signature.length !== sodium.crypto_sign_BYTES) return false;
+    if (typeof trackerHost !== 'string' || trackerHost.length === 0 || trackerHost.length > 255) return false;
+    if (!NodeIdentity.verifyClaim(claim, params)) return false;
+    try {
+      return sodium.crypto_sign_verify_detached(
+        signature,
+        trackerJoinMessage(nonce, claim.peerId, trackerHost),
+        claim.pubkey,
+      );
+    } catch {
+      return false;
+    }
   }
 
   /** 永続化用。秘密鍵を含むので取り扱い注意 */

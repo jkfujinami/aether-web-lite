@@ -4,10 +4,13 @@
  * Next.js の HTTP サーバーに WebSocket シグナリングサーバー（TrackerServer）を同居させる。
  * これにより 1 つのポート（3000）で HTTP + WS 両方を提供する。
  */
+// Next.js の利用統計の送信を止める (利用者のサーバの存在を外部に知らせない)
+process.env.NEXT_TELEMETRY_DISABLED ??= '1';
+
 import { createServer } from 'http';
 import { parse } from 'url';
 import next from 'next';
-import { TrackerServer } from './src/server/TrackerServer';
+import { TrackerServer } from '@aether/tracker';
 
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = '0.0.0.0';

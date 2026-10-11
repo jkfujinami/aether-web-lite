@@ -155,3 +155,13 @@ vite.config.ts.timestamp-*
 # 外部の秘密管理から注入する場合は AETHER_NODE_SEED 環境変数を使う。
 node_identity.key
 aether-cache/node_identity.key
+
+# Bundled maintainer CLI (packages/core)
+dist-cli/
+
+# Electron のビルド出力
+apps/desktop/dist-electron/
+
+# Playwright
+web/test-results/
+web/playwright-report/

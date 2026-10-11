@@ -43,7 +43,10 @@ export {
 export {
   NodeIdentity,
   type NodeClaim,
+  type NodeIdPowParams,
   NODE_ID_POW,
+  NODE_ID_POW_FAST,
+  trackerJoinMessage,
 } from './crypto/NodeIdentity';
 export { NodeIdentityStore } from './crypto/NodeIdentityStore';
 export { PacketBuilder } from './crypto/PacketBuilder';
@@ -57,17 +60,26 @@ export { ChunkedReceiver } from './network/stream/ChunkedReceiver';
 // ── Network & Routing ──
 export { PeerManager } from './network/PeerManager';
 export { WebRTCPeer } from './network/WebRTCPeer';
-export { SignalingClient } from './network/SignalingClient';
+export { SignalingClient, TrackerNotConfiguredError, TrackerJoinError } from './network/SignalingClient';
+export * from './network/TrackerProtocol';
+export {
+  parseTrackerUrl,
+  describeTrackerUrlError,
+  TRACKER_URL_MAX_LENGTH,
+  type TrackerUrlError,
+  type TrackerUrlResult,
+} from './network/TrackerUrl';
 export { MessageDispatcher } from './network/MessageDispatcher';
 export { ZoneManager } from './network/ZoneManager';
 export { ZoneGossipRouter } from './network/gossip/ZoneGossipRouter';
 export { DandelionRouter, DANDELION_CONFIG } from './network/gossip/DandelionRouter';
-export { OnionRouter, type OnionHop, type OnionPayload } from './crypto/OnionRouter';
+export { OnionRouter, type OnionHop, type OnionPayload, type ExitPayload } from './crypto/OnionRouter';
+export { OnionCircuit, CIRCUIT_CONFIG, type OnionCircuitOptions } from './network/onion/OnionCircuit';
 export { SeenCache } from './network/gossip/SeenCache';
 export { PEXHandler } from './network/PEXHandler';
 export { Heartbeat } from './network/Heartbeat';
 export { RingMaintainer } from './network/RingMaintainer';
-export { RateLimiter } from './network/RateLimiter';
+export { RateLimiter, type RateLimitConfig } from './network/RateLimiter';
 export { PeerMisbehaviorManager, ViolationType } from './network/PeerMisbehaviorManager';
 export { PacketValidator } from './network/gossip/PacketValidator';
 
@@ -106,5 +118,23 @@ export { BOARD_META_THREAD_ID } from './logic/types';
 export { SyncProtocol } from './network/mailbox/SyncProtocol';
 
 // ── Storage ──
-export { SecretVault, type SealedSecret } from './storage/SecretVault';
-export { IndexedDBStore, type MailboxEntry, type PostEntry } from './storage/IndexedDBStore';
+export { SecretVault, VAULT_PARAMS, VAULT_PARAMS_FAST, type SealedSecret, type VaultParams } from './storage/SecretVault';
+export { IndexedDBStore, type MailboxEntry, type PostEntry, type BoardRecord } from './storage/IndexedDBStore';
+export { DataVault, WrongPassphraseError } from './storage/DataVault';
+
+// Trusted guards
+export {
+  createGuardString,
+  parseGuardString,
+  signGuardList,
+  verifyGuardList,
+  maintainerKeyId,
+  keyFingerprint,
+  GUARD_STRING_PREFIX,
+  GUARD_LIST_PREFIX,
+  TRUSTED_GUARD_LIMITS,
+  type MaintainerKeySet,
+  type TrustedGuard,
+  type GuardListContent,
+  type GuardListResult,
+} from './trust/TrustedGuards';

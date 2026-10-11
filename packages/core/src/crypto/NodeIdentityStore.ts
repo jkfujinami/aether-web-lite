@@ -1,3 +1,4 @@
+import { WrongPassphraseError } from '../storage/DataVault';
 import sodium from './sodium';
 import { NodeIdentity, NODE_ID_POW, type NodeIdPowParams } from './NodeIdentity';
 import { SecretVault, VAULT_PARAMS, type VaultParams } from '../storage/SecretVault';
@@ -19,16 +20,49 @@ const NODE_SLOT = 'node';
  */
 export class NodeIdentityStore {
   /**
+   * 使い捨ての identity を採掘する (保存しない)。既定はこちら。
+   *
+   * ★ peerId を端末に永続化すると、トラッカーと全隣人がそれを見るので、
+   *   IP や VPN を変えても全セッションが同一端末として紐付く (H4)。
+   *   起動のたびに採掘し直す (既定パラメータで数秒) 代わりに、
+   *   セッションを跨いだ追跡の手掛かりを消す。
+   *
+   *   以前の版が保存した**パスフレーズで保護されていない**ノード鍵が
+   *   端末に残っていれば消す (押収時に読める状態で残さない)。
+   */
+  static async mineEphemeral(
+    store: SealedStore,
+    params: NodeIdPowParams = NODE_ID_POW,
+  ): Promise<NodeIdentity> {
+    await sodium.ready;
+    const record = await store.getSealed(NODE_SLOT).catch(() => undefined);
+    if (record && record.sealed?.protected !== true) {
+      await store.deleteSealed(NODE_SLOT).catch(() => undefined);
+      log.warn(`Removed an unprotected persisted node identity from this device.`);
+    }
+    return NodeIdentity.mine(params);
+  }
+
+  /**
    * 保存済みの identity を復元する。無ければ採掘して保存する。
    *
-   * @param passphrase 封印のパスフレーズ。未設定なら空文字。
+   * ★ パスフレーズ必須。空のパスフレーズでの封印は秘匿性ゼロ (誰でも開ける) なので、
+   *   「保護されているつもりで保護されていない」鍵を端末に置かせない。
+   *
+   * @param passphrase 封印のパスフレーズ (空文字は不可)
+   */
+  /**
+   * @throws WrongPassphraseError 保存済みの identity がこのパスワードで開けないとき (何も書き換えない)
    */
   static async loadOrMine(
     store: SealedStore,
-    passphrase: string = '',
+    passphrase: string,
     params: NodeIdPowParams = NODE_ID_POW,
     vaultParams: VaultParams = VAULT_PARAMS,
   ): Promise<NodeIdentity> {
+    if (typeof passphrase !== 'string' || passphrase.length === 0) {
+      throw new RangeError('NodeIdentityStore.loadOrMine: a non-empty passphrase is required to persist the node identity');
+    }
     await sodium.ready;
 
     const restored = await NodeIdentityStore.tryLoad(store, passphrase, params);
@@ -54,13 +88,17 @@ export class NodeIdentityStore {
     passphrase: string,
     params: NodeIdPowParams,
   ): Promise<NodeIdentity | null> {
-    const record = await store.getSealed(NODE_SLOT).catch(() => undefined);
+    // 読み出しの失敗は伝える。「無かった」と扱うと、一時的な失敗で採掘し直した
+    // identity が保存済みのものを上書きしてしまう。
+    const record = await store.getSealed(NODE_SLOT);
     if (!record) return null;
 
     const secret = SecretVault.open(record.sealed, passphrase);
     if (!secret) {
-      log.warn(`Could not unseal node identity.`);
-      return null;
+      // ★ 旧実装はここで null を返し、呼び出し側が新しい identity を採掘して
+      //   同じ場所へ (間違ったパスワードで封印して) 上書きしていた。
+      //   打ち間違い 1 回で元の鍵が永久に失われた。開けないなら何も書き換えない。
+      throw new WrongPassphraseError();
     }
 
     const skBytes = sodium.crypto_sign_SECRETKEYBYTES;

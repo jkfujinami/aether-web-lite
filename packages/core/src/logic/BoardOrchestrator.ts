@@ -7,9 +7,10 @@ import type { IPeerManager, IZoneManager, IPoWEngine, IKeyManager } from '../typ
 import type { ThreadMeta } from './types';
 import { PacketBuilder } from '../crypto/PacketBuilder';
 import { KeyManager } from '../crypto/KeyManager';
-import { DifficultyEstimator } from '../crypto/DifficultyEstimator';
+import { POW_POLICY } from '../crypto/PowPolicy';
 import { BOARD_META_THREAD_ID, BoardStatus } from './types';
 import { createLogger } from '../common/Logger';
+import { CryptoUtils } from '../common/CryptoUtils';
 import type { SchrodingerMailbox } from '../network/hint/SchrodingerMailbox';
 import type { OpenedHint } from '../network/hint/HintRouter';
 
@@ -39,6 +40,8 @@ export class BoardOrchestrator {
 
   private currentBoardId: string | null = null;
   private currentBoardKey: Uint8Array | null = null;
+  /** 開いている板・スレッドのゾーンの購読を外す */
+  private unwatchZone: (() => void) | null = null;
   private isListening: boolean = false;
   /** 実行中の fullSync。多重起動を防ぐ */
   private syncInFlight: Promise<void> | null = null;
@@ -414,11 +417,16 @@ export class BoardOrchestrator {
    * 板の同期を活性化する
    */
   public async activate(boardId: string, boardKey: Uint8Array) {
-    // 1. 板が切り替わった場合はリセット
-    if (this.currentBoardId !== boardId) {
+    // 1. 板が切り替わった場合はリセット (同じ板 ID でも鍵が違えば別の板として扱う)
+    const sameKey = this.currentBoardKey !== null &&
+      this.currentBoardKey.length === boardKey.length &&
+      this.currentBoardKey.every((b, i) => b === boardKey[i]);
+    if (this.currentBoardId !== boardId || !sameKey) {
       this.clear();
       this.currentBoardId = boardId;
       this.currentBoardKey = boardKey;
+      // 開いている板のゾーンを購読に加える (ローカルな判断。網には出ない)
+      this.unwatchZone = this.zm.watchTopic?.(KeyManager.deriveTopicHash(boardKey)) ?? null;
     }
 
     // 2. リスナーの登録（一度だけ）
@@ -467,20 +475,22 @@ export class BoardOrchestrator {
     this.updateStatus('submitting', 'スレッドを構築中...', true, 30);
 
     try {
-      const threadId = Math.random().toString(36).substring(2, 12);
+      // スレッド ID は網に出るので暗号論的乱数で作る (Math.random は状態を復元され得る)
+      const threadId = CryptoUtils.generateId(10);
       const threadKey = KeyManager.deriveThreadKey(boardKey, threadId);
       
-      // 🌟 板のメタデータ（スレッド作成通知）なので、スレッドのゾーンではなく「板のゾーン」にブロードキャストする
-      const boardTopicHash = KeyManager.cryptoHash(boardKey);
-      const boardZoneId = KeyManager.computeZoneId(boardTopicHash, this.zm.depth);
+      // 板のメタデータ (スレッド作成通知) なので、板の鍵のゾーンへ流す。
+      // zone_id は PacketBuilder が鍵と depth から計算する。
+      // ★ 旧実装はここで計算した zone_id を depth の引数に渡しており、depth > 0 で
+      //   存在しないゾーン番号 (例: depth 4 で 31860) が載っていた。
 
-      const timestamps = await this.db.getRecentTimestamps(DifficultyEstimator.WINDOW);
-      const powDifficulty = DifficultyEstimator.compute(timestamps);
+      // 網共通の固定値。端末の閲覧状況から計算した値をヘッダに載せない (PowPolicy 参照)
+      const powDifficulty = POW_POLICY.NETWORK_DIFFICULTY;
 
       const packet = await PacketBuilder.build(
         title, boardKey, this.identity, this.cryptoEng,
         this.powEng, this.keyMgr, boardId, threadId,
-        0, null, powDifficulty, boardZoneId, 1,
+        0, null, powDifficulty, this.zm.depth, 1,
         [], threadId, powDifficulty
       );
 
@@ -500,7 +510,8 @@ export class BoardOrchestrator {
       //   画面に出ないまま固まって見えた。
       //   ThreadOrchestrator.submitReply は元から非同期送信だったので、
       //   スレ立てだけが取り残されていた。
-      const savedAt = Date.now();
+      // 表示上の作成時刻は、網に出したパケットと同じ (分単位に丸めた) 値にそろえる
+      const savedAt = packet.timestamp;
       this.mergeThread(
         { thread_id: threadId, board_id: boardId, content: title, post_type: 1, created_at: savedAt },
         packet.packet_id,
@@ -523,14 +534,7 @@ export class BoardOrchestrator {
       }).catch(() => {});
 
       // ── ここから先はネットワークへの送出。UI を待たせない。 ──
-      this.router.broadcast(packet).catch((err: any) => {
-        log.error('[BoardOrchestrator] Gossip broadcast failed:', err);
-      });
-      // ★ 本体はランダムな Slot へ、その在り処は Hint で配る。
-      //   Hint は Stem を通るので発信元が隣人に割れない。
-      this.schrodinger.publish(boardKey, rawPacketData, savedAt).catch((e: any) => {
-        log.warn('Schrodinger publish failed:', e);
-      });
+      this.sendAnonymously(packet, boardKey, randomMessageId(), rawPacketData.length);
 
       this.updateStatus('idle', '', false, 0);
       return threadId;
@@ -541,6 +545,28 @@ export class BoardOrchestrator {
     }
   }
 
+
+  /**
+   * 投稿をオニオン回路で送り出す。
+   *
+   * ★ 本体・Slot・索引のすべてがオニオンセルに載る (C3)。
+   *   Slot は Gossip と同じセルに同梱し、出口が作者の代わりに保管する。
+   *   索引 (Hint) は本体が網に現れた後で、時間をずらして別のセルで放流する。
+   *   回路で届かなかった場合は平文に落とさず、その旨を表示する (Fail-Closed)。
+   */
+  private sendAnonymously(packet: any, key: Uint8Array, messageId: number, bodyBytes: number): void {
+    const slot = this.schrodinger.prepareSlot(key, messageId);
+    void (async () => {
+      const delivered = await this.router.broadcast(packet, { slot: slot.exitSlot });
+      if (!delivered) {
+        this.updateStatus('error', '匿名経路で送信できませんでした (平文での送信は行っていません)。隣人が増えてから再度お試しください。');
+        return;
+      }
+      await this.schrodinger.releaseHint(slot.hint, bodyBytes);
+    })().catch((err: any) => {
+      log.error('[BoardOrchestrator] anonymous send failed:', err);
+    });
+  }
 
   /**
    * メモリ状態をリセットする（板の切り替え時など）
@@ -566,6 +592,8 @@ export class BoardOrchestrator {
       this.isListening = false;
     }
 
+    this.unwatchZone?.();
+    this.unwatchZone = null;
     this.currentBoardId = null;
     this.currentBoardKey = null;
     this.threads.clear();
@@ -579,4 +607,13 @@ export class BoardOrchestrator {
 /** ログ用の短縮表示。undefined でも落ちないようにしておく */
 function short(id: string | undefined | null): string {
   return id ? id.substring(0, 8) : '?';
+}
+
+/**
+ * Hint の message_id。鍵を持つ全員に見えるので、時刻ではなく乱数にする (A5)。
+ * 2^48 未満の安全な整数。
+ */
+export function randomMessageId(): number {
+  const b = crypto.getRandomValues(new Uint8Array(6));
+  return b.reduce((acc, x) => acc * 256 + x, 0);
 }

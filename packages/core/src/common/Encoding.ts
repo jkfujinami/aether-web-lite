@@ -21,7 +21,11 @@ export class Encoding {
    * Uint8ArrayをBase64URLに変換
    */
   static toBase64(bytes: Uint8Array): string {
-    const binary = String.fromCharCode(...bytes);
+    // 引数展開は大きな入力 (約 130KB 超) でスタックを使い切るので、区切って変換する
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    }
     return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
   }
 

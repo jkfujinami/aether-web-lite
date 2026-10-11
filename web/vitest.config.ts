@@ -5,6 +5,11 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
+      // テストは常に共有パッケージのソースに対して走らせる (古い dist で通ってしまうのを防ぐ)
+      '@aether/core': path.resolve(__dirname, '../packages/core/src/index.ts'),
+      '@aether/ui/styles.css': path.resolve(__dirname, '../packages/ui/src/styles.css'),
+      '@aether/ui': path.resolve(__dirname, '../packages/ui/src/index.ts'),
+      '@aether/tracker': path.resolve(__dirname, '../packages/tracker/src/index.ts'),
     },
   },
   test: {
@@ -16,8 +21,7 @@ export default defineConfig({
     hookTimeout: 30_000,
     coverage: {
       provider: 'v8',
-      include: ['src/lib/**/*.ts', 'src/server/**/*.ts'],
-      exclude: ['src/lib/worker/pow.worker.ts'],
+      include: ['src/**/*.ts', 'src/**/*.tsx', 'server.ts'],
     },
   },
 });

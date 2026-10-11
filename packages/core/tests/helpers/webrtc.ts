@@ -65,13 +65,21 @@ class FakeRTCPeerConnection {
     return ch;
   }
 
+  /** 接続ごとに異なる疑似 DTLS 指紋 (実ブラウザと同じく SDP の a=fingerprint に載せる) */
+  get fingerprint(): string {
+    const hex = Array.from(this.id.padEnd(32, '#'))
+      .map(c => c.charCodeAt(0).toString(16).padStart(2, '0').toUpperCase())
+      .slice(0, 32);
+    return `sha-256 ${hex.join(':')}`;
+  }
+
   async createOffer(): Promise<{ type: 'offer'; sdp: string }> {
-    const sdp = `v=0\r\no=- ${this.id} 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n`;
+    const sdp = `v=0\r\no=- ${this.id} 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=fingerprint:${this.fingerprint}\r\n`;
     return { type: 'offer', sdp };
   }
 
   async createAnswer(): Promise<{ type: 'answer'; sdp: string }> {
-    const sdp = `v=0\r\no=- ${this.id} 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n`;
+    const sdp = `v=0\r\no=- ${this.id} 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=fingerprint:${this.fingerprint}\r\n`;
     return { type: 'answer', sdp };
   }
 

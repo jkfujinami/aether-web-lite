@@ -4,6 +4,7 @@ import 'fake-indexeddb/auto';
 
 import { AetherNode } from '../src/node/AetherNode';
 import { IndexedDBStore } from '../src/storage/IndexedDBStore';
+import { VAULT_PARAMS_FAST } from '../src/storage/SecretVault';
 import { KeyManager } from '../src/crypto/KeyManager';
 import { installFakeWebRTC, resetFakeWebRTC } from './helpers/webrtc';
 import { SignalingHub, HubSignalingClient } from './helpers/fakes';
@@ -21,68 +22,62 @@ describe('AetherNode Multi-Node End-to-End P2P Integration', () => {
     hub = new SignalingHub();
   });
 
-  it('2つの完全な AetherNode (Alice & Bob) 間でスレッド作成とP2P同期が完結する', async () => {
-    // 1. 各ノード専用の隔離された IndexedDB
-    const dbAlice = new IndexedDBStore('AliceDB_' + Date.now());
-    await dbAlice.init();
-    const dbBob = new IndexedDBStore('BobDB_' + Date.now());
-    await dbBob.init();
-
-    // 2. 仮想シグナリングハブクライアントの準備
-    let sigAlice: HubSignalingClient;
-    let sigBob: HubSignalingClient;
-
-    const nodeAlice = await AetherNode.create({
-      db: dbAlice,
-      releaseMode: 'instant',
+  /** ハブ経由のシグナリングを差し込んだノードを作る */
+  async function makeNode(name: string): Promise<AetherNode> {
+    const db = new IndexedDBStore(`${name}DB_` + Date.now());
+    await db.init();
+    const node = await AetherNode.create({
+      db,
+      releaseMode: 'disabled',
       autoStart: false,
+      passphrase: `${name}-passphrase`,
+      vaultParams: VAULT_PARAMS_FAST,
+      // テスト用に cover traffic と混合遅延を縮める (既定は数秒単位)
+      circuit: { coverIntervalMs: 20, relayDelayMs: 1, exitDelayMs: 5, echoTimeoutMs: 3000 },
     });
-    sigAlice = new HubSignalingClient(hub, nodeAlice.peerId);
-    (nodeAlice.peerManager as any).signaling = sigAlice;
-    sigAlice.on('relay', (sender: string, payload: any) => (nodeAlice.peerManager as any).handleRelay(sender, payload));
+    const sig = new HubSignalingClient(hub, node.peerId);
+    (node.peerManager as any).signaling = sig;
+    sig.on('relay', (sender: string, payload: any) => (node.peerManager as any).handleRelay(sender, payload));
+    return node;
+  }
 
-    const nodeBob = await AetherNode.create({
-      db: dbBob,
-      releaseMode: 'instant',
-      autoStart: false,
-    });
-    sigBob = new HubSignalingClient(hub, nodeBob.peerId);
-    (nodeBob.peerManager as any).signaling = sigBob;
-    sigBob.on('relay', (sender: string, payload: any) => (nodeBob.peerManager as any).handleRelay(sender, payload));
+  it('3 ノード (Alice - Bob - Carol) で、スレッドがオニオン回路経由で配送される', async () => {
+    const alice = await makeNode('Alice');
+    const bob = await makeNode('Bob');
+    const carol = await makeNode('Carol');
+    expect(new Set([alice.peerId, bob.peerId, carol.peerId]).size).toBe(3);
 
-    // PeerId が異なることを確認
-    expect(nodeAlice.peerId).not.toBe(nodeBob.peerId);
+    // Alice の隣人は Bob だけ。Bob の背後の Carol が出口になる
+    alice.peerManager.connect(bob.peerId, true);
+    bob.peerManager.connect(carol.peerId, true);
+    await new Promise((r) => setTimeout(r, 300));
 
-    // 3. Alice から Bob へ P2P 接続要求
-    nodeAlice.peerManager.connect(nodeBob.peerId, true);
+    // DTLS 指紋に束縛された JOIN (v4) で相互に本人確認が済んでいること
+    expect(alice.peerManager.peers.get(bob.peerId)?.isVerified).toBe(true);
+    expect(bob.peerManager.peers.get(alice.peerId)?.isVerified).toBe(true);
+    expect(bob.peerManager.peers.get(carol.peerId)?.isVerified).toBe(true);
 
-    // ハンドシェイク完了を待機
-    await new Promise((r) => setTimeout(r, 200));
+    for (const n of [alice, bob, carol]) await n.start();
+    // Guard の隣人表 (PEX) が届くまで待つ
+    await new Promise((r) => setTimeout(r, 300));
 
-    expect(nodeAlice.peerManager.peers.get(nodeBob.peerId)?.isConnected).toBe(true);
-    expect(nodeBob.peerManager.peers.get(nodeAlice.peerId)?.isConnected).toBe(true);
-
-    // 4. 板キーを共有して購読
     const boardId = 'vip';
     const boardKey = KeyManager.cryptoHash(new TextEncoder().encode('AETHER_LITE_VIP_DEFAULT_SEED')).slice(0, 32);
+    for (const n of [alice, bob, carol]) n.boardOrchestrator.activate(boardId, boardKey);
 
-    nodeAlice.boardOrchestrator.activate(boardId, boardKey);
-    nodeBob.boardOrchestrator.activate(boardId, boardKey);
-
-    // 5. Alice がスレッドを投稿
     const threadTitle = 'AETHER P2P 統合テストスレッド (Alice発信)';
-    const threadId = await nodeAlice.boardOrchestrator.submitThread(boardId, boardKey, threadTitle);
+    const threadId = await alice.boardOrchestrator.submitThread(boardId, boardKey, threadTitle);
     expect(threadId).toBeTruthy();
 
-    // 6. ゴシップ伝搬を待機
-    await new Promise((r) => setTimeout(r, 400));
+    // cover の空き待ち + 混合遅延 + 伝播を待つ
+    const deadline = Date.now() + 5000;
+    const seen = (n: AetherNode) => n.boardOrchestrator.getThreads().some((t) => t.content === threadTitle);
+    while (Date.now() < deadline && !(seen(bob) && seen(carol))) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(seen(bob)).toBe(true);
+    expect(seen(carol)).toBe(true);
 
-    // 7. Bob 側でスレッドが受信・検証され、BoardOrchestrator に反映されていることを確認
-    const bobThreads = nodeBob.boardOrchestrator.getThreads();
-    expect(bobThreads.some((t) => t.content === threadTitle)).toBe(true);
-
-    // 8. 正常シャットダウン
-    await nodeAlice.stop();
-    await nodeBob.stop();
-  });
+    for (const n of [alice, bob, carol]) await n.stop();
+  }, 30_000);
 });

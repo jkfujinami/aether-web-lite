@@ -8,6 +8,7 @@ import type {
 } from '../types';
 import { WebRTCPeer } from './WebRTCPeer';
 import { RingPosition } from './RingPosition';
+import { groupCap } from './NetGroup';
 import { RING_MESH } from '../constants';
 import { WireCodec } from './wire/WireCodec';
 import { WireType } from './wire/WireTypes';
@@ -16,10 +17,12 @@ import { PeerMisbehaviorManager, ViolationType } from './PeerMisbehaviorManager'
 import {
   NodeIdentity,
   NODE_ID_POW,
+  CHALLENGE_BYTES,
   type NodeIdPowParams,
   type SignedNodeClaim,
 } from '../crypto/NodeIdentity';
 import { toBytes } from '../crypto/PowPolicy';
+import { TrackerNotConfiguredError } from './SignalingClient';
 import { createLogger } from '../common/Logger';
 
 const log = createLogger('net.peer');
@@ -27,14 +30,29 @@ const log = createLogger('net.peer');
 /** peerId は Bound Identity なので hex 32 文字に固定されている */
 const PEER_ID_RE = /^[0-9a-f]{32}$/;
 
-/** WireType → レートリミッタのカテゴリ */
-const RATE_CATEGORY: Partial<Record<WireType, string>> = {
+/**
+ * WireType → レートリミッタのカテゴリ。
+ *
+ * ★ すべての WireType を必ずどこかに割り当てる (Record で網羅を型検査させる)。
+ *   旧実装は Partial で、HINT / HINT_STEM / DHT_PUT_STEM / PING / PONG / RING_INFO が
+ *   表から漏れて無制限に受け付けられていた。
+ */
+const RATE_CATEGORY: Record<Exclude<WireType, WireType.UNKNOWN>, string> = {
   [WireType.HELLO]: 'handshake',
   [WireType.JOIN]: 'handshake',
+  [WireType.RING_INFO]: 'control',
+  [WireType.PING]: 'control',
+  [WireType.PONG]: 'control',
+  [WireType.LOCAL_LINK_REQ]: 'control',
+  [WireType.LOCAL_LINK_ACK]: 'control',
+  [WireType.LOCAL_LINK_REJ]: 'control',
   [WireType.GOSSIP]: 'gossip',
   [WireType.STEM]: 'gossip',
-  [WireType.ONION_STEM]: 'gossip',
+  [WireType.HINT]: 'gossip',
+  [WireType.HINT_STEM]: 'gossip',
+  [WireType.ONION_STEM]: 'onion',
   [WireType.DHT_PUT]: 'dhtPut',
+  [WireType.DHT_PUT_STEM]: 'dhtPut',
   [WireType.DHT_GET]: 'dhtGet',
   [WireType.DHT_RES]: 'dhtGet',
   [WireType.PEX_REQUEST]: 'pex',
@@ -49,6 +67,37 @@ const RATE_CATEGORY: Partial<Record<WireType, string>> = {
  */
 const PRE_HANDSHAKE_TYPES = new Set<WireType>([WireType.HELLO, WireType.JOIN]);
 
+/**
+ * WireType ごとのフレーム長の上限 (bytes)。デコードの前に確かめる。
+ *
+ * レート制限は件数しか数えないので、1 件を巨大にすると (再組み立ての上限 1MB)
+ * msgpack のデコード負荷を何百倍にも水増しできる。正規のメッセージが
+ * 取りうる大きさに余裕を持たせた値で切る。DHT だけは複数エントリを運ぶので大きい。
+ */
+const MAX_FRAME_BYTES: Partial<Record<WireType, number>> = {
+  [WireType.HELLO]: 256,
+  [WireType.JOIN]: 1024,
+  [WireType.PING]: 256,
+  [WireType.PONG]: 256,
+  [WireType.ONION_STEM]: 4096,
+  [WireType.GOSSIP]: 8 * 1024,
+  [WireType.STEM]: 8 * 1024,
+  [WireType.HINT]: 1024,
+  [WireType.HINT_STEM]: 1024,
+  [WireType.PEX_REQUEST]: 256,
+  [WireType.PEX_RESPONSE]: 4096,
+  [WireType.SDP_RELAY]: 16 * 1024,
+  [WireType.ICE_RELAY]: 4096,
+  [WireType.DHT_GET]: 1024,
+};
+const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
+
+/** ハンドシェイク未完了の接続の同時上限 */
+const MAX_PENDING_PEERS = 8;
+/** 未接続ピアから先行して届いたシグナルのバッファ上限 (1 送信者あたり / 送信者数) */
+const MAX_SIGNALS_PER_SENDER = 32;
+const MAX_SIGNAL_SENDERS = 32;
+
 export class PeerManager implements IPeerManager {
   private _peers: Map<PeerId, WebRTCPeer> = new Map();
   private signaling: ISignalingClient;
@@ -61,6 +110,10 @@ export class PeerManager implements IPeerManager {
   private identity: NodeIdentity;
   public readonly misbehavior: PeerMisbehaviorManager;
   private reannounceTimer: any = null;
+  private detachTimer: ReturnType<typeof setTimeout> | null = null;
+  /** stop() 済みか。停止後は新規接続も再アナウンスもしない */
+  private stopped = false;
+  private readonly allowMissingDtlsFingerprint: boolean;
 
   public readonly myPeerId: PeerId;
   public readonly myPosition: number;
@@ -75,8 +128,15 @@ export class PeerManager implements IPeerManager {
       rateLimiter?: RateLimiter;
       powParams?: NodeIdPowParams;
       misbehavior?: PeerMisbehaviorManager;
+      /**
+       * ★ テスト専用。SDP に a=fingerprint が無い環境 (偽の WebRTC 等) で
+       *   JOIN の DTLS 束縛を省略する。実運用では絶対に true にしないこと
+       *   (中継型 MITM による ID 乗っ取りが再び可能になる)。
+       */
+      allowMissingDtlsFingerprint?: boolean;
     } = {},
   ) {
+    this.allowMissingDtlsFingerprint = options.allowMissingDtlsFingerprint ?? false;
     this.identity = identity;
     this.myPeerId = identity.peerId;
     this.myPosition = identity.position;
@@ -96,10 +156,12 @@ export class PeerManager implements IPeerManager {
     // ── SDP / ICE の P2P リレー ──
     const handleRelay = (peerId: PeerId, msg: any, type: WireType) => {
       if (msg?.targetPeerId === this.myPeerId) {
+        // ★ senderId は中継経路上の誰でも名乗れる値である (認証されていない)。
+        //   ここで pexRoutes を書き換えると、既存の正規接続のシグナリング経路まで
+        //   乗っ取られる。経路は「新しく接続を作るとき」にだけ handleRelay が記録する。
         const sender = msg.senderId;
         if (typeof sender === 'string' && PEER_ID_RE.test(sender)) {
-          this.pexRoutes.set(sender, peerId);
-          this.handleRelay(sender, msg);
+          this.handleRelay(sender, msg, peerId);
         }
       } else if (typeof msg?.targetPeerId === 'string' && this._peers.has(msg.targetPeerId)) {
         this.sendMessage(msg.targetPeerId, type, msg);
@@ -119,11 +181,34 @@ export class PeerManager implements IPeerManager {
    */
   private handleHello(peerId: PeerId, msg: any) {
     const challenge = toBytes(msg?.challenge);
-    if (challenge.length === 0) {
-      log.warn(`HELLO from ${peerId.substring(0, 8)} without challenge`);
+    if (challenge.length !== CHALLENGE_BYTES) {
+      log.warn(`HELLO from ${peerId.substring(0, 8)} with malformed challenge`);
       return;
     }
-    this.sendMessage(peerId, WireType.JOIN, this.identity.signClaim(challenge));
+    const peer = this._peers.get(peerId);
+    if (!peer) return;
+
+    // 自分 (署名者) の視点: 自分の指紋 = local、検証者の指紋 = remote
+    const fp = peer.dtlsFingerprints();
+    if (!this.fingerprintsUsable(fp)) {
+      log.warn(`Refusing to sign JOIN for ${peerId.substring(0, 8)}: DTLS fingerprint unavailable`);
+      return;
+    }
+    this.sendMessage(peerId, WireType.JOIN, this.identity.signClaim(challenge, {
+      verifierId: peerId,
+      signerFingerprint: fp.local,
+      verifierFingerprint: fp.remote,
+    }));
+  }
+
+  /**
+   * 指紋が JOIN の束縛に使えるか。
+   * 実ブラウザの WebRTC では必ず存在する。欠けている場合は束縛が成立しないので、
+   * 明示的に許可されていない限りハンドシェイクを進めない (fail-closed)。
+   */
+  private fingerprintsUsable(fp: { local: string; remote: string }): boolean {
+    if (fp.local && fp.remote) return true;
+    return this.allowMissingDtlsFingerprint;
   }
 
   /**
@@ -162,27 +247,129 @@ export class PeerManager implements IPeerManager {
 
     // 名乗った peerId と、この接続の相手として認識している peerId が
     // 一致しなければならない。ここが緩いと「別人になりすました JOIN」が通る。
+    // ★ ハンドシェイク失敗では違反を記録しない (切断だけ)。
+    //
+    //   この接続の peerId は、シグナリングで「相手が名乗っただけ」の値である。
+    //   旧実装はここで名乗られた ID に 100 点 (即 BAN) を付けていたため、
+    //   攻撃者は正規ノード V を名乗って接続し、わざと JOIN に失敗するだけで
+    //   V を 1 時間 BAN させられた。隣人ごとに繰り返せば Eclipse が完成する。
     if (claim.peerId !== peerId) {
       log.warn(
         `[PeerManager] JOIN identity mismatch: connection=${peerId.substring(0, 8)} claimed=${String(claim.peerId).substring(0, 8)}`,
       );
-      this.misbehavior.recordViolation(peerId, ViolationType.MALFORMED_WIRE, 'Identity mismatch in JOIN');
       this.disconnect(peerId);
       return;
     }
 
-    if (!NodeIdentity.verifySignedClaim(claim, expected, this.powParams)) {
+    // 自分 (検証者) の視点: 署名者の指紋 = remote、自分の指紋 = local
+    const fp = peer.dtlsFingerprints();
+    if (!this.fingerprintsUsable(fp)) {
+      log.warn(`JOIN from ${peerId.substring(0, 8)} rejected: DTLS fingerprint unavailable`);
+      this.disconnect(peerId);
+      return;
+    }
+    const binding = {
+      verifierId: this.myPeerId,
+      signerFingerprint: fp.remote,
+      verifierFingerprint: fp.local,
+    };
+
+    if (!NodeIdentity.verifySignedClaim(claim, expected, binding, this.powParams)) {
       log.warn(`JOIN verification failed for ${peerId.substring(0, 8)} — dropping peer`);
-      this.misbehavior.recordViolation(peerId, ViolationType.INVALID_SIGNATURE, 'JOIN verification failed');
       this.disconnect(peerId);
       return;
     }
 
-    peer.markVerified(claim.pubkey);
+    peer.markVerified(claim.pubkey, claim.powCounter);
     log.debug(
       `[PeerManager] Peer ${peerId.substring(0, 8)} verified (bound position: ${peer.position.toFixed(6)})`,
     );
     this.emit('peer:verified', peer);
+
+    // 次数の調整は「検証が済んだ後」にだけ行う (未認証の offer で既存リンクを追い出させない)。
+    // 出所の区分 (getStats) を求めてから行う。取れなくても 'unknown' として進む。
+    void peer.resolveNetGroup().then((group) => {
+      this.noteGroup(group);
+      this.rebalance(peerId);
+    });
+  }
+
+  /**
+   * 検証済みピアが MAX_DEGREE を超えたときの調整。超えている間は 1 人ずつ外す。
+   *
+   * 外す順番 (Sybil 対策。どれも「拒否」ではなく「枠が足りないときの優先順位」):
+   *   1. outbound (自分で選んだ相手) は外さない。inbound の新顔が何人来ても、
+   *      自分で選んだ接続は押し出されない (A1)
+   *   2. ローカルリンク (リング上の最近接 LOCAL_LINKS 人) は外さない
+   *   3. 残りの inbound のうち、出所の区分が多すぎるものから (A2)
+   *   4. 同じなら、観測期間が短い (新しい) ものから (A3)
+   *   5. 同じなら、リング上で遠いものから
+   *
+   * 網が小さいうちは次数が上限に届かないので、この調整自体が起きない
+   * (初期成長を妨げない)。
+   */
+  public rebalance(newcomerId?: PeerId): void {
+    for (let guard = 0; guard < RING_MESH.MAX_DEGREE * 2; guard++) {
+      const verified = this.verifiedPeers;
+      if (verified.length <= RING_MESH.MAX_DEGREE) return;
+      const victim = this.pickEvictionVictim(verified, newcomerId);
+      if (!victim) return;
+      if (victim.peerId !== newcomerId) this.coolDowns.set(victim.peerId, Date.now());
+      log.debug(() => `rebalance: dropping ${victim.direction} ${victim.peerId.substring(0, 8)}`);
+      this.disconnect(victim.peerId);
+    }
+  }
+
+  private pickEvictionVictim(verified: WebRTCPeer[], newcomerId?: PeerId): WebRTCPeer | null {
+    const distance = (p: WebRTCPeer) => RingPosition.distance(this.myPosition, p.position);
+    const byDistance = [...verified].sort((a, b) => distance(a) - distance(b));
+    const local = new Set(byDistance.slice(0, RING_MESH.LOCAL_LINKS).map(p => p.peerId));
+
+    let pool = verified.filter(p => p.direction === 'inbound' && !local.has(p.peerId));
+    if (pool.length === 0) {
+      // 外せる inbound が無い: 枠を超えた新顔 (outbound) の方を諦める
+      const newcomer = newcomerId ? verified.find(p => p.peerId === newcomerId) : undefined;
+      if (newcomer && !local.has(newcomer.peerId)) return newcomer;
+      pool = verified.filter(p => !local.has(p.peerId) && p.peerId !== newcomerId);
+      if (pool.length === 0) return null;
+    }
+
+    const counts = new Map<string, number>();
+    for (const p of verified) {
+      const g = p.netGroup ?? 'unknown';
+      counts.set(g, (counts.get(g) ?? 0) + 1);
+    }
+    const cap = groupCap(RING_MESH.MAX_DEGREE, this.seenGroups.size);
+    const overflow = (p: WebRTCPeer) => (counts.get(p.netGroup ?? 'unknown') ?? 0) - cap;
+
+    pool.sort((a, b) =>
+      overflow(b) - overflow(a) ||
+      (b.verifiedAt ?? 0) - (a.verifiedAt ?? 0) ||
+      distance(b) - distance(a),
+    );
+    return pool[0];
+  }
+
+  /** このセッションで見えた出所の区分。区分の上限 ({@link groupCap}) の母数になる */
+  private seenGroups = new Set<string>();
+
+  private noteGroup(group: string): void {
+    if (this.seenGroups.size >= 1024 && !this.seenGroups.has(group)) return;
+    this.seenGroups.add(group);
+  }
+
+  /** outbound (自分で選んで張った) 接続の数。接続中のものも含む */
+  public get outboundCount(): number {
+    let n = 0;
+    for (const p of this._peers.values()) if (p.direction === 'outbound') n++;
+    return n;
+  }
+
+  /** ハンドシェイクが済んでいない接続 (接続中 + 接続済み未検証) の数 */
+  private get pendingCount(): number {
+    let n = 0;
+    for (const p of this._peers.values()) if (!p.isVerified) n++;
+    return n;
   }
 
   public setZoneManager(zm: IZoneManager) {
@@ -217,35 +404,87 @@ export class PeerManager implements IPeerManager {
     return this.identity;
   }
 
+  /** NodeId PoW の検証パラメータ (他モジュールが claim を検証するときに揃える) */
+  public get nodeIdPowParams(): NodeIdPowParams {
+    return this.powParams;
+  }
+
   public async start(): Promise<void> {
     log.debug(`Starting as ${this.myPeerId} (bound position: ${this.myPosition.toFixed(6)})`);
+    this.stopped = false;
 
-    // 購読ゾーンは送らない。トラッカーに申告すると、そのピアが何に興味を
-    // 持っているかをトラッカーと全ピアに晒すことになる (本家 18.6.2 の交差攻撃)。
-    await this.signaling.connect({ claim: this.identity.claim() });
-
-    setTimeout(() => {
-      log.debug(`Detaching from Tracker Server! Entering Fully Decentralized Mode.`);
-      this.signaling.disconnect();
-    }, 15_000);
-
-    // 接続数低下時または孤立防止の動的再アナウンス (Adaptive Re-announce)
+    // 接続数低下時または孤立防止の動的再アナウンス (Adaptive Re-announce)。
+    // ★ 旧実装は最初のトラッカー接続が成功した後にだけこれを仕掛けていたため、
+    //   起動時にトラッカーへ届かないと二度と再試行しなかった。先に仕掛ける。
     if (this.reannounceTimer) clearInterval(this.reannounceTimer);
     this.reannounceTimer = setInterval(() => {
+      if (this.stopped) return;
       if (this.degree < 4 && !this.signaling.isConnected) {
         log.info(`Degree dropped to ${this.degree} (< 4). Reconnecting to tracker for network repair.`);
-        this.signaling.connect({ claim: this.identity.claim() }).catch((err) => {
+        this.connectTracker().catch((err) => {
+          if (err instanceof TrackerNotConfiguredError) return;
           log.warn(`Adaptive tracker reconnect failed: ${err}`);
         });
       }
     }, 30_000);
+
+    await this.connectTracker();
   }
 
+  /**
+   * トラッカーへ接続して自身を登録し、しばらくしたら切り離す。
+   *
+   * 購読ゾーンは送らない。トラッカーに申告すると、そのピアが何に興味を
+   * 持っているかをトラッカーと全ピアに晒すことになる (本家 18.6.2 の交差攻撃)。
+   * 接続し続けないのも同じ理由で、トラッカーが見られる期間を短くするため。
+   */
+  private async connectTracker(): Promise<void> {
+    if (this.stopped) return;
+    await this.signaling.connect({ claim: this.identity.claim(), identity: this.identity });
+    if (this.stopped) {
+      this.signaling.disconnect();
+      return;
+    }
+
+    if (this.detachTimer) clearTimeout(this.detachTimer);
+    this.detachTimer = setTimeout(() => {
+      this.detachTimer = null;
+      log.debug(`Detaching from Tracker Server! Entering Fully Decentralized Mode.`);
+      this.signaling.disconnect();
+    }, 15_000);
+  }
+
+  /**
+   * トラッカーの設定を変えた直後に呼ぶ。停止中は何もしない。
+   * 失敗 (未設定・到達不能) は例外で返す。以後は再アナウンスが再試行する。
+   */
+  public async reconnectTracker(): Promise<void> {
+    if (this.stopped) return;
+    if (this.detachTimer) {
+      clearTimeout(this.detachTimer);
+      this.detachTimer = null;
+    }
+    await this.connectTracker();
+  }
+
+  /**
+   * 停止。以後トラッカーへの再アナウンスも新規接続も行わない。
+   *
+   * ★ 旧実装の AetherNode.stop() はこれを呼んでおらず、停止後も 30 秒ごとに
+   *   「次数 < 4」を検出してトラッカーへ peerId と IP を再登録し、接続を
+   *   張り直していた。利用者が「止めた」と思った後も網に参加し続けていた。
+   */
   public stop(): void {
+    this.stopped = true;
     if (this.reannounceTimer) {
       clearInterval(this.reannounceTimer);
       this.reannounceTimer = null;
     }
+    if (this.detachTimer) {
+      clearTimeout(this.detachTimer);
+      this.detachTimer = null;
+    }
+    this.pendingSignals.clear();
     this.signaling.disconnect();
     for (const peerId of Array.from(this._peers.keys())) {
       this.disconnect(peerId);
@@ -253,6 +492,7 @@ export class PeerManager implements IPeerManager {
   }
 
   private handleTrackerPeers(peers: Array<{ peerId: PeerId }>): void {
+    if (this.stopped) return;
     if (!Array.isArray(peers)) return;
     log.debug(`Received ${peers.length} peers from tracker`);
 
@@ -267,7 +507,11 @@ export class PeerManager implements IPeerManager {
     }
   }
 
-  private handleRelay(senderId: PeerId, msg: any): void {
+  /**
+   * @param viaPeerId DataChannel 越しに中継されてきた場合、その中継者
+   */
+  private handleRelay(senderId: PeerId, msg: any, viaPeerId?: PeerId): void {
+    if (this.stopped) return;
     if (this.misbehavior.isBanned(senderId)) {
       return;
     }
@@ -288,7 +532,18 @@ export class PeerManager implements IPeerManager {
     //   RTCPeerConnection に setRemoteDescription することになり、
     //   ICE は connected になるのに DataChannel が二度と open しない。
     //   offer は「張り直したい」という意思表示なので、古い接続を畳む。
+    //
+    //   ★ ただし検証済みで生きている接続は置き換えない。
+    //     senderId は中継経路上の誰でも名乗れるので、旧実装では
+    //     「正規隣人 V を名乗る offer」1 通で V との接続を切らせ、
+    //     攻撃者の端点に V の名前で繋ぎ直させることができた。
+    //     本物の V が張り直す場合、古い接続は ICE 切断 / onclose で先に畳まれる。
     if (isOffer && this._peers.has(senderId)) {
+      const existing = this._peers.get(senderId)!;
+      if (existing.isVerified && existing.isConnected) {
+        log.warn(`Ignoring re-offer for live verified peer ${senderId.substring(0, 8)}`);
+        return;
+      }
       log.debug(`Peer ${senderId.substring(0, 8)} re-offered; replacing stale connection`);
       this.disconnect(senderId);
       // disconnect のクールダウンには入れない (正当な再接続なので)
@@ -302,12 +557,10 @@ export class PeerManager implements IPeerManager {
 
       if (isNewSession) {
         log.debug(`Received Offer via relay from ${senderId.substring(0, 8)}`);
-        if (this.degree >= RING_MESH.MAX_DEGREE) {
-          const evicted = this.evictLongRangeLink();
-          if (!evicted) return;
-        }
-
-        const viaPeerId = this.pexRoutes.get(senderId);
+        // ★ 未認証の offer で既存リンクを追い出さない。
+        //   旧実装は MAX_DEGREE に達していると offer 1 通ごとに正規の
+        //   ロングレンジリンクを切り、30 秒のクールダウンに入れていた。
+        //   次数の調整は検証後に rebalance() が行う。
         peer = this.connect(senderId, false, viaPeerId);
 
         if (!peer) return;
@@ -321,7 +574,13 @@ export class PeerManager implements IPeerManager {
         if (this.coolDowns.has(senderId) && Date.now() - this.coolDowns.get(senderId)! < 30_000) return;
         const buffered = this.pendingSignals.get(senderId) || [];
         // 未接続ピアのバッファは無制限に伸ばさない (メモリ枯渇の防止)
-        if (buffered.length >= 32) return;
+        if (buffered.length >= MAX_SIGNALS_PER_SENDER) return;
+        // 送信者の数にも上限を置く。senderId は自由に名乗れるので、
+        // 1 人あたりの上限だけでは乱数 ID を変えながら無限に積める。
+        if (!this.pendingSignals.has(senderId) && this.pendingSignals.size >= MAX_SIGNAL_SENDERS) {
+          const oldest = this.pendingSignals.keys().next().value;
+          if (oldest !== undefined) this.pendingSignals.delete(oldest);
+        }
         buffered.push(msg);
         this.pendingSignals.set(senderId, buffered);
       }
@@ -332,6 +591,7 @@ export class PeerManager implements IPeerManager {
   }
 
   public connect(peerId: PeerId, initiator: boolean = true, viaPeerId?: PeerId): WebRTCPeer | undefined {
+    if (this.stopped) return undefined;
     if (this.misbehavior.isBanned(peerId)) {
       log.warn(`Refusing connection to banned peer ${peerId.substring(0, 8)}`);
       return undefined;
@@ -354,6 +614,16 @@ export class PeerManager implements IPeerManager {
 
     const lastEvicted = this.coolDowns.get(peerId);
     if (lastEvicted && Date.now() - lastEvicted < 30_000) return undefined;
+    if (lastEvicted) this.coolDowns.delete(peerId);
+
+    // ★ ハンドシェイク未完了の接続数に上限を置く。
+    //   degree は接続済みしか数えないため、旧実装では乱数 senderId の offer を
+    //   送るたびに RTCPeerConnection が無制限に増え、ブラウザの上限で
+    //   ノードが機能停止した。
+    if (this.pendingCount >= MAX_PENDING_PEERS) {
+      log.warn(`Refusing connection to ${peerId.substring(0, 8)}: too many pending handshakes`);
+      return undefined;
+    }
 
     if (viaPeerId) this.pexRoutes.set(peerId, viaPeerId);
 
@@ -444,26 +714,40 @@ export class PeerManager implements IPeerManager {
       return;
     }
 
-    const decoded = (data instanceof Uint8Array)
-      ? WireCodec.decode(data)
-      : WireCodec.decode(new TextEncoder().encode(data));
+    const bytes = (data instanceof Uint8Array) ? data : new TextEncoder().encode(data);
+    const limit = MAX_FRAME_BYTES[bytes[0] as WireType] ?? DEFAULT_MAX_FRAME_BYTES;
+    if (bytes.byteLength > limit) {
+      log.debug(() => `dropped oversized frame (type=0x${bytes[0]?.toString(16)}, ${bytes.byteLength}B) from ${peerId.substring(0, 8)}`);
+      return;
+    }
+    const decoded = WireCodec.decode(bytes);
+
+    const peer = this._peers.get(peerId);
+    // 違反点は「本人確認が済んだ peerId」にだけ付ける。未検証の接続の
+    // peerId は名乗りに過ぎず、そこに点を付けると第三者を陥れられる。
+    const authenticated = peer?.isVerified === true;
 
     if (decoded.type === WireType.UNKNOWN) {
       log.warn(`Dropped unknown wire message from ${peerId.substring(0, 8)}`);
-      this.misbehavior.recordViolation(peerId, ViolationType.MALFORMED_WIRE, 'Unknown wire message');
+      if (authenticated) {
+        this.misbehavior.recordViolation(peerId, ViolationType.MALFORMED_WIRE, 'Unknown wire message');
+      }
       this.disconnect(peerId);
       return;
     }
 
-    const category = RATE_CATEGORY[decoded.type];
-    if (category && !this.rateLimiter.allow(peerId, category)) {
-      if (this.misbehavior.recordViolation(peerId, ViolationType.RATE_LIMIT_EXCEEDED, 'Rate limit exceeded')) {
-        this.disconnect(peerId);
-      }
+    // ★ レート超過は「捨てる」だけで、違反点は付けない。
+    //   Gossip は正直な隣人がそのまま中継してくるものなので、網全体で投稿が
+    //   集中すると正直な隣人も一時的に上限を超える。旧実装はこれに 25 点を付けて
+    //   4 回で BAN していたため、攻撃者が安い PoW のパケットを網に流すだけで
+    //   正直なノード同士が互いを BAN し合い、網が自然に分断された。
+    //   流量の上限はトークンバケットが既に保証している。
+    const category = RATE_CATEGORY[decoded.type as Exclude<WireType, WireType.UNKNOWN>] ?? 'unknown';
+    if (!this.rateLimiter.allow(peerId, category)) {
+      log.trace(() => `rate limited ${category} from ${peerId.substring(0, 8)}`);
       return;
     }
 
-    const peer = this._peers.get(peerId);
     if (!PRE_HANDSHAKE_TYPES.has(decoded.type) && !peer?.isVerified) {
       return;
     }
@@ -477,25 +761,6 @@ export class PeerManager implements IPeerManager {
     if (peer && peer.isConnected) {
       peer.send(WireCodec.encode(type, payload));
     }
-  }
-
-  private evictLongRangeLink(): boolean {
-    const connected = Array.from(this._peers.values()).filter(p => p.isConnected);
-    if (connected.length === 0) return false;
-
-    connected.sort((a, b) => {
-      const dA = RingPosition.distance(this.myPosition, a.position);
-      const dB = RingPosition.distance(this.myPosition, b.position);
-      return dB - dA;
-    });
-
-    if (connected.length > RING_MESH.LOCAL_LINKS) {
-      const victim = connected[0];
-      this.coolDowns.set(victim.peerId, Date.now());
-      this.disconnect(victim.peerId);
-      return true;
-    }
-    return false;
   }
 
   public disconnect(peerId: PeerId): void {

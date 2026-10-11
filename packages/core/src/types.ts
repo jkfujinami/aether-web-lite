@@ -20,19 +20,7 @@ export interface WireNodeClaim {
 }
 
 // -- Signaling Serverとの通信用メッセージ --
-export type SignalingMessage =
-  | ({ type: 'join'; turnstileToken?: string } & WireNodeClaimJson)
-  | { type: 'peers'; peers: Array<{ peerId: PeerId }> }
-  | { type: 'relay'; targetPeerId: PeerId; payload: any } // トラッカー経由の最初のSDP交換用
-  | { type: 'error'; message: string };
-
-/** WebSocket は JSON なのでバイト列は hex 文字列で運ぶ */
-export interface WireNodeClaimJson {
-  peerId: PeerId;
-  /** hex 64 文字 */
-  pubkey: string;
-  powCounter: number;
-}
+// トラッカーとのメッセージの型は network/TrackerProtocol.ts にある (サーバと共有)
 
 // -- Gossipの型定義 --
 export interface GossipPacket {
@@ -114,6 +102,10 @@ export interface IPeerManager {
   disconnect(peerId: PeerId): void;
   // 高レベルバイナリ送信 (Wire V2)
   sendMessage(peerId: PeerId, type: number, payload: any): void;
+  /** outbound (自分で選んで張った) 接続の数 */
+  readonly outboundCount?: number;
+  /** 次数が上限を超えていれば、Sybil 対策の優先順位に従って調整する */
+  rebalance?(newcomerId?: PeerId): void;
   on(event: string, handler: (...args: any[]) => void): void;
   off(event: string, handler: (...args: any[]) => void): void;
 }
@@ -125,9 +117,25 @@ export interface IMessageDispatcher {
 }
 
 // ── Signaling Client ──
+/** トラッカーへの登録に署名できる主体 (NodeIdentity が満たす) */
+export interface TrackerJoinSigner {
+  readonly peerId: PeerId;
+  readonly pubkey: Uint8Array;
+  readonly powCounter: number;
+  signTrackerJoin(nonce: Uint8Array, trackerHost: string): Uint8Array;
+}
+
 export interface ISignalingClient {
   readonly isConnected?: boolean;
-  connect(options: { claim: WireNodeClaim; turnstileToken?: string }): Promise<void>;
+  /** 現在の接続先 (未設定なら null)。URL を持たない実装 (テスト用など) では undefined */
+  readonly url?: string | null;
+  /** 接続先を変える。不正な URL は例外。既存の接続は切る */
+  setUrl?(url: string | null): void;
+  /**
+   * トラッカーへ接続して登録する。登録が受け付けられたら解決する。
+   * identity は所有証明 (トラッカーの nonce への署名) に使う。
+   */
+  connect(options: { claim: WireNodeClaim; identity?: TrackerJoinSigner }): Promise<void>;
   sendRelay(targetPeerId: PeerId, payload: any): void;
   disconnect(): void;
   on(event: 'peers', cb: (peers: Array<{ peerId: PeerId }>) => void): void;
@@ -136,7 +144,6 @@ export interface ISignalingClient {
 
 // ── Mailbox (DHT) ──
 export interface IMailbox {
-  publish(topicHashHex: string, data: Uint8Array): Promise<void>;
   fetch(topicHashHex: string): Promise<Uint8Array[]>;
   replicate(targetPeerId: string, topicHash: string, entries: Uint8Array[]): void;
 }
@@ -151,7 +158,6 @@ export interface DAGMetadata {
 export interface IPostStore {
   save(post: { boardId: string; threadId: string; payload: Uint8Array; dag?: DAGMetadata }): Promise<void>;
   getPosts(boardId: string, threadId: string): Promise<any[]>;
-  getRecentTimestamps(count: number): Promise<number[]>;
 }
 
 // ── Key Management ──
@@ -178,6 +184,11 @@ export interface IZoneManager {
   readonly depth: number;
   readonly subscribedZones: ReadonlySet<number>;
   isSubscribed(zoneId: number): boolean;
+  /**
+   * 自分が見ている板・スレッドのトピックを、購読に加える (網には何も送らない)。
+   * 返り値の関数で外す。
+   */
+  watchTopic?(topicHash: Uint8Array): () => void;
 }
 
 // ── Anti-Spam (PoW) ──

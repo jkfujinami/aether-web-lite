@@ -18,6 +18,8 @@ export class ReplicationManager {
   
   // 頻繁な接続変化によるバーストを防ぐためのデバウンスタイマー
   private rebalanceTimer: any = null;
+  private periodicTimer: ReturnType<typeof setInterval>;
+  private destroyed = false;
 
   constructor(mailbox: IMailbox, peerManager: IPeerManager, store: IndexedDBStore) {
     this.mailbox = mailbox;
@@ -29,13 +31,21 @@ export class ReplicationManager {
     this.peerManager.on('peer:disconnect', () => this.planRebalance());
 
     // 定期的なバックアップチェック（念のため）
-    setInterval(() => this.planRebalance(), 300_000); // 5分ごと
+    this.periodicTimer = setInterval(() => this.planRebalance(), 300_000); // 5分ごと
+  }
+
+  public destroy(): void {
+    clearInterval(this.periodicTimer);
+    if (this.rebalanceTimer) clearTimeout(this.rebalanceTimer);
+    this.rebalanceTimer = null;
+    this.destroyed = true;
   }
 
   /**
    * 再配分を計画する（デバウンス付き）
    */
   private planRebalance() {
+    if (this.destroyed) return;
     if (this.rebalanceTimer) clearTimeout(this.rebalanceTimer);
     this.rebalanceTimer = setTimeout(() => this.executeRebalance(), 10_000); // 10秒待機
   }
@@ -43,8 +53,18 @@ export class ReplicationManager {
   /**
    * 現在保持している全トピックを、現在の最新K最近接ノードへコピーする
    */
-  public async executeRebalance() {
-    if (this.peerManager.degree === 0) return;
+  public async executeRebalance(): Promise<void> {
+    // ★ タイマーや起動時から投げっぱなしで呼ばれる。停止・ロック後に保管庫が例外を
+    //   投げても、未処理の reject にしない。
+    try {
+      await this.rebalanceOnce();
+    } catch (err) {
+      if (!this.destroyed) log.warn(`rebalance failed: ${(err as Error)?.message ?? err}`);
+    }
+  }
+
+  private async rebalanceOnce(): Promise<void> {
+    if (this.destroyed || this.peerManager.degree === 0) return;
 
     const allTopicHashes = await this.store.getAllTopicHashes();
     if (allTopicHashes.length === 0) return;
@@ -52,6 +72,7 @@ export class ReplicationManager {
     log.debug(`Starting rebalance for ${allTopicHashes.length} topics...`);
 
     for (const topicHash of allTopicHashes) {
+      if (this.destroyed) return;
       const topicPos = this.hashToPosition(topicHash);
       const nearestPeers = this.findKNearestExcludingMe(topicPos, this.K_REPLICATION);
       

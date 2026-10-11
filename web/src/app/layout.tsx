@@ -1,28 +1,13 @@
 import type { Metadata } from "next";
-import { Space_Grotesk, Inter, Space_Mono } from "next/font/google";
-import "./globals.css";
-import { P2PProvider } from "@/providers/P2PProvider";
-import { AppHeader } from "@/components/AppHeader";
-
-const spaceGrotesk = Space_Grotesk({
-  variable: "--font-space-grotesk",
-  subsets: ["latin"],
-});
-
-const inter = Inter({
-  variable: "--font-inter",
-  subsets: ["latin"],
-});
-
-const spaceMono = Space_Mono({
-  variable: "--font-space-mono",
-  subsets: ["latin"],
-  weight: ["400", "700"],
-});
+import "@aether/ui/styles.css";
 
 export const metadata: Metadata = {
-  title: "AETHER Web-Lite v2",
-  description: "Dual-Strand IPv4/IPv6 P2P Network",
+  title: "AETHER",
+  description: "AETHER Web",
+  // 検索エンジンに載せない (利用者の参照元として記録されるのを避ける)
+  robots: { index: false, follow: false },
+  // 外部へ参照元を送らない
+  referrer: "no-referrer",
 };
 
 export default function RootLayout({
@@ -31,16 +16,9 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="ja" className="light">
-      <body className={`${spaceGrotesk.variable} ${inter.variable} ${spaceMono.variable}`}>
-        <div id="app" className="app-root">
-          <P2PProvider>
-            <AppHeader />
-            <main>
-              {children}
-            </main>
-          </P2PProvider>
-        </div>
+    <html lang="ja">
+      <body>
+        <div id="root">{children}</div>
       </body>
     </html>
   );

@@ -10,8 +10,12 @@ import {
   MAILBOX_LIMITS,
 } from './MailboxEntry';
 import { createLogger } from '../../common/Logger';
-import type { DandelionRouter } from '../gossip/DandelionRouter';
-import { decodeSlotBlob } from '../hint/SlotBlob';
+import type { OnionCircuit } from '../onion/OnionCircuit';
+import type { GossipPacket } from '../../types';
+import { JsonBinary } from '../../common/JsonBinary';
+import { checkEntry } from './MailboxEntry';
+import { decodeHint } from '../hint/HintPacket';
+import { decodeSlotBlob, encodeSlotBlob } from '../hint/SlotBlob';
 
 const log = createLogger('net.mailbox');
 
@@ -38,7 +42,16 @@ const FETCH_GRACE_MS = 300;
  */
 const PUT_ACCEPT_SLACK = 3;
 
+/** エントリの同一性 (保管側の重複排除と同じく、バイト列そのもの) */
+function entryKey(e: Uint8Array): string {
+  let out = '';
+  for (let i = 0; i < e.length; i++) out += e[i].toString(16).padStart(2, '0');
+  return out;
+}
+
 export class DHTMailbox implements IMailbox {
+  /** acceptForStorage を直列化するための鎖 */
+  private storageQueue: Promise<void> = Promise.resolve();
   private store: IndexedDBStore;
   private pendingRequests = new Map<
     string,
@@ -47,25 +60,36 @@ export class DHTMailbox implements IMailbox {
 
   private peerManager: IPeerManager;
   private slotListeners: Array<(entry: Uint8Array, topicHash: string) => void> = [];
+  /** 保管の総バイト数 (遅延計算してから増分で追う) */
+  private usageBytes: number | null = null;
+  /** 送り主ごとの 1 時間あたりの受け入れ量 */
+  private peerQuota = new Map<PeerId, { windowStart: number; bytes: number }>();
+  private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     peerManager: IPeerManager,
     dispatcher: IMessageDispatcher,
     store: IndexedDBStore,
     /**
-     * PUT を Stem に載せるために使う。**必須**にしてある。
-     * 省略可にすると渡し忘れたときに直接 PUT へ落ち、
-     * 「動いているように見えて発信元が丸見え」になる。
+     * 作者の Slot は、Gossip と同じオニオンセルに載って出口まで運ばれ、
+     * **出口が作者の代わりに** K-nearest へ PUT する。**必須**にしてある。
      */
-    private dandelion: DandelionRouter,
+    circuit: OnionCircuit,
   ) {
     this.peerManager = peerManager;
     this.store = store;
 
     dispatcher.register(WireType.DHT_PUT, (peerId, msg) => this.handlePut(peerId, msg));
-    dispatcher.register(WireType.DHT_PUT_STEM, (peerId, msg) => this.handlePutStem(peerId, msg));
     dispatcher.register(WireType.DHT_GET, (peerId, msg) => this.handleGet(peerId, msg));
     dispatcher.register(WireType.DHT_RES, (peerId, msg) => this.handleRes(peerId, msg));
+    circuit.onExit('exit_fluff', (payload) => {
+      if (payload.type === 'exit_fluff' && payload.slot) {
+        // 停止 (ロック) 直後に届いた分は保管できずに失敗する。未処理の reject にしない
+        this.storeSlotAsExit(payload.slot.topicHash, payload.slot.hint, payload.packet).catch((err) => {
+          log.debug(() => `exit slot store failed: ${(err as Error)?.message ?? err}`);
+        });
+      }
+    });
   }
 
   /**
@@ -122,92 +146,149 @@ export class DHTMailbox implements IMailbox {
   }
 
   /**
-   * Gossip等で生まれたデータをデータベースと担当のK人に保管する (PUT)
+   * 出口として、作者の代わりに Slot を K-nearest へ保管する。
+   *
+   * ★ 作者自身は PUT を出さない (C3)。
+   *
+   *   旧実装は同じ投稿を Gossip ではオニオンに載せつつ、Slot (JSON 化した
+   *   GossipPacket = packet_id 入り) を平文の DHT_PUT_STEM で作者のエポック
+   *   Stem 先へ直接送っていた。Stem 先は「その投稿が網に現れる前に、
+   *   この隣人から届いた」ことを観測でき、オニオンが丸ごと迂回されていた。
+   *   隣人が居ないときに作者が直接 K-nearest へ置く経路も残っていた。
+   *
+   *   現在は Slot の素 (topicHash と索引) を exit_fluff セルに同梱し、
+   *   本体は出口がパケットから組み立てる (本体 JSON はセルに収まらないため)。
+   *   保管者が見る IP は出口のもので、出口は作者を知らない。
    */
-  public async publish(topicHashHex: string, data: Uint8Array): Promise<void> {
-    if (!isValidTopicHash(topicHashHex)) {
-      throw new RangeError(`DHTMailbox.publish: invalid topicHash`);
+  public async storeSlotAsExit(topicHashHex: string, hintBytes: Uint8Array, packet: GossipPacket): Promise<void> {
+    if (!isValidTopicHash(topicHashHex)) return;
+    const hint = decodeHint(hintBytes);
+    if (!hint) return;
+
+    let entry: Uint8Array;
+    try {
+      entry = encodeSlotBlob(hint, new TextEncoder().encode(JsonBinary.stringify(packet)));
+    } catch {
+      return;
     }
-
-    // ★ 直接 K-nearest へ投げない。
-    //
-    //   直接 PUT すると、保管者は「この IP が置いた」を確実に知る。
-    //   Gossip と違って「中継しただけかも」という否認可能性が無い。
-    //   しかも保管者が板の参加者なら本体を復号できるので、
-    //   相関を取るまでもなく手元に平文と相手の IP が揃ってしまう。
-    //
-    //   数ホップ Stem で運び、**最後のホップが自分の代わりに PUT する**。
-    //   保管者が見る IP は最終ホップのもので、そのノード自身も
-    //   「自分が発信したのか中継したのか」を区別されない。
-    //
-    //   ★ 層状暗号 (Onion) は要らない。
-    //     Onion が層を重ねるのは最終宛先を途中のホップに隠すためだが、
-    //     Schrödinger 化後の宛先 topicHash はランダムな 32 バイトで
-    //     非参加者には何も指していない。本体も既に封印済み。
-    const stemmed = this.stemPut(topicHashHex, data);
-    if (stemmed) return;
-
-    // Stem できない (隣人が居ない) ときは自分で置く。
-    // 届かないより匿名性が下がる方がまし、という判断は Dandelion と同じ。
-    log.debug(() => `no stem target, putting directly ${topicHashHex.substring(0, 8)}`);
-    await this.putToKNearest(topicHashHex, data);
+    // 自分の保管と同じ検証 (CHK・PoW・索引の PoW・サイズ) を通ったものだけ配る
+    if (!checkEntry(entry).ok) {
+      log.debug(() => `exit slot rejected ${topicHashHex.substring(0, 8)}`);
+      return;
+    }
+    log.debug(() => `exit storing slot ${topicHashHex.substring(0, 8)} on behalf of author`);
+    await this.putToKNearest(topicHashHex, entry);
   }
 
   /**
-   * Stem の 1 ホップ目を投げる。相手が居なければ false。
+   * 保管の可否を決めて書き込む。保管経路 (PUT / RES / 出口の自分宛て) はすべてここを通す。
    *
-   * ★ 発信時は確率 Fluff を引かない (`pickOriginTarget`)。
-   *   発信元が実行地点になってしまうと Stem に載せた意味が消える。
+   * 上限 (H7):
+   *   - トピックあたりの件数・トピック数
+   *   - 保管の総バイト数
+   *   - 送り主ごとの 1 時間あたりの受け入れ量 (1 人の隣人が枠を食い潰せないように)
+   *
+   * @returns 実際に保管したエントリ
    */
-  private stemPut(topicHashHex: string, data: Uint8Array): boolean {
-    const target = this.dandelion.pickOriginTarget();
-    if (!target) return false;
-    // ★ 転送先は TRACE 止まり (経路情報そのもの)
-    log.trace(() => `stem PUT ${topicHashHex.substring(0, 8)} -> ${target.substring(0, 8)}`);
-    this.peerManager.sendMessage(target, WireType.DHT_PUT_STEM, {
-      topicHash: topicHashHex,
-      entries: [data],
-    });
+  private async acceptForStorage(topicHash: string, entries: Uint8Array[], source: PeerId): Promise<Uint8Array[]> {
+    // ★ 1 件ずつ順に処理する。読み (既存エントリ・使用量) と書きの間に await があるので、
+    //   重なった PUT が同じ古い値を見て、使用量の更新が失われ (総量の上限を超えられる)、
+    //   トピックあたりの件数の上限を破り、同じエントリを何度も受け入れて通知していた。
+    const run = this.storageQueue.then(() => this.acceptForStorageNow(topicHash, entries, source));
+    this.storageQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private async acceptForStorageNow(topicHash: string, entries: Uint8Array[], source: PeerId): Promise<Uint8Array[]> {
+    const existing = (await this.store.get(topicHash)) ?? [];
+    if (existing.length >= MAILBOX_LIMITS.MAX_ENTRIES_PER_TOPIC) {
+      log.debug(() => `store rejected for ${topicHash.substring(0, 8)}: topic is full`);
+      return [];
+    }
+    if (existing.length === 0) {
+      const topicCount = (await this.store.getAllTopicHashes()).length;
+      if (topicCount >= MAILBOX_LIMITS.MAX_TOPICS) {
+        log.warn(`store rejected: topic capacity reached (${topicCount})`);
+        return [];
+      }
+    }
+
+    // ★ 既に持っているエントリは数えない。旧実装は同じエントリの再 PUT (複製の
+    //   定期送信で正当なノードも 5 分ごとに行う) のたびに使用量と送り主の割当を
+    //   加算していた。保管側では重複は捨てられるので、使用量だけが実際より膨らみ、
+    //   いずれ上限に達して全ての保管を断るようになった。
+    const have = new Set(existing.map(entryKey));
+    const fresh: Uint8Array[] = [];
+    for (const e of entries) {
+      const k = entryKey(e);
+      if (have.has(k)) continue;
+      have.add(k);
+      fresh.push(e);
+    }
+    if (fresh.length === 0) return [];
+
+    const room = MAILBOX_LIMITS.MAX_ENTRIES_PER_TOPIC - existing.length;
+    const candidates = fresh.slice(0, room);
+    const bytes = candidates.reduce((n, e) => n + e.byteLength, 0);
+
+    const usage = await this.currentUsage();
+    if (usage + bytes > MAILBOX_LIMITS.MAX_TOTAL_BYTES) {
+      log.warn(`store rejected: total capacity reached (${usage}B)`);
+      return [];
+    }
+    if (source !== this.peerManager.myPeerId && !this.chargePeerQuota(source, bytes)) {
+      log.warn(`store rejected: hourly quota exceeded for ${source.substring(0, 8)}`);
+      return [];
+    }
+
+    await this.store.put(topicHash, candidates);
+    this.usageBytes = usage + bytes;
+    return candidates;
+  }
+
+  private async currentUsage(): Promise<number> {
+    if (this.usageBytes === null) {
+      this.usageBytes = await this.store.mailboxUsageBytes().catch(() => 0);
+    }
+    return this.usageBytes;
+  }
+
+  private chargePeerQuota(peerId: PeerId, bytes: number): boolean {
+    const now = Date.now();
+    let q = this.peerQuota.get(peerId);
+    if (!q || now - q.windowStart > 60 * 60 * 1000) {
+      q = { windowStart: now, bytes: 0 };
+      this.peerQuota.set(peerId, q);
+    }
+    if (q.bytes + bytes > MAILBOX_LIMITS.MAX_BYTES_PER_PEER_PER_HOUR) return false;
+    q.bytes += bytes;
     return true;
   }
 
-  /**
-   * Stem で運ばれてきた PUT。転送を続けるか、自分が代わりに置くかを決める。
-   *
-   * ★ ここで「見たことがあるか」で分岐してはいけない。分岐させると、
-   *   攻撃者が PUT を送りつけて相手の反応を見るだけで
-   *   「既に知っていたか」を判定できるオラクルになる。
-   */
-  private handlePutStem(peerId: PeerId, msg: any): void {
-    const topicHash = msg?.topicHash;
-    if (!isValidTopicHash(topicHash)) {
-      log.debug(() => `PUT_STEM rejected (malformed topicHash) from ${peerId.substring(0, 8)}`);
-      return;
+  /** 保持期限を過ぎたトピックを消す。起動時と 1 時間ごとに走らせる */
+  public async pruneExpired(now: number = Date.now()): Promise<void> {
+    const { topics, bytes } = await this.store.pruneMailbox(now - MAILBOX_LIMITS.RETENTION_MS).catch(() => ({ topics: 0, bytes: 0 }));
+    if (topics > 0) {
+      log.info(`pruned ${topics} expired topic(s), ${bytes}B`);
+      this.usageBytes = null;
     }
-    const { accepted } = filterValidEntries(msg.entries);
-    if (accepted.length === 0) {
-      log.debug(() => `PUT_STEM rejected (no valid entries) from ${peerId.substring(0, 8)}`);
-      return;
-    }
-
-    const decision = this.dandelion.decideStem(peerId);
-    if (decision.action === 'forward') {
-      log.trace(() => `PUT_STEM forward ${topicHash.substring(0, 8)}`);
-      // 書き換えずにそのまま次の 1 人へ
-      this.peerManager.sendMessage(decision.target, WireType.DHT_PUT_STEM, {
-        topicHash, entries: accepted,
-      });
-      return;
-    }
-
-    // ここが実行地点。発信元の代わりに K-nearest へ置く。
-    log.debug(() => `PUT_STEM executing ${topicHash.substring(0, 8)}`);
-    for (const entry of accepted) {
-      void this.putToKNearest(topicHash, entry);
+    for (const [peerId, q] of this.peerQuota) {
+      if (now - q.windowStart > 60 * 60 * 1000) this.peerQuota.delete(peerId);
     }
   }
 
-  /** 実際に K-nearest へ配る (Stem の最終ホップ、または fallback) */
+  public startMaintenance(): void {
+    this.stopMaintenance();
+    void this.pruneExpired();
+    this.maintenanceTimer = setInterval(() => void this.pruneExpired(), 60 * 60 * 1000);
+  }
+
+  public stopMaintenance(): void {
+    if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
+    this.maintenanceTimer = null;
+  }
+
+  /** 実際に K-nearest へ配る (出口が作者の代わりに行う) */
   private async putToKNearest(topicHashHex: string, data: Uint8Array): Promise<void> {
     const topicPos = this.hashToPosition(topicHashHex);
     const nearest = this.findKNearest(topicPos, K_NEAREST);
@@ -221,7 +302,7 @@ export class DHTMailbox implements IMailbox {
       }
     }
     if (nearest.includes(this.peerManager.myPeerId)) {
-      await this.store.put(topicHashHex, [data]);
+      await this.acceptForStorage(topicHashHex, [data], this.peerManager.myPeerId);
     }
   }
 
@@ -381,23 +462,8 @@ export class DHTMailbox implements IMailbox {
     if (accepted.length === 0) return;
 
     try {
-      const existing = (await this.store.get(topicHash)) ?? [];
-      if (existing.length >= MAILBOX_LIMITS.MAX_ENTRIES_PER_TOPIC) {
-        log.warn(`PUT rejected for ${topicHash.substring(0, 8)}: topic is full`);
-        return;
-      }
-
-      if (existing.length === 0) {
-        const topicCount = (await this.store.getAllTopicHashes()).length;
-        if (topicCount >= MAILBOX_LIMITS.MAX_TOPICS) {
-          log.warn(`PUT rejected: topic capacity reached (${topicCount})`);
-          return;
-        }
-      }
-
-      const room = MAILBOX_LIMITS.MAX_ENTRIES_PER_TOPIC - existing.length;
-      const toStore = accepted.slice(0, room);
-      await this.store.put(topicHash, toStore);
+      const toStore = await this.acceptForStorage(topicHash, accepted, peerId);
+      if (toStore.length === 0) return;
       // 保管した Slot は、鍵を持っていればその場で開ける
       for (const entry of toStore) {
         for (const cb of this.slotListeners) cb(entry, topicHash);
@@ -467,9 +533,12 @@ export class DHTMailbox implements IMailbox {
     req.resolve(accepted);
 
     if (accepted.length > 0 && this.isResponsibleFor(req.topicHash)) {
-      // 検証済みのものだけをローカルにも保管する
-      this.store.put(req.topicHash, accepted).catch(e => log.error(e));
-      for (const entry of accepted) {
+      // 検証済みのものだけを、保管の上限の範囲でローカルにも保管する
+      const stored = await this.acceptForStorage(req.topicHash, accepted, peerId).catch((e) => {
+        log.error(e);
+        return [] as Uint8Array[];
+      });
+      for (const entry of stored) {
         for (const cb of this.slotListeners) cb(entry, req.topicHash);
       }
     }

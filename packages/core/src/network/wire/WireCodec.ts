@@ -94,7 +94,11 @@ export class WireCodec {
       };
 
       return {
-        type: typeMap[msg.type] || WireType.UNKNOWN,
+        // 自前のキーだけを見る ("constructor" や "__proto__" で Object.prototype の
+        // メンバーを型として返さない)
+        type: typeof msg?.type === 'string' && Object.prototype.hasOwnProperty.call(typeMap, msg.type)
+          ? typeMap[msg.type]
+          : WireType.UNKNOWN,
         payload: msg
       };
 
