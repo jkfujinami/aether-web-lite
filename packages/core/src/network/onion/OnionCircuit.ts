@@ -7,7 +7,7 @@ import { Encoding } from '../../common/Encoding';
 import { createLogger } from '../../common/Logger';
 import { WireType } from '../wire/WireTypes';
 import { SeenCache } from '../gossip/SeenCache';
-import { secureRandomIndex, type DandelionRouter } from '../gossip/DandelionRouter';
+import { secureWeightedIndex, OBSERVATION_SATURATION_MS, type DandelionRouter } from '../gossip/DandelionRouter';
 
 const log = createLogger('net.onion');
 
@@ -62,6 +62,9 @@ interface QueuedCell {
 
 interface GuardNeighbor {
   pubkey: Uint8Array;
+  /** Guard の隣人表で最初に見た時刻 (このセッション内) */
+  firstSeen: number;
+  /** 最後に見た時刻 (有効期限の判定) */
   seenAt: number;
 }
 
@@ -315,7 +318,13 @@ export class OnionCircuit {
 
     const nonAdjacent = fresh.filter(h => !this.peerManager.peers.has(h.peerId));
     const pool = nonAdjacent.length > 0 ? nonAdjacent : fresh;
-    return pool[secureRandomIndex(pool.length)];
+    // 観測期間の長い候補ほど選ばれやすくする (A3)。新しく Guard の隣に
+    // 張り付いた Sybil は出口に選ばれにくい。拒否はしないので、小さな網でも回路は組める。
+    const weights = pool.map(h => {
+      const firstSeen = this.guardNeighbors.get(h.peerId)?.firstSeen ?? now;
+      return 0.25 + Math.min(now - firstSeen, OBSERVATION_SATURATION_MS) / OBSERVATION_SATURATION_MS;
+    });
+    return pool[secureWeightedIndex(weights)];
   }
 
   // ── Guard の隣人表 ──
@@ -351,7 +360,7 @@ export class OnionCircuit {
       // Guard は任意の公開鍵を差し込める (=出口のセルを自分で復号できる)。
       const claim = { peerId, pubkey, powCounter: entry?.powCounter };
       if (!NodeIdentity.verifyClaim(claim, powParams)) continue;
-      this.guardNeighbors.set(peerId, { pubkey, seenAt: now });
+      this.guardNeighbors.set(peerId, { pubkey, firstSeen: now, seenAt: now });
     }
   }
 

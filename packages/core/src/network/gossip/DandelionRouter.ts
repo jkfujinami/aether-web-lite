@@ -103,9 +103,27 @@ export class DandelionRouter {
       }
       return null;
     }
-    const selected = candidates[secureRandomIndex(candidates.length)];
+    const selected = candidates[secureWeightedIndex(candidates.map(c => this.guardWeight(c.peerId, now)))];
     this.setGuard(selected.peerId, now + DANDELION_CONFIG.GUARD_PIN_DURATION);
     return selected;
+  }
+
+  /**
+   * Guard 候補の重み (A3)。拒否はせず、選ばれやすさだけを変える。
+   *
+   * - 自分で選んで張った接続 (outbound) を 3 倍に重くする。Sybil は inbound なら
+   *   好きなだけ送り込めるが、こちらが選ぶ outbound の相手は自由にできない。
+   *   起動直後はどの隣人も観測期間がほぼ 0 なので、ここが主な効き目になる。
+   * - 本人確認からの経過時間 (最大 30 分) で最大 2 倍まで重くする。
+   *   作ったばかりの Sybil は Guard に選ばれにくくなる。
+   *
+   * 観測履歴は端末に保存しない (どのノードとつながっていたかが押収時の痕跡になる)。
+   */
+  private guardWeight(peerId: PeerId, now: number): number {
+    const peer: any = this.peerManager.peers.get(peerId);
+    const directionWeight = peer?.direction === 'outbound' ? 3 : 1;
+    const age = typeof peer?.verifiedAt === 'number' ? Math.max(0, now - peer.verifiedAt) : 0;
+    return directionWeight * (1 + Math.min(age, OBSERVATION_SATURATION_MS) / OBSERVATION_SATURATION_MS);
   }
 
   public getPinnedGuardId(): PeerId | null {
@@ -128,6 +146,22 @@ export class DandelionRouter {
     this.pinnedGuardExpiry = expiry;
     if (changed) this.guardListeners.forEach(cb => cb(id));
   }
+}
+
+/** 観測期間による重みが飽和するまでの時間 (Guard / 出口の選択で共通) */
+export const OBSERVATION_SATURATION_MS = 30 * 60 * 1000;
+
+/** 重みに比例した暗号論的乱数インデックス。重みはすべて正であること */
+export function secureWeightedIndex(weights: number[]): number {
+  const total = weights.reduce((a, w) => a + w, 0);
+  if (!(total > 0)) return secureRandomIndex(weights.length);
+  const r = (crypto.getRandomValues(new Uint32Array(1))[0] / 0x100000000) * total;
+  let acc = 0;
+  for (let i = 0; i < weights.length; i++) {
+    acc += weights[i];
+    if (r < acc) return i;
+  }
+  return weights.length - 1;
 }
 
 /** 偏りの無い暗号論的乱数インデックス */
