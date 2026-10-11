@@ -43,8 +43,12 @@ export class RingMaintainer {
   }
 
   public evaluateTopology() {
-    const peers = Array.from(this.peerManager.peers.values());
-    
+    // ★ 検証済みのピアだけで判断する。
+    //   未検証の接続まで数えると、攻撃者が未認証の接続を積むだけで次数が
+    //   MAX_DEGREE を超えたことになり、正規のロングレンジリンクが切られる。
+    const peers = Array.from(this.peerManager.peers.values()).filter(p => p.isConnected && p.isVerified);
+    const verifiedDegree = peers.length;
+
     // まだ少ない場合は強制切断はしない
     if (peers.length <= RING_MESH.LOCAL_LINKS) return;
 
@@ -57,8 +61,8 @@ export class RingMaintainer {
     const longRangeLinks = peers.slice(RING_MESH.LOCAL_LINKS);
 
     // 最大接続数超過時は、遠い（効果の薄い）ロングレンジリンクから捨てる
-    if (this.peerManager.degree > RING_MESH.MAX_DEGREE) {
-      const excess = this.peerManager.degree - RING_MESH.MAX_DEGREE;
+    if (verifiedDegree > RING_MESH.MAX_DEGREE) {
+      const excess = verifiedDegree - RING_MESH.MAX_DEGREE;
       
       for (let i = 0; i < excess; i++) {
         const target = longRangeLinks.pop();

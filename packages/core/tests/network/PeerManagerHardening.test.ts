@@ -30,16 +30,24 @@ describe('PeerManager 要塞化 (Hardening Integration Tests)', () => {
     });
   });
 
-  it('壊れたワイヤデータ (MALFORMED_WIRE) を受信したピアを即座にBANし切断する', () => {
-    expect(peerManagerA.misbehavior.isBanned(BAD_PEER_ID)).toBe(false);
+  it('検証済みピアが壊れたワイヤデータを送ったら即座にBANし切断する', () => {
+    const verifiedPeer: any = { isVerified: true, isConnected: true, close: vi.fn() };
+    (peerManagerA as any)._peers.set(BAD_PEER_ID, verifiedPeer);
 
-    // 未知のワイヤメッセージ (WireType.UNKNOWN = 0) を送信
-    const invalidData = new Uint8Array([0x99, 0xff, 0x00]); // 壊れたエンコーディング
+    (peerManagerA as any).handleData(BAD_PEER_ID, new Uint8Array([0x99, 0xff, 0x00]));
 
-    (peerManagerA as any).handleData(BAD_PEER_ID, invalidData);
-
-    // 即時BANされていること
     expect(peerManagerA.misbehavior.isBanned(BAD_PEER_ID)).toBe(true);
+    expect(peerManagerA.peers.has(BAD_PEER_ID)).toBe(false);
+  });
+
+  it('未検証の接続が壊れたデータを送っても、名乗られた ID は BAN せず切断だけする', () => {
+    const unverified: any = { isVerified: false, isConnected: true, close: vi.fn() };
+    (peerManagerA as any)._peers.set(BAD_PEER_ID, unverified);
+
+    (peerManagerA as any).handleData(BAD_PEER_ID, new Uint8Array([0x99, 0xff, 0x00]));
+
+    expect(peerManagerA.misbehavior.isBanned(BAD_PEER_ID)).toBe(false);
+    expect(peerManagerA.peers.has(BAD_PEER_ID)).toBe(false);
   });
 
   it('BANされたピアに対する新規接続の試行を拒絶する', () => {
@@ -62,7 +70,7 @@ describe('PeerManager 要塞化 (Hardening Integration Tests)', () => {
     expect(peerManagerA.peers.has(BAD_PEER_ID)).toBe(false);
   });
 
-  it('JOIN時に名乗りと接続IDが不一致のピアを即時BANする', () => {
+  it('JOIN時に名乗りと接続IDが不一致なら切断するが、名乗られた ID は BAN しない', () => {
     const fakePeer: any = {
       isVerified: false,
       challenge: new Uint8Array(32),
@@ -79,6 +87,33 @@ describe('PeerManager 要塞化 (Hardening Integration Tests)', () => {
       signature: new Uint8Array(64),
     });
 
-    expect(peerManagerA.misbehavior.isBanned(BAD_PEER_ID)).toBe(true);
+    expect(fakePeer.markVerified).not.toHaveBeenCalled();
+    expect(peerManagerA.peers.has(BAD_PEER_ID)).toBe(false);
+    // 接続の peerId はシグナリングで名乗られただけの値。第三者を陥れられないこと
+    expect(peerManagerA.misbehavior.isBanned(BAD_PEER_ID)).toBe(false);
+  });
+
+  it('検証済みの生きた接続は、同じ ID を名乗る offer で置き換えられない', () => {
+    const VICTIM = 'abc00000000000000000000000000001';
+    const live: any = { peerId: VICTIM, isVerified: true, isConnected: true, close: vi.fn(), signal: vi.fn() };
+    (peerManagerA as any)._peers.set(VICTIM, live);
+
+    (peerManagerA as any).handleRelay(VICTIM, { type: 'sdp-relay', sdp: { type: 'offer', sdp: 'x' } });
+
+    expect(live.close).not.toHaveBeenCalled();
+    expect(peerManagerA.peers.get(VICTIM)).toBe(live);
+  });
+
+  it('ハンドシェイク未完了の接続数に上限があり、乱数 ID の offer で無制限に増えない', () => {
+    (globalThis as any).RTCPeerConnection = class {
+      createDataChannel() { return {}; }
+      createOffer() { return new Promise(() => {}); }
+      close() {}
+    };
+    for (let i = 0; i < 50; i++) {
+      peerManagerA.connect(i.toString(16).padStart(32, '0'), true);
+    }
+    expect(peerManagerA.peers.size).toBeLessThanOrEqual(8);
+    delete (globalThis as any).RTCPeerConnection;
   });
 });
