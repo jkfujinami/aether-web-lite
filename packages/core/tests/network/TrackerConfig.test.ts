@@ -9,6 +9,7 @@ import { AetherNode } from '../../src/node/AetherNode';
 import { IndexedDBStore } from '../../src/storage/IndexedDBStore';
 import { VAULT_PARAMS_FAST } from '../../src/storage/SecretVault';
 import type { WireNodeClaim } from '../../src/types';
+import { Encoding } from '../../src/common/Encoding';
 
 const FAST = { difficulty: 0, opsLimit: 1, memLimit: 8192 };
 
@@ -31,13 +32,22 @@ class FakeWebSocket {
     queueMicrotask(() => this.onclose?.());
   }
   open() { this.readyState = 1; this.onopen?.(); }
+  /** トラッカー側の振る舞い: hello を送り、join が来たら peers を返す */
+  handshake(nonce = 'ab'.repeat(32)) {
+    this.open();
+    this.receive({ type: 'hello', v: 2, nonce });
+    if (this.sent.some((m) => m.type === 'join')) this.receive({ type: 'peers', peers: [] });
+  }
   receive(msg: unknown) { this.onmessage?.({ data: JSON.stringify(msg) }); }
   static last(): FakeWebSocket { return FakeWebSocket.instances[FakeWebSocket.instances.length - 1]; }
 }
 const WS = FakeWebSocket as unknown as typeof WebSocket;
 
-const claim = (peerId = 'a'.repeat(32)): WireNodeClaim =>
-  ({ peerId, pubkey: new Uint8Array(32), powCounter: 0 }) as WireNodeClaim;
+let me: NodeIdentity;
+beforeAll(async () => {
+  me = await NodeIdentity.mine(FAST);
+});
+const claim = () => ({ claim: me.claim() as WireNodeClaim, identity: me });
 
 afterEach(() => {
   FakeWebSocket.instances = [];
@@ -96,7 +106,7 @@ describe('SignalingClient: 接続先を推測しない', () => {
   it('URL が未設定なら接続を試みずに失敗する', async () => {
     const client = new SignalingClient(null, { WebSocketImpl: WS });
     expect(client.url).toBeNull();
-    await expect(client.connect({ claim: claim() })).rejects.toBeInstanceOf(TrackerNotConfiguredError);
+    await expect(client.connect(claim())).rejects.toBeInstanceOf(TrackerNotConfiguredError);
     expect(FakeWebSocket.instances).toHaveLength(0);
   });
 
@@ -109,13 +119,13 @@ describe('SignalingClient: 接続先を推測しない', () => {
 
   it('設定した URL にだけ接続し、自分の claim で登録する', async () => {
     const client = new SignalingClient('wss://a.example', { WebSocketImpl: WS });
-    const p = client.connect({ claim: claim('b'.repeat(32)) });
+    const p = client.connect(claim());
     const ws = FakeWebSocket.last();
     expect(ws.url).toBe('wss://a.example/ws');
-    ws.open();
+    ws.handshake();
     await p;
     expect(client.isConnected).toBe(true);
-    expect(ws.sent).toEqual([expect.objectContaining({ type: 'join', peerId: 'b'.repeat(32) })]);
+    expect(ws.sent).toEqual([expect.objectContaining({ type: 'join', peerId: me.peerId, host: 'a.example' })]);
     // 購読ゾーンや位置は送らない
     expect(ws.sent[0]).not.toHaveProperty('zones');
     expect(ws.sent[0]).not.toHaveProperty('position');
@@ -123,12 +133,12 @@ describe('SignalingClient: 接続先を推測しない', () => {
 
   it('接続中に重ねて connect しても、ソケットは 1 本だけ (同じ ID を二重登録しない)', async () => {
     const client = new SignalingClient('wss://a.example', { WebSocketImpl: WS });
-    const p1 = client.connect({ claim: claim() });
-    const p2 = client.connect({ claim: claim() });
+    const p1 = client.connect(claim());
+    const p2 = client.connect(claim());
     expect(FakeWebSocket.instances).toHaveLength(1);
-    FakeWebSocket.last().open();
+    FakeWebSocket.last().handshake();
     await Promise.all([p1, p2]);
-    await client.connect({ claim: claim() }); // 接続済みなら何もしない
+    await client.connect(claim()); // 接続済みなら何もしない
     expect(FakeWebSocket.instances).toHaveLength(1);
     expect(FakeWebSocket.last().sent).toHaveLength(1);
   });
@@ -137,21 +147,21 @@ describe('SignalingClient: 接続先を推測しない', () => {
     const client = new SignalingClient('wss://old.example', { WebSocketImpl: WS });
     const peers = vi.fn();
     client.on('peers', peers);
-    const p = client.connect({ claim: claim() });
+    const p = client.connect(claim());
     const old = FakeWebSocket.last();
-    old.open();
+    old.handshake();
     await p;
 
     client.setUrl('wss://new.example');
     expect(old.readyState).toBe(3);
     expect(client.isConnected).toBe(false);
     old.receive({ type: 'peers', peers: [{ peerId: 'c'.repeat(32) }] });
-    expect(peers).not.toHaveBeenCalled();
+    expect(peers).not.toHaveBeenCalledWith([{ peerId: 'c'.repeat(32) }]);
 
-    const p2 = client.connect({ claim: claim() });
+    const p2 = client.connect(claim());
     const fresh = FakeWebSocket.last();
     expect(fresh.url).toBe('wss://new.example/ws');
-    fresh.open();
+    fresh.handshake();
     await p2;
     fresh.receive({ type: 'peers', peers: [{ peerId: 'd'.repeat(32) }] });
     expect(peers).toHaveBeenCalledWith([{ peerId: 'd'.repeat(32) }]);
@@ -159,22 +169,22 @@ describe('SignalingClient: 接続先を推測しない', () => {
 
   it('接続待ちの間に URL を変えたら、その接続は失敗として終わる', async () => {
     const client = new SignalingClient('wss://old.example', { WebSocketImpl: WS });
-    const p = client.connect({ claim: claim() });
+    const p = client.connect(claim());
     client.setUrl('wss://new.example');
     await expect(p).rejects.toThrow();
     // 遅れて開いても登録しない
-    FakeWebSocket.instances[0].open();
+    FakeWebSocket.instances[0].handshake();
     expect(FakeWebSocket.instances[0].sent).toHaveLength(0);
   });
 
   it('開く前に閉じられたら失敗する。応答が無ければ時間切れで失敗する', async () => {
     const client = new SignalingClient('wss://a.example', { WebSocketImpl: WS, connectTimeoutMs: 50 });
-    const p = client.connect({ claim: claim() });
+    const p = client.connect(claim());
     FakeWebSocket.last().close();
     await expect(p).rejects.toThrow(/closed/);
 
     vi.useFakeTimers();
-    const p2 = client.connect({ claim: claim() });
+    const p2 = client.connect(claim());
     const check = expect(p2).rejects.toThrow(/timeout/);
     await vi.advanceTimersByTimeAsync(60);
     await check;
@@ -264,7 +274,7 @@ describe('AetherNode: トラッカーの設定', () => {
     const p = node.setTrackerUrl('wss://tracker.example.org');
     expect(node.trackerUrl).toBe('wss://tracker.example.org/ws');
     const ws = FakeWebSocket.last();
-    ws.open();
+    ws.handshake();
     await p;
     expect(ws.sent[0]).toMatchObject({ type: 'join', peerId: node.peerId });
 
@@ -286,5 +296,109 @@ describe('AetherNode: トラッカーの設定', () => {
     expect(FakeWebSocket.instances).toHaveLength(0);
     await node.stop();
     await expect(node.setTrackerUrl('wss://other.example')).rejects.toThrow(/stopped/);
+  });
+});
+
+describe('トラッカーへの登録: 所有証明 (v2)', () => {
+  const nonceHex = 'cd'.repeat(32);
+
+  it('hello の nonce と接続先ホストに署名した join を送り、トラッカー側の検証を通る', async () => {
+    const client = new SignalingClient('wss://Tracker.Example.org:8443', { WebSocketImpl: WS });
+    const p = client.connect(claim());
+    const ws = FakeWebSocket.last();
+    ws.open();
+    expect(ws.sent).toHaveLength(0); // hello を受け取るまで何も送らない
+    ws.receive({ type: 'hello', v: 2, nonce: nonceHex });
+    const join = ws.sent[0];
+    expect(join).toMatchObject({ type: 'join', v: 2, peerId: me.peerId, host: 'tracker.example.org:8443', powCounter: me.powCounter });
+    expect(Object.keys(join).sort()).toEqual(['host', 'peerId', 'powCounter', 'pubkey', 'sig', 'type', 'v']);
+    expect(NodeIdentity.verifyTrackerJoin(
+      { peerId: join.peerId, pubkey: Encoding.fromHex(join.pubkey), powCounter: join.powCounter },
+      Encoding.fromHex(nonceHex), join.host, Encoding.fromHex(join.sig), FAST,
+    )).toBe(true);
+    ws.receive({ type: 'peers', peers: [] });
+    await p;
+  });
+
+  it('署名は別の nonce・別のホスト・別の ID では検証を通らない', () => {
+    const nonce = Encoding.fromHex(nonceHex);
+    const sig = me.signTrackerJoin(nonce, 'a.example');
+    const c = me.claim();
+    expect(NodeIdentity.verifyTrackerJoin(c, nonce, 'a.example', sig, FAST)).toBe(true);
+    expect(NodeIdentity.verifyTrackerJoin(c, nonce, 'A.EXAMPLE', sig, FAST)).toBe(true); // ホストは大小無視
+    expect(NodeIdentity.verifyTrackerJoin(c, Encoding.fromHex('ce'.repeat(32)), 'a.example', sig, FAST)).toBe(false);
+    expect(NodeIdentity.verifyTrackerJoin(c, nonce, 'b.example', sig, FAST)).toBe(false);
+    const flipped = sig.slice();
+    flipped[0] ^= 1;
+    expect(NodeIdentity.verifyTrackerJoin(c, nonce, 'a.example', flipped, FAST)).toBe(false);
+    expect(NodeIdentity.verifyTrackerJoin(c, nonce.slice(0, 31), 'a.example', sig, FAST)).toBe(false);
+    expect(NodeIdentity.verifyTrackerJoin(c, nonce, '', sig, FAST)).toBe(false);
+  });
+
+  it('P2P の JOIN 署名とトラッカー登録の署名は互いに流用できない (ドメイン分離)', async () => {
+    const nonce = Encoding.fromHex(nonceHex);
+    const p2p = me.signClaim(nonce, { verifierId: 'a.example', signerFingerprint: '', verifierFingerprint: '' });
+    expect(NodeIdentity.verifyTrackerJoin(me.claim(), nonce, 'a.example', p2p.signature, FAST)).toBe(false);
+  });
+
+  it('公開情報 (peerId・pubkey・powCounter) だけでは他人として登録できない', async () => {
+    const other = await NodeIdentity.mine(FAST);
+    const nonce = Encoding.fromHex(nonceHex);
+    // 攻撃者は自分の鍵で署名し、他人の claim を添える
+    const sig = me.signTrackerJoin(nonce, 'a.example');
+    expect(NodeIdentity.verifyTrackerJoin(other.claim(), nonce, 'a.example', sig, FAST)).toBe(false);
+  });
+
+  it('トラッカーが登録を拒否したら、理由のコード付きで失敗する', async () => {
+    const client = new SignalingClient('wss://a.example', { WebSocketImpl: WS });
+    const p = client.connect(claim());
+    const ws = FakeWebSocket.last();
+    ws.open();
+    ws.receive({ type: 'hello', v: 2, nonce: nonceHex });
+    ws.receive({ type: 'error', code: 'bad-signature' });
+    await expect(p).rejects.toMatchObject({ name: 'TrackerJoinError', code: 'bad-signature' });
+    expect(ws.readyState).toBe(3);
+  });
+
+  it('対応していない版・hello 以外の最初のメッセージ・壊れた hello では登録しない', async () => {
+    for (const first of [
+      { type: 'hello', v: 1, nonce: nonceHex },
+      { type: 'peers', peers: [] },
+      { type: 'hello', v: 2, nonce: 'zz' },
+    ]) {
+      const client = new SignalingClient('wss://a.example', { WebSocketImpl: WS, connectTimeoutMs: 50 });
+      vi.useFakeTimers();
+      const p = client.connect(claim());
+      const check = expect(p).rejects.toThrow();
+      const ws = FakeWebSocket.last();
+      ws.open();
+      ws.receive(first);
+      await vi.advanceTimersByTimeAsync(60);
+      await check;
+      expect(ws.sent.filter((m) => m.type === 'join')).toHaveLength(0);
+      vi.useRealTimers();
+    }
+  });
+
+  it('登録前に届いた relay は捨て、登録後のものだけを渡す', async () => {
+    const client = new SignalingClient('wss://a.example', { WebSocketImpl: WS });
+    const relay = vi.fn();
+    client.on('relay', relay);
+    const p = client.connect(claim());
+    const ws = FakeWebSocket.last();
+    ws.open();
+    ws.receive({ type: 'hello', v: 2, nonce: nonceHex });
+    ws.receive({ type: 'relay', senderId: 'e'.repeat(32), payload: { sdp: 'early' } });
+    ws.receive({ type: 'peers', peers: [] });
+    await p;
+    ws.receive({ type: 'relay', senderId: 'e'.repeat(32), payload: { sdp: 'late' } });
+    ws.receive({ type: 'relay', senderId: 'not-a-peer-id', payload: { sdp: 'x' } });
+    expect(relay.mock.calls).toEqual([['e'.repeat(32), { sdp: 'late' }]]);
+  });
+
+  it('署名できない identity では接続しない', async () => {
+    const client = new SignalingClient('wss://a.example', { WebSocketImpl: WS });
+    await expect(client.connect({ claim: me.claim() as WireNodeClaim })).rejects.toThrow(/identity/);
+    expect(FakeWebSocket.instances).toHaveLength(0);
   });
 });

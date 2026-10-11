@@ -4,7 +4,10 @@ import path from 'path';
 export default defineConfig({
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, './src'),
+      // テストは常に core のソースに対して走らせる (古い dist で通ってしまうのを防ぐ)
+      '@aether/core': path.resolve(__dirname, '../../packages/core/src/index.ts'),
+      '@aether/ui/styles.css': path.resolve(__dirname, '../../packages/ui/src/styles.css'),
+      '@aether/ui': path.resolve(__dirname, '../../packages/ui/src/index.ts'),
     },
   },
   test: {

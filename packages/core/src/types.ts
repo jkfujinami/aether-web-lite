@@ -20,19 +20,7 @@ export interface WireNodeClaim {
 }
 
 // -- Signaling Serverとの通信用メッセージ --
-export type SignalingMessage =
-  | ({ type: 'join'; turnstileToken?: string } & WireNodeClaimJson)
-  | { type: 'peers'; peers: Array<{ peerId: PeerId }> }
-  | { type: 'relay'; targetPeerId: PeerId; payload: any } // トラッカー経由の最初のSDP交換用
-  | { type: 'error'; message: string };
-
-/** WebSocket は JSON なのでバイト列は hex 文字列で運ぶ */
-export interface WireNodeClaimJson {
-  peerId: PeerId;
-  /** hex 64 文字 */
-  pubkey: string;
-  powCounter: number;
-}
+// トラッカーとのメッセージの型は network/TrackerProtocol.ts にある (サーバと共有)
 
 // -- Gossipの型定義 --
 export interface GossipPacket {
@@ -129,13 +117,25 @@ export interface IMessageDispatcher {
 }
 
 // ── Signaling Client ──
+/** トラッカーへの登録に署名できる主体 (NodeIdentity が満たす) */
+export interface TrackerJoinSigner {
+  readonly peerId: PeerId;
+  readonly pubkey: Uint8Array;
+  readonly powCounter: number;
+  signTrackerJoin(nonce: Uint8Array, trackerHost: string): Uint8Array;
+}
+
 export interface ISignalingClient {
   readonly isConnected?: boolean;
   /** 現在の接続先 (未設定なら null)。URL を持たない実装 (テスト用など) では undefined */
   readonly url?: string | null;
   /** 接続先を変える。不正な URL は例外。既存の接続は切る */
   setUrl?(url: string | null): void;
-  connect(options: { claim: WireNodeClaim; turnstileToken?: string }): Promise<void>;
+  /**
+   * トラッカーへ接続して登録する。登録が受け付けられたら解決する。
+   * identity は所有証明 (トラッカーの nonce への署名) に使う。
+   */
+  connect(options: { claim: WireNodeClaim; identity?: TrackerJoinSigner }): Promise<void>;
   sendRelay(targetPeerId: PeerId, payload: any): void;
   disconnect(): void;
   on(event: 'peers', cb: (peers: Array<{ peerId: PeerId }>) => void): void;
@@ -184,6 +184,11 @@ export interface IZoneManager {
   readonly depth: number;
   readonly subscribedZones: ReadonlySet<number>;
   isSubscribed(zoneId: number): boolean;
+  /**
+   * 自分が見ている板・スレッドのトピックを、購読に加える (網には何も送らない)。
+   * 返り値の関数で外す。
+   */
+  watchTopic?(topicHash: Uint8Array): () => void;
 }
 
 // ── Anti-Spam (PoW) ──

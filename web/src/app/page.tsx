@@ -1,38 +1,34 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import BoardView from "@/components/BoardView";
-import ThreadView from "@/components/ThreadView";
+import { useEffect, useState } from "react";
+import { AetherApp } from "@aether/ui";
+import { sodiumReady } from "@aether/core";
 
-export default function SPAHashRouter() {
-  const [route, setRoute] = useState<{ boardId: string; threadId?: string; key?: string }>({ boardId: 'vip' });
+/**
+ * Web 版。画面もプロトコルも Desktop と同じもの (@aether/ui + @aether/core) を使う。
+ *
+ * トラッカーの既定値は、このページを配信したサーバ自身の /ws とする。
+ * ページを取得した時点でそのサーバには IP アドレスが見えているので、新たに晒すものは無い。
+ * 利用者が設定画面で変えた値があれば、そちらが優先される。
+ * 平文の ws:// は localhost 以外では検証で弾かれる (https で配信すること)。
+ */
+function sameOriginTracker(): string {
+  const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+  return `${scheme}://${window.location.host}/ws`;
+}
+
+export default function Page() {
+  const [tracker, setTracker] = useState<string | null | undefined>(undefined);
 
   useEffect(() => {
-    const parseHash = () => {
-      const hash = window.location.hash;
-      if (!hash || hash === '#') {
-        window.location.hash = '#board=vip';
-        return;
-      }
-
-      // #board=XXX&thread=YYY&key=ZZZ
-      const params = new URLSearchParams(hash.substring(1));
-      const boardId = params.get('board') || 'vip';
-      const threadId = params.get('thread') || undefined;
-      const key = params.get('key') || undefined;
-
-      setRoute({ boardId, threadId, key });
-    };
-
-    window.addEventListener('hashchange', parseHash);
-    parseHash(); // 初回実行
-
-    return () => window.removeEventListener('hashchange', parseHash);
+    // IndexedDB と libsodium はブラウザでしか使えないので、描画はクライアントで始める
+    let cancelled = false;
+    sodiumReady.then(() => {
+      if (!cancelled) setTracker(sameOriginTracker());
+    });
+    return () => { cancelled = true; };
   }, []);
 
-  if (route.threadId) {
-    return <ThreadView boardId={route.boardId} threadId={route.threadId} boardKeyBase64={route.key} />;
-  }
-
-  return <BoardView boardId={route.boardId} boardKeyBase64={route.key} />;
+  if (tracker === undefined) return null;
+  return <AetherApp badge="Web" defaultTrackerUrl={tracker} />;
 }

@@ -43,7 +43,10 @@ export {
 export {
   NodeIdentity,
   type NodeClaim,
+  type NodeIdPowParams,
   NODE_ID_POW,
+  NODE_ID_POW_FAST,
+  trackerJoinMessage,
 } from './crypto/NodeIdentity';
 export { NodeIdentityStore } from './crypto/NodeIdentityStore';
 export { PacketBuilder } from './crypto/PacketBuilder';
@@ -57,7 +60,8 @@ export { ChunkedReceiver } from './network/stream/ChunkedReceiver';
 // ── Network & Routing ──
 export { PeerManager } from './network/PeerManager';
 export { WebRTCPeer } from './network/WebRTCPeer';
-export { SignalingClient, TrackerNotConfiguredError } from './network/SignalingClient';
+export { SignalingClient, TrackerNotConfiguredError, TrackerJoinError } from './network/SignalingClient';
+export * from './network/TrackerProtocol';
 export {
   parseTrackerUrl,
   describeTrackerUrlError,
@@ -75,7 +79,7 @@ export { SeenCache } from './network/gossip/SeenCache';
 export { PEXHandler } from './network/PEXHandler';
 export { Heartbeat } from './network/Heartbeat';
 export { RingMaintainer } from './network/RingMaintainer';
-export { RateLimiter } from './network/RateLimiter';
+export { RateLimiter, type RateLimitConfig } from './network/RateLimiter';
 export { PeerMisbehaviorManager, ViolationType } from './network/PeerMisbehaviorManager';
 export { PacketValidator } from './network/gossip/PacketValidator';
 

@@ -11,13 +11,18 @@
   "scripts": {
     "dev": "npm --workspace=web run dev",
     "dev:desktop": "npm --workspace=@aether/desktop run dev",
-    "test": "npm --workspace=@aether/core test && npm --workspace=web test && npm --workspace=@aether/desktop test",
-    "test:all": "npm test",
-    "test:core": "npm --workspace=@aether/core test",
-    "test:web": "npm --workspace=web test",
-    "test:desktop": "npm --workspace=@aether/desktop test",
     "build:core": "npm --workspace=@aether/core run build",
-    "build:desktop": "npm --workspace=@aether/desktop run build"
+    "build:desktop": "npm --workspace=@aether/desktop run build",
+    "build:web": "npm --workspace=web run build",
+    "typecheck": "npm --workspace=@aether/core run typecheck && npm --workspace=@aether/ui run typecheck && npm --workspace=@aether/tracker run typecheck && npm --workspace=@aether/desktop run typecheck && npm --workspace=web run typecheck",
+    "test": "npm run test:core && npm run test:ui && npm run test:tracker && npm run test:desktop && npm run test:web",
+    "test:core": "npm --workspace=@aether/core test",
+    "test:ui": "npm --workspace=@aether/ui test",
+    "test:desktop": "npm --workspace=@aether/desktop test",
+    "test:web": "npm --workspace=web test",
+    "check": "npm run build:core && npm run typecheck && npm test",
+    "test:tracker": "npm --workspace=@aether/tracker test",
+    "tracker": "npm --workspace=@aether/tracker start"
   },
   "devDependencies": {
     "jsdom": "^29.1.1"

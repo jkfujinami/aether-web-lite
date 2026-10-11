@@ -1,7 +1,18 @@
-import type { PeerId, SignalingMessage, ISignalingClient, WireNodeClaim } from '../types';
+import type { PeerId, ISignalingClient, WireNodeClaim, TrackerJoinSigner } from '../types';
 import { Encoding } from '../common/Encoding';
 import { createLogger } from '../common/Logger';
 import { parseTrackerUrl } from './TrackerUrl';
+import {
+  TRACKER_PROTOCOL_VERSION,
+  TRACKER_MAX_FRAME_BYTES,
+  parseTrackerServerMessage,
+  trackerHostOf,
+  isPeerId,
+  type TrackerClientMessage,
+  type TrackerErrorCode,
+  type TrackerJoin,
+  type TrackerRelayOut,
+} from './TrackerProtocol';
 
 const log = createLogger('net.signaling');
 
@@ -13,6 +24,14 @@ export class TrackerNotConfiguredError extends Error {
   constructor() {
     super('tracker URL is not configured');
     this.name = 'TrackerNotConfiguredError';
+  }
+}
+
+/** トラッカーが登録を拒否した (理由のコード付き) */
+export class TrackerJoinError extends Error {
+  constructor(public readonly code: TrackerErrorCode) {
+    super(`tracker rejected join: ${code}`);
+    this.name = 'TrackerJoinError';
   }
 }
 
@@ -74,20 +93,24 @@ export class SignalingClient implements ISignalingClient {
     log.debug(() => `Tracker URL ${next ? 'configured' : 'cleared'}`);
   }
 
-  public async connect(options: { claim: WireNodeClaim; turnstileToken?: string }): Promise<void> {
+  public async connect(options: { claim: WireNodeClaim; identity?: TrackerJoinSigner }): Promise<void> {
     if (!this._url) throw new TrackerNotConfiguredError();
     if (this.isConnected) return;
     if (this.pending) return this.pending;
     if (!this.WebSocketImpl) throw new Error('WebSocket is not available');
+    const identity = options.identity;
+    if (!identity) throw new Error('tracker join requires an identity that can sign');
 
     // 閉じかけの古い接続は捨てる (二重接続で同じ peerId を 2 回登録しない)
     this.closeSocket();
     const generation = ++this.generation;
     const url = this._url;
+    const host = trackerHostOf(url);
 
     const attempt = new Promise<void>((resolve, reject) => {
       log.debug(`Connecting to tracker`);
       let settled = false;
+      let phase: 'hello' | 'joining' | 'joined' = 'hello';
       const ws = new this.WebSocketImpl!(url);
       this.ws = ws;
 
@@ -98,30 +121,63 @@ export class SignalingClient implements ISignalingClient {
         if (this.ws === ws) this.closeSocket();
         reject(err);
       };
+      // hello → join → peers までを含めた上限
       const timer = setTimeout(() => fail(new Error('tracker connect timeout')), this.connectTimeoutMs);
 
       ws.onopen = () => {
-        if (settled || generation !== this.generation) return;
-        settled = true;
-        clearTimeout(timer);
-        log.debug(`Connected to tracker`);
-        // 接続直後に Join メッセージで自身を登録。
-        // position と zones は送らない (前者は peerId から導出可能、
-        // 後者は購読宣言そのものでトラッカーに興味を晒すことになる)。
-        const joinMsg: SignalingMessage = {
-          type: 'join',
-          peerId: options.claim.peerId,
-          pubkey: Encoding.toHex(options.claim.pubkey),
-          powCounter: options.claim.powCounter,
-          turnstileToken: options.turnstileToken,
-        };
-        this.send(joinMsg);
-        resolve();
+        if (generation !== this.generation) return;
+        log.debug(`Connected to tracker, waiting for hello`);
       };
 
       ws.onmessage = (event) => {
         if (generation !== this.generation) return;
-        this.handleMessage(event.data);
+        const msg = parseTrackerServerMessage(event.data);
+        if (!msg) {
+          log.warn(`Dropped malformed message from tracker`);
+          return;
+        }
+
+        if (phase === 'hello') {
+          if (msg.type !== 'hello') return fail(new TrackerJoinError('bad-message'));
+          if (msg.v !== TRACKER_PROTOCOL_VERSION) return fail(new TrackerJoinError('unsupported-version'));
+          // 接続直後に、所有証明つきの join で自身を登録する。
+          // position と zones は送らない (前者は peerId から導出可能、
+          // 後者は購読宣言そのものでトラッカーに興味を晒すことになる)。
+          const join: TrackerJoin = {
+            type: 'join',
+            v: TRACKER_PROTOCOL_VERSION,
+            peerId: identity.peerId,
+            pubkey: Encoding.toHex(identity.pubkey),
+            powCounter: identity.powCounter,
+            host,
+            sig: Encoding.toHex(identity.signTrackerJoin(Encoding.fromHex(msg.nonce), host)),
+          };
+          phase = 'joining';
+          this.sendRaw(ws, join);
+          return;
+        }
+
+        if (msg.type === 'error') {
+          if (phase === 'joining') return fail(new TrackerJoinError(msg.code));
+          log.warn(`Tracker error: ${msg.code}`);
+          return;
+        }
+
+        if (msg.type === 'peers') {
+          if (phase === 'joining') {
+            phase = 'joined';
+            settled = true;
+            clearTimeout(timer);
+            log.debug(`Registered with tracker`);
+            resolve();
+          }
+          this.onPeersCb?.(msg.peers);
+          return;
+        }
+
+        if (msg.type === 'relay' && phase === 'joined') {
+          this.onRelayCb?.(msg.senderId, msg.payload);
+        }
       };
 
       ws.onerror = () => {
@@ -145,49 +201,20 @@ export class SignalingClient implements ISignalingClient {
     }
   }
 
-  private handleMessage(raw: unknown): void {
-    try {
-      const data = JSON.parse(String(raw)) as SignalingMessage | any;
-      log.debug(`<<< Message from tracker: type=${data.type}`);
-
-      if (data.type === 'peers') {
-        const peers = Array.isArray(data.peers)
-          ? data.peers.filter((p: any) => typeof p?.peerId === 'string').map((p: any) => ({ peerId: p.peerId }))
-          : [];
-        if (this.onPeersCb) this.onPeersCb(peers);
-      } else if (data.type === 'relay') {
-        // トラッカー経由のリレーメッセージ (Unwrap)
-        const senderId = data.senderId || data.sender_id;
-        if (this.onRelayCb && senderId) {
-          this.onRelayCb(senderId, data.payload);
-        }
-      } else if (data.sdp || data.candidate || data.type === 'sdp-relay' || data.type === 'ice-relay') {
-        // 後位互換: トラッカーによるフラットなリレーや、V1形式
-        const senderId = data.senderId || data.sender_id;
-        if (this.onRelayCb && senderId) this.onRelayCb(senderId, data);
-      } else if (data.type === 'error') {
-        log.error(`Tracker error:`, data.message);
-      } else {
-        log.warn(`Unhandled message type: ${data.type}`);
-      }
-    } catch (e) {
-      log.error(`Failed to parse message`, e);
-    }
-  }
-
   public sendRelay(targetPeerId: PeerId, payload: any): void {
-    const msg: SignalingMessage = {
-      type: 'relay',
-      targetPeerId,
-      payload
-    };
-    this.send(msg);
+    if (!this.ws || !isPeerId(targetPeerId) || typeof payload !== 'object' || payload === null) return;
+    const msg: TrackerRelayOut = { type: 'relay', targetPeerId, payload };
+    this.sendRaw(this.ws, msg);
   }
 
-  private send(msg: SignalingMessage): void {
-    if (this.ws && this.ws.readyState === WS_OPEN) {
-      this.ws.send(JSON.stringify(msg));
+  private sendRaw(ws: WebSocket, msg: TrackerClientMessage): void {
+    if (ws.readyState !== WS_OPEN) return;
+    const text = JSON.stringify(msg);
+    if (text.length > TRACKER_MAX_FRAME_BYTES) {
+      log.warn(`Dropped oversized message to tracker`);
+      return;
     }
+    ws.send(text);
   }
 
   public on(event: 'peers', cb: PeersCallback): void;

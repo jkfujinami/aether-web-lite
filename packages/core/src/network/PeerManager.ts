@@ -440,7 +440,7 @@ export class PeerManager implements IPeerManager {
    */
   private async connectTracker(): Promise<void> {
     if (this.stopped) return;
-    await this.signaling.connect({ claim: this.identity.claim() });
+    await this.signaling.connect({ claim: this.identity.claim(), identity: this.identity });
     if (this.stopped) {
       this.signaling.disconnect();
       return;

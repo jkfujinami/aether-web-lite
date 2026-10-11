@@ -81,6 +81,11 @@ const POSITION_DOMAIN = new TextEncoder().encode('AETHER/v3/position');
  * ドメインを変えておくことで、旧クライアントとのハンドシェイクは確実に失敗する (fail-closed)。
  */
 const JOIN_DOMAIN = new TextEncoder().encode('AETHER/v4/join');
+/**
+ * トラッカーへの登録の署名ドメイン。P2P の JOIN とは分ける
+ * (どちらかの署名を、もう一方の検証に流用されないように)。
+ */
+const TRACKER_JOIN_DOMAIN = new TextEncoder().encode('AETHER/v1/tracker-join');
 
 /** peerId のバイト長 (hex 表記では 32 文字) */
 export const PEER_ID_BYTES = 16;
@@ -176,6 +181,22 @@ export function joinMessage(challenge: Uint8Array, signerId: string, binding: Jo
     lengthPrefixed(binding.signerFingerprint),
     lengthPrefixed(binding.verifierFingerprint),
   ]);
+}
+
+/**
+ * トラッカー登録の正準メッセージ。
+ *
+ *   domain ‖ nonce (32 バイト, トラッカーが接続ごとに出す) ‖ lp(peerId) ‖ lp(trackerHost)
+ *
+ * trackerHost は「署名者が接続したつもりのトラッカー」のホスト名 (小文字、既定以外のポートを含む)。
+ * これを含めないと、悪意あるトラッカー A が別のトラッカー B の nonce を中継して署名を得て、
+ * 利用者になりすまして B に登録できてしまう。
+ */
+export function trackerJoinMessage(nonce: Uint8Array, peerId: string, trackerHost: string): Uint8Array {
+  if (nonce.length !== CHALLENGE_BYTES) {
+    throw new RangeError(`trackerJoinMessage: nonce must be ${CHALLENGE_BYTES} bytes`);
+  }
+  return concat([TRACKER_JOIN_DOMAIN, nonce, lengthPrefixed(peerId), lengthPrefixed(trackerHost.toLowerCase())]);
 }
 
 export class NodeIdentity {
@@ -358,6 +379,43 @@ export class NodeIdentity {
       challenge,
       signature: sodium.crypto_sign_detached(joinMessage(challenge, this.peerId, binding), this.privkey),
     };
+  }
+
+  /**
+   * トラッカーへの登録の所有証明。トラッカーが接続ごとに出す nonce と、
+   * 接続先のホスト名に署名する ({@link trackerJoinMessage})。
+   */
+  signTrackerJoin(nonce: Uint8Array, trackerHost: string): Uint8Array {
+    return sodium.crypto_sign_detached(trackerJoinMessage(nonce, this.peerId, trackerHost), this.privkey);
+  }
+
+  /**
+   * トラッカー側の検証。Bound Identity (peerId = hash(pubkey) + NodeId PoW) に加えて、
+   * その公開鍵の秘密鍵で、この接続の nonce とこのトラッカーのホスト名に署名していること。
+   *
+   * ★ peerId・pubkey・powCounter は公開情報 (P2P の JOIN で全隣人に渡る) なので、
+   *   それだけを確かめても他人の ID での登録を防げない。署名が必須。
+   */
+  static verifyTrackerJoin(
+    claim: NodeClaim,
+    nonce: Uint8Array,
+    trackerHost: string,
+    signature: Uint8Array,
+    params: NodeIdPowParams = NODE_ID_POW,
+  ): boolean {
+    if (!(nonce instanceof Uint8Array) || nonce.length !== CHALLENGE_BYTES) return false;
+    if (!(signature instanceof Uint8Array) || signature.length !== sodium.crypto_sign_BYTES) return false;
+    if (typeof trackerHost !== 'string' || trackerHost.length === 0 || trackerHost.length > 255) return false;
+    if (!NodeIdentity.verifyClaim(claim, params)) return false;
+    try {
+      return sodium.crypto_sign_verify_detached(
+        signature,
+        trackerJoinMessage(nonce, claim.peerId, trackerHost),
+        claim.pubkey,
+      );
+    } catch {
+      return false;
+    }
   }
 
   /** 永続化用。秘密鍵を含むので取り扱い注意 */
