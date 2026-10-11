@@ -208,6 +208,20 @@ export class WebRTCPeer implements IPeerConnection {
     });
   }
 
+  /**
+   * この接続の DTLS 証明書フィンガープリント (SDP の a=fingerprint 行)。
+   *
+   * JOIN 署名をこの接続に束縛するために使う ({@link JoinBinding})。
+   * DataChannel が開いた時点で local / remote の両 SDP は確定している。
+   * 取れない場合は空文字を返す (呼び出し側が fail-closed で扱う)。
+   */
+  public dtlsFingerprints(): { local: string; remote: string } {
+    return {
+      local: extractFingerprint(this.pc.localDescription?.sdp),
+      remote: extractFingerprint(this.pc.remoteDescription?.sdp),
+    };
+  }
+
   /** 送出したチャレンジを記録する (HELLO 送信時) */
   public setChallenge(challenge: Uint8Array) {
     this._challenge = challenge;
@@ -226,4 +240,17 @@ export class WebRTCPeer implements IPeerConnection {
     if (this.channel) this.channel.close();
     this.pc.close();
   }
+}
+
+/**
+ * SDP から a=fingerprint を取り出して正規化する。
+ * 複数行ある場合 (セッション / メディア単位) は重複を除いてソート連結する。
+ */
+export function extractFingerprint(sdp: string | undefined | null): string {
+  if (typeof sdp !== 'string') return '';
+  const found = new Set<string>();
+  for (const m of sdp.matchAll(/^a=fingerprint:\s*(\S+)\s+([0-9A-Fa-f:]+)\s*$/gm)) {
+    found.add(`${m[1].toLowerCase()} ${m[2].toUpperCase()}`);
+  }
+  return Array.from(found).sort().join(',');
 }

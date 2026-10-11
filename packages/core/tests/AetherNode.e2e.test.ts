@@ -61,6 +61,9 @@ describe('AetherNode Multi-Node End-to-End P2P Integration', () => {
 
     expect(nodeAlice.peerManager.peers.get(nodeBob.peerId)?.isConnected).toBe(true);
     expect(nodeBob.peerManager.peers.get(nodeAlice.peerId)?.isConnected).toBe(true);
+    // DTLS 指紋に束縛された JOIN (v4) で相互に本人確認が済んでいること
+    expect(nodeAlice.peerManager.peers.get(nodeBob.peerId)?.isVerified).toBe(true);
+    expect(nodeBob.peerManager.peers.get(nodeAlice.peerId)?.isVerified).toBe(true);
 
     // 4. 板キーを共有して購読
     const boardId = 'vip';

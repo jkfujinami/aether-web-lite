@@ -16,6 +16,7 @@ import { PeerMisbehaviorManager, ViolationType } from './PeerMisbehaviorManager'
 import {
   NodeIdentity,
   NODE_ID_POW,
+  CHALLENGE_BYTES,
   type NodeIdPowParams,
   type SignedNodeClaim,
 } from '../crypto/NodeIdentity';
@@ -67,6 +68,7 @@ export class PeerManager implements IPeerManager {
   private identity: NodeIdentity;
   public readonly misbehavior: PeerMisbehaviorManager;
   private reannounceTimer: any = null;
+  private readonly allowMissingDtlsFingerprint: boolean;
 
   public readonly myPeerId: PeerId;
   public readonly myPosition: number;
@@ -81,8 +83,15 @@ export class PeerManager implements IPeerManager {
       rateLimiter?: RateLimiter;
       powParams?: NodeIdPowParams;
       misbehavior?: PeerMisbehaviorManager;
+      /**
+       * ★ テスト専用。SDP に a=fingerprint が無い環境 (偽の WebRTC 等) で
+       *   JOIN の DTLS 束縛を省略する。実運用では絶対に true にしないこと
+       *   (中継型 MITM による ID 乗っ取りが再び可能になる)。
+       */
+      allowMissingDtlsFingerprint?: boolean;
     } = {},
   ) {
+    this.allowMissingDtlsFingerprint = options.allowMissingDtlsFingerprint ?? false;
     this.identity = identity;
     this.myPeerId = identity.peerId;
     this.myPosition = identity.position;
@@ -127,11 +136,34 @@ export class PeerManager implements IPeerManager {
    */
   private handleHello(peerId: PeerId, msg: any) {
     const challenge = toBytes(msg?.challenge);
-    if (challenge.length === 0) {
-      log.warn(`HELLO from ${peerId.substring(0, 8)} without challenge`);
+    if (challenge.length !== CHALLENGE_BYTES) {
+      log.warn(`HELLO from ${peerId.substring(0, 8)} with malformed challenge`);
       return;
     }
-    this.sendMessage(peerId, WireType.JOIN, this.identity.signClaim(challenge));
+    const peer = this._peers.get(peerId);
+    if (!peer) return;
+
+    // 自分 (署名者) の視点: 自分の指紋 = local、検証者の指紋 = remote
+    const fp = peer.dtlsFingerprints();
+    if (!this.fingerprintsUsable(fp)) {
+      log.warn(`Refusing to sign JOIN for ${peerId.substring(0, 8)}: DTLS fingerprint unavailable`);
+      return;
+    }
+    this.sendMessage(peerId, WireType.JOIN, this.identity.signClaim(challenge, {
+      verifierId: peerId,
+      signerFingerprint: fp.local,
+      verifierFingerprint: fp.remote,
+    }));
+  }
+
+  /**
+   * 指紋が JOIN の束縛に使えるか。
+   * 実ブラウザの WebRTC では必ず存在する。欠けている場合は束縛が成立しないので、
+   * 明示的に許可されていない限りハンドシェイクを進めない (fail-closed)。
+   */
+  private fingerprintsUsable(fp: { local: string; remote: string }): boolean {
+    if (fp.local && fp.remote) return true;
+    return this.allowMissingDtlsFingerprint;
   }
 
   /**
@@ -184,7 +216,20 @@ export class PeerManager implements IPeerManager {
       return;
     }
 
-    if (!NodeIdentity.verifySignedClaim(claim, expected, this.powParams)) {
+    // 自分 (検証者) の視点: 署名者の指紋 = remote、自分の指紋 = local
+    const fp = peer.dtlsFingerprints();
+    if (!this.fingerprintsUsable(fp)) {
+      log.warn(`JOIN from ${peerId.substring(0, 8)} rejected: DTLS fingerprint unavailable`);
+      this.disconnect(peerId);
+      return;
+    }
+    const binding = {
+      verifierId: this.myPeerId,
+      signerFingerprint: fp.remote,
+      verifierFingerprint: fp.local,
+    };
+
+    if (!NodeIdentity.verifySignedClaim(claim, expected, binding, this.powParams)) {
       log.warn(`JOIN verification failed for ${peerId.substring(0, 8)} — dropping peer`);
       this.disconnect(peerId);
       return;

@@ -76,7 +76,11 @@ const NODE_ID_SALT = new Uint8Array([
 
 const PEER_ID_DOMAIN = new TextEncoder().encode('AETHER/v3/peerid');
 const POSITION_DOMAIN = new TextEncoder().encode('AETHER/v3/position');
-const JOIN_DOMAIN = new TextEncoder().encode('AETHER/v3/join');
+/**
+ * v4: 署名対象を「この接続」に束縛した。v3 の署名 (challenge のみ) は受理しない。
+ * ドメインを変えておくことで、旧クライアントとのハンドシェイクは確実に失敗する (fail-closed)。
+ */
+const JOIN_DOMAIN = new TextEncoder().encode('AETHER/v4/join');
 
 /** peerId のバイト長 (hex 表記では 32 文字) */
 export const PEER_ID_BYTES = 16;
@@ -119,8 +123,59 @@ export interface NodeClaim {
 export interface SignedNodeClaim extends NodeClaim {
   /** 相手から受け取った challenge をそのまま echo する */
   challenge: Uint8Array;
-  /** Ed25519(JOIN_DOMAIN ‖ challenge) */
+  /** Ed25519(joinMessage(...))。{@link JoinBinding} を参照 */
   signature: Uint8Array;
+}
+
+/**
+ * JOIN 署名を束縛する「この接続」の文脈。
+ *
+ * ★ 旧実装 (v3) は Ed25519(JOIN_DOMAIN ‖ challenge) しか署名していなかった。
+ *   challenge はどの接続から来たものかを何も表さないので、攻撃者 M は
+ *     1. T から受け取った challenge を、自分が正規ノード V へ送る HELLO に流用し
+ *     2. V が返した署名付き JOIN をそのまま T へ転送する
+ *   だけで、T に「M の端点 = V」と信じ込ませられた (中継型 MITM / identity misbinding)。
+ *   NodeId PoW を一切払わずに任意の正規 ID の座標を占有でき、Bound Identity が無効化された。
+ *
+ *   v4 では、署名対象に
+ *     - 検証者 (challenge を出した側) の peerId
+ *     - 署名者自身の peerId
+ *     - 両側の DTLS 証明書フィンガープリント (SDP の a=fingerprint)
+ *   を含める。DTLS の秘密鍵はブラウザから持ち出せないので、別の接続で得た署名を
+ *   この接続に流用することができない (M が DTLS を終端すると指紋が食い違う)。
+ *
+ * 署名側と検証側は同じ値を「自分の視点」から組み立てる:
+ *   - signerFingerprint   : 署名者の DTLS 指紋 (署名側から見て local、検証側から見て remote)
+ *   - verifierFingerprint : 検証者の DTLS 指紋 (署名側から見て remote、検証側から見て local)
+ */
+export interface JoinBinding {
+  /** challenge を出した側 (検証者) の peerId */
+  verifierId: string;
+  /** 署名者の DTLS 指紋 */
+  signerFingerprint: string;
+  /** 検証者の DTLS 指紋 */
+  verifierFingerprint: string;
+}
+
+function lengthPrefixed(text: string): Uint8Array {
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.length > 0xffff) throw new RangeError('JoinBinding field too long');
+  const out = new Uint8Array(2 + bytes.length);
+  new DataView(out.buffer).setUint16(0, bytes.length, false);
+  out.set(bytes, 2);
+  return out;
+}
+
+/** JOIN 署名の正準メッセージ。フィールド境界は長さ前置きで固定する */
+export function joinMessage(challenge: Uint8Array, signerId: string, binding: JoinBinding): Uint8Array {
+  return concat([
+    JOIN_DOMAIN,
+    challenge,
+    lengthPrefixed(binding.verifierId),
+    lengthPrefixed(signerId),
+    lengthPrefixed(binding.signerFingerprint),
+    lengthPrefixed(binding.verifierFingerprint),
+  ]);
 }
 
 export class NodeIdentity {
@@ -209,27 +264,37 @@ export class NodeIdentity {
   static verifySignedClaim(
     claim: SignedNodeClaim,
     expectedChallenge: Uint8Array,
+    binding: JoinBinding,
     params: NodeIdPowParams = NODE_ID_POW,
   ): boolean {
-    if (!NodeIdentity.verifyClaim(claim, params)) return false;
-
-    const challenge = claim.challenge instanceof Uint8Array ? claim.challenge : null;
-    const signature = claim.signature instanceof Uint8Array ? claim.signature : null;
+    const challenge = claim?.challenge instanceof Uint8Array ? claim.challenge : null;
+    const signature = claim?.signature instanceof Uint8Array ? claim.signature : null;
     if (!challenge || !signature) return false;
+    if (expectedChallenge.length !== CHALLENGE_BYTES) return false;
     if (challenge.length !== expectedChallenge.length) return false;
+    if (signature.length !== sodium.crypto_sign_BYTES) return false;
 
     // タイミング差で challenge を推測されないよう定数時間比較を使う
     if (!sodium.memcmp(challenge, expectedChallenge)) return false;
 
+    // 安価な署名検査を先に通し、重い NodeId PoW (Argon2id) は最後に回す
+    if (typeof claim.peerId !== 'string') return false;
+    if (!(claim.pubkey instanceof Uint8Array) || claim.pubkey.length !== sodium.crypto_sign_PUBLICKEYBYTES) {
+      return false;
+    }
+    let signatureOk = false;
     try {
-      return sodium.crypto_sign_verify_detached(
+      signatureOk = sodium.crypto_sign_verify_detached(
         signature,
-        concat([JOIN_DOMAIN, challenge]),
+        joinMessage(challenge, claim.peerId, binding),
         claim.pubkey,
       );
     } catch {
       return false;
     }
+    if (!signatureOk) return false;
+
+    return NodeIdentity.verifyClaim(claim, params);
   }
 
   /** 検証する側が送るチャレンジを生成する */
@@ -278,12 +343,20 @@ export class NodeIdentity {
     return { peerId: this.peerId, pubkey: this.pubkey, powCounter: this.powCounter };
   }
 
-  /** 相手のチャレンジに署名した主張 (P2P の JOIN) */
-  signClaim(challenge: Uint8Array): SignedNodeClaim {
+  /**
+   * 相手のチャレンジに署名した主張 (P2P の JOIN)。
+   *
+   * challenge は固定長しか受け付けない。任意長のバイト列に署名して返すと、
+   * 署名オラクルとして悪用される余地が広がる。
+   */
+  signClaim(challenge: Uint8Array, binding: JoinBinding): SignedNodeClaim {
+    if (challenge.length !== CHALLENGE_BYTES) {
+      throw new RangeError(`signClaim: challenge must be ${CHALLENGE_BYTES} bytes`);
+    }
     return {
       ...this.claim(),
       challenge,
-      signature: sodium.crypto_sign_detached(concat([JOIN_DOMAIN, challenge]), this.privkey),
+      signature: sodium.crypto_sign_detached(joinMessage(challenge, this.peerId, binding), this.privkey),
     };
   }
 
