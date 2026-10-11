@@ -267,6 +267,16 @@ function decodeListString(text: string): { content: GuardListContent; sigs: Arra
 }
 
 /**
+ * 署名を検証せずにリストの中身だけを読む。
+ *
+ * ★ 信頼の判断には絶対に使わないこと (メンテナ用 CLI が、既存リストに署名を
+ *   足すときに発行・失効時刻を揃えるためだけに使う)。
+ */
+export function readGuardListUnverified(text: string): GuardListContent | null {
+  return decodeListString(text.trim())?.content ?? null;
+}
+
+/**
  * 信頼リストを検証する。1 つでも条件を満たさなければ、リスト全体を拒否する (fail-closed)。
  *
  * @param minVersion 手元で既に受け入れた最大の版。これより古い版は拒否する (巻き戻し防止)。
