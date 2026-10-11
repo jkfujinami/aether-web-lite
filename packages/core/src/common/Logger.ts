@@ -63,16 +63,19 @@ export function levelName(v: LogLevelValue): LogLevelName {
 }
 
 /**
- * 既定レベル。開発は DEBUG、本番は WARN。
+ * 既定レベルは常に WARN。詳しいログは明示的に有効化したときだけ出す。
  *
- * ★ 開発既定を INFO にすると、経路を追うための debug ログが全部落ちて
- *   「何も出ない」状態になる。実網のデバッグでは既定で流れている方がよい。
- *   うるさければ `aetherLog.set('*','info')` で下げられる。
+ * ★ 旧実装は `process.env.NODE_ENV` で本番かどうかを判定し、それ以外を DEBUG にしていた。
+ *   ブラウザや Electron のレンダラー (nodeIntegration: false) には `process` が無いため、
+ *   配布版でも DEBUG になっていた。DEBUG ログには経路の判断や Slot / Hint の ID、
+ *   隣人の peerId の一部が含まれ、コンソールの転送先 (OS のセッションログなど) に
+ *   平文で残り得る。押収時の痕跡を増やさないよう、既定は静かにしておく。
+ *
+ *   開発時は環境変数 AETHER_LOG か localStorage.aether_log で上げる
+ *   (例: "*=debug,net.gossip=trace")。
  */
 function defaultLevel(): LogLevelValue {
-  const isProd =
-    typeof process !== 'undefined' && process.env?.NODE_ENV === 'production';
-  return isProd ? LogLevel.WARN : LogLevel.DEBUG;
+  return LogLevel.WARN;
 }
 
 /**

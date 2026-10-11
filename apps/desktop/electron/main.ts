@@ -75,10 +75,16 @@ function createWindow() {
     },
   });
 
-  // レンダラープロセスのコンソール出力をターミナルに流す
-  mainWindow.webContents.on('console-message', (_event, _level, message, line, sourceId) => {
-    console.log(`[Renderer] ${message} (${sourceId}:${line})`);
-  });
+  // レンダラーのコンソール出力をターミナルへ流すのは開発時だけ。
+  //
+  // ★ 配布版では転送しない。メインプロセスの標準出力は OS のセッションログ
+  //   (Linux の ~/.xsession-errors など) に平文で残ることがあり、経路や ID を含む
+  //   ログが押収時の痕跡になる。
+  if (VITE_DEV_SERVER_URL) {
+    mainWindow.webContents.on('console-message', (_event, _level, message, line, sourceId) => {
+      console.log(`[Renderer] ${message} (${sourceId}:${line})`);
+    });
+  }
 
   mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription) => {
     console.error(`[Load Error] ${errorCode}: ${errorDescription}`);

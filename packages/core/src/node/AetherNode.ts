@@ -181,7 +181,7 @@ export class AetherNode {
     const nodeIdentity = config.identityMode === 'persistent'
       ? await NodeIdentityStore.loadOrMine(db, passphrase)
       : await NodeIdentityStore.mineEphemeral(db);
-    log.info(() => `Node identity initialized: ${nodeIdentity.peerId} pos=${nodeIdentity.position}`);
+    log.debug(() => `Node identity initialized (${config.identityMode ?? 'ephemeral'})`);
 
     // 3. エンジン群
     const cryptoEngine = new CryptoEngine();
@@ -307,7 +307,7 @@ export class AetherNode {
     } catch (err) {
       log.warn('Could not connect to signaling tracker on start, continuing in local/p2p mode', err);
     }
-    log.info(() => `AetherNode started. PeerId: ${this.nodeIdentity.peerId}`);
+    log.info(() => 'AetherNode started');
   }
 
   /**
