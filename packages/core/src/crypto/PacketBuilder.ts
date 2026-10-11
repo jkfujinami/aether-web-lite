@@ -215,15 +215,51 @@ export class PacketBuilder {
       return null;
     }
 
+    // 5. トリップ署名の検証。
+    //
+    // ★ 旧実装は trip_sig を一切検証せず、trip_pubkey をそのまま返していた。
+    //   板の鍵を持つ誰もが他人の公開トリップ鍵を名乗って投稿でき、
+    //   UI 上はその人物の投稿として表示された (トリップのなりすまし)。
+    //   トリップが付いているのに検証できないパケットは丸ごと捨てる
+    //   (トリップを剥がして受理すると「名無しとして通る」別の混乱を生む)。
+    const tripPubkey = verifyTripSignature(innerPayload, signedData);
+    if (tripPubkey === false) {
+      log.warn(`Trip signature verification failed for packet: ${packet.packet_id}`);
+      return null;
+    }
+
     return {
       ...originalPostDataObj,
       post_type: encPayload.post_type,
       session_pubkey: innerPayload.session_pubkey,
-      trip_pubkey: innerPayload.trip_pubkey,
+      trip_pubkey: tripPubkey,
       // -- DAG fields --
       parents: innerPayload.parents,
       cumulative_pow: innerPayload.cumulative_pow,
       thread_root: innerPayload.thread_root
     };
+  }
+}
+
+/**
+ * トリップ署名を検証する。
+ *
+ * @returns トリップ無しなら null、検証に成功すれば公開鍵、失敗なら false
+ */
+function verifyTripSignature(innerPayload: any, signedData: Uint8Array): Uint8Array | null | false {
+  const hasPubkey = innerPayload.trip_pubkey !== undefined && innerPayload.trip_pubkey !== null;
+  const hasSig = innerPayload.trip_sig !== undefined && innerPayload.trip_sig !== null;
+  if (!hasPubkey && !hasSig) return null;
+  if (!hasPubkey || !hasSig) return false;
+
+  const pubkey = toBytes(innerPayload.trip_pubkey);
+  const sig = toBytes(innerPayload.trip_sig);
+  if (pubkey.length !== sodium.crypto_sign_PUBLICKEYBYTES) return false;
+  if (sig.length !== sodium.crypto_sign_BYTES) return false;
+
+  try {
+    return sodium.crypto_sign_verify_detached(sig, signedData, pubkey) ? pubkey : false;
+  } catch {
+    return false;
   }
 }
