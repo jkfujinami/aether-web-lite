@@ -158,3 +158,10 @@ aether-cache/node_identity.key
 
 # Bundled maintainer CLI (packages/core)
 dist-cli/
+
+# Electron のビルド出力
+apps/desktop/dist-electron/
+
+# Playwright
+web/test-results/
+web/playwright-report/

@@ -1,3 +1,0 @@
-cargo:rustc-link-lib=static=ring-core
-cargo:rustc-link-lib=static=ring-test
-cargo:rustc-link-search=native=/Users/fujinami/github/aether-web-lite/aether-cache/target/debug/build/ring-b3c78447c5baf7a0/out
