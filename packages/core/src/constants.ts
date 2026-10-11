@@ -6,6 +6,12 @@ export const RING_MESH = {
   LONG_RANGE_LINKS: 12,
   /** 1ノードの最大WebRTC接続数 (§2.45) */
   MAX_DEGREE: 16,
+  /**
+   * 自分で選んで張る (outbound) 接続の目標数。
+   * これに満たない間は、次数が上限に達していても outbound を張りに行き、
+   * inbound の枠と入れ替える (inbound だけで隣人を埋め尽くされないように)。
+   */
+  OUTBOUND_TARGET: 8,
 
   // ── リング位置 ──
   /** 円環の範囲 [0, 1) */

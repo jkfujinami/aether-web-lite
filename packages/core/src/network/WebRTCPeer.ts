@@ -3,6 +3,7 @@ import { RingPosition } from './RingPosition';
 import { ChunkedSender } from './stream/ChunkedSender';
 import { ChunkedReceiver } from './stream/ChunkedReceiver';
 import { createLogger } from '../common/Logger';
+import { netGroupOf } from './NetGroup';
 
 const log = createLogger('net.webrtc');
 
@@ -35,6 +36,16 @@ export class WebRTCPeer implements IPeerConnection {
   private _verified = false;
   private _pubkey: Uint8Array | null = null;
   private _powCounter: number | null = null;
+  private _verifiedAt: number | null = null;
+  private _netGroup: string | null = null;
+
+  /**
+   * 接続の向き。outbound = 自分で選んで張りに行った接続、inbound = 相手から来た接続。
+   *
+   * Sybil は inbound なら好きなだけ送り込めるが、自分が選ぶ outbound の相手は
+   * 自由にできない。次数の調整と Guard 選びでこの違いを使う。
+   */
+  public readonly direction: 'outbound' | 'inbound';
   /** 相手に送ったチャレンジ。JOIN の署名検証に使う */
   private _challenge: Uint8Array | null = null;
   private opts: WebRTCPeerOptions;
@@ -57,6 +68,46 @@ export class WebRTCPeer implements IPeerConnection {
     return this._pubkey;
   }
 
+  /** 本人確認 (JOIN) が済んだ時刻。この接続をどれだけ長く観測しているかの基準 */
+  public get verifiedAt(): number | null {
+    return this._verifiedAt;
+  }
+
+  /** ネットワーク上の出所の区分 ({@link netGroupOf})。未取得なら null */
+  public get netGroup(): string | null {
+    return this._netGroup;
+  }
+
+  /**
+   * 確定した経路 (selected candidate pair) から相手の出所の区分を求める。
+   * IP そのものは保持しない。取れなければ 'unknown'。
+   */
+  public async resolveNetGroup(): Promise<string> {
+    if (this._netGroup) return this._netGroup;
+    let group = 'unknown';
+    try {
+      const stats: any = await this.pc.getStats();
+      const all = new Map<string, any>();
+      stats.forEach((s: any) => all.set(s.id, s));
+
+      let pair: any = null;
+      for (const s of all.values()) {
+        if (s.type === 'transport' && s.selectedCandidatePairId) pair = all.get(s.selectedCandidatePairId);
+      }
+      if (!pair) {
+        for (const s of all.values()) {
+          if (s.type === 'candidate-pair' && s.state === 'succeeded' && (s.nominated || s.selected)) pair = s;
+        }
+      }
+      const remote = pair ? all.get(pair.remoteCandidateId) : null;
+      if (remote) group = netGroupOf(remote.address ?? remote.ip, remote.candidateType);
+    } catch {
+      // getStats が使えない環境では 'unknown' のまま
+    }
+    this._netGroup = group;
+    return group;
+  }
+
   /** 検証済みの NodeId PoW の解 (PEX で隣人の claim を紹介するために保持する) */
   public get powCounter(): number | null {
     return this._powCounter;
@@ -69,6 +120,7 @@ export class WebRTCPeer implements IPeerConnection {
   constructor(opts: WebRTCPeerOptions) {
     this.opts = opts;
     this.peerId = opts.remoteId;
+    this.direction = opts.initiator ? 'outbound' : 'inbound';
     // 座標は peerId の純粋関数。相手からもらった数値は一切使わない。
     this.position = RingPosition.forPeer(opts.remoteId);
 
@@ -236,6 +288,7 @@ export class WebRTCPeer implements IPeerConnection {
   /** Bound Identity の検証に成功した印を付ける */
   public markVerified(pubkey?: Uint8Array, powCounter?: number) {
     this._verified = true;
+    this._verifiedAt = Date.now();
     if (pubkey) this._pubkey = pubkey;
     if (typeof powCounter === 'number') this._powCounter = powCounter;
   }

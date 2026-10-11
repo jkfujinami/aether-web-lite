@@ -114,6 +114,10 @@ export interface IPeerManager {
   disconnect(peerId: PeerId): void;
   // 高レベルバイナリ送信 (Wire V2)
   sendMessage(peerId: PeerId, type: number, payload: any): void;
+  /** outbound (自分で選んで張った) 接続の数 */
+  readonly outboundCount?: number;
+  /** 次数が上限を超えていれば、Sybil 対策の優先順位に従って調整する */
+  rebalance?(newcomerId?: PeerId): void;
   on(event: string, handler: (...args: any[]) => void): void;
   off(event: string, handler: (...args: any[]) => void): void;
 }

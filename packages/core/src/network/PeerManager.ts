@@ -8,6 +8,7 @@ import type {
 } from '../types';
 import { WebRTCPeer } from './WebRTCPeer';
 import { RingPosition } from './RingPosition';
+import { groupCap } from './NetGroup';
 import { RING_MESH } from '../constants';
 import { WireCodec } from './wire/WireCodec';
 import { WireType } from './wire/WireTypes';
@@ -284,34 +285,83 @@ export class PeerManager implements IPeerManager {
     );
     this.emit('peer:verified', peer);
 
-    // 次数の調整は「検証が済んだ後」にだけ行う (未認証の offer で既存リンクを追い出させない)
-    this.enforceDegree(peerId);
+    // 次数の調整は「検証が済んだ後」にだけ行う (未認証の offer で既存リンクを追い出させない)。
+    // 出所の区分 (getStats) を求めてから行う。取れなくても 'unknown' として進む。
+    void peer.resolveNetGroup().then((group) => {
+      this.noteGroup(group);
+      this.rebalance(peerId);
+    });
   }
 
   /**
-   * 検証済みピアが MAX_DEGREE を超えたときの調整。
+   * 検証済みピアが MAX_DEGREE を超えたときの調整。超えている間は 1 人ずつ外す。
    *
-   * 確立済みの接続を優先して守る。新顔が自分のローカルリンク (最近接 LOCAL_LINKS 人)
-   * に入る場合だけ、最も遠いロングレンジリンクを譲る。それ以外は新顔の方を切る。
-   * こうしないと、PoW を払った Sybil が次々に接続するだけで正規のリンクが入れ替わる。
+   * 外す順番 (Sybil 対策。どれも「拒否」ではなく「枠が足りないときの優先順位」):
+   *   1. outbound (自分で選んだ相手) は外さない。inbound の新顔が何人来ても、
+   *      自分で選んだ接続は押し出されない (A1)
+   *   2. ローカルリンク (リング上の最近接 LOCAL_LINKS 人) は外さない
+   *   3. 残りの inbound のうち、出所の区分が多すぎるものから (A2)
+   *   4. 同じなら、観測期間が短い (新しい) ものから (A3)
+   *   5. 同じなら、リング上で遠いものから
+   *
+   * 網が小さいうちは次数が上限に届かないので、この調整自体が起きない
+   * (初期成長を妨げない)。
    */
-  private enforceDegree(newcomerId: PeerId): void {
-    const verified = this.verifiedPeers;
-    if (verified.length <= RING_MESH.MAX_DEGREE) return;
-
-    const byDistance = [...verified].sort(
-      (a, b) => RingPosition.distance(this.myPosition, a.position) - RingPosition.distance(this.myPosition, b.position),
-    );
-    const isLocal = byDistance.slice(0, RING_MESH.LOCAL_LINKS).some(p => p.peerId === newcomerId);
-    if (!isLocal) {
-      this.disconnect(newcomerId);
-      return;
-    }
-    const victim = byDistance.reverse().find(p => p.peerId !== newcomerId);
-    if (victim) {
-      this.coolDowns.set(victim.peerId, Date.now());
+  public rebalance(newcomerId?: PeerId): void {
+    for (let guard = 0; guard < RING_MESH.MAX_DEGREE * 2; guard++) {
+      const verified = this.verifiedPeers;
+      if (verified.length <= RING_MESH.MAX_DEGREE) return;
+      const victim = this.pickEvictionVictim(verified, newcomerId);
+      if (!victim) return;
+      if (victim.peerId !== newcomerId) this.coolDowns.set(victim.peerId, Date.now());
+      log.debug(() => `rebalance: dropping ${victim.direction} ${victim.peerId.substring(0, 8)}`);
       this.disconnect(victim.peerId);
     }
+  }
+
+  private pickEvictionVictim(verified: WebRTCPeer[], newcomerId?: PeerId): WebRTCPeer | null {
+    const distance = (p: WebRTCPeer) => RingPosition.distance(this.myPosition, p.position);
+    const byDistance = [...verified].sort((a, b) => distance(a) - distance(b));
+    const local = new Set(byDistance.slice(0, RING_MESH.LOCAL_LINKS).map(p => p.peerId));
+
+    let pool = verified.filter(p => p.direction === 'inbound' && !local.has(p.peerId));
+    if (pool.length === 0) {
+      // 外せる inbound が無い: 枠を超えた新顔 (outbound) の方を諦める
+      const newcomer = newcomerId ? verified.find(p => p.peerId === newcomerId) : undefined;
+      if (newcomer && !local.has(newcomer.peerId)) return newcomer;
+      pool = verified.filter(p => !local.has(p.peerId) && p.peerId !== newcomerId);
+      if (pool.length === 0) return null;
+    }
+
+    const counts = new Map<string, number>();
+    for (const p of verified) {
+      const g = p.netGroup ?? 'unknown';
+      counts.set(g, (counts.get(g) ?? 0) + 1);
+    }
+    const cap = groupCap(RING_MESH.MAX_DEGREE, this.seenGroups.size);
+    const overflow = (p: WebRTCPeer) => (counts.get(p.netGroup ?? 'unknown') ?? 0) - cap;
+
+    pool.sort((a, b) =>
+      overflow(b) - overflow(a) ||
+      (b.verifiedAt ?? 0) - (a.verifiedAt ?? 0) ||
+      distance(b) - distance(a),
+    );
+    return pool[0];
+  }
+
+  /** このセッションで見えた出所の区分。区分の上限 ({@link groupCap}) の母数になる */
+  private seenGroups = new Set<string>();
+
+  private noteGroup(group: string): void {
+    if (this.seenGroups.size >= 1024 && !this.seenGroups.has(group)) return;
+    this.seenGroups.add(group);
+  }
+
+  /** outbound (自分で選んで張った) 接続の数。接続中のものも含む */
+  public get outboundCount(): number {
+    let n = 0;
+    for (const p of this._peers.values()) if (p.direction === 'outbound') n++;
+    return n;
   }
 
   /** ハンドシェイクが済んでいない接続 (接続中 + 接続済み未検証) の数 */
@@ -479,7 +529,7 @@ export class PeerManager implements IPeerManager {
         // ★ 未認証の offer で既存リンクを追い出さない。
         //   旧実装は MAX_DEGREE に達していると offer 1 通ごとに正規の
         //   ロングレンジリンクを切り、30 秒のクールダウンに入れていた。
-        //   次数の調整は検証後に enforceDegree() が行う。
+        //   次数の調整は検証後に rebalance() が行う。
         peer = this.connect(senderId, false, viaPeerId);
 
         if (!peer) return;

@@ -84,7 +84,10 @@ export class PEXHandler {
 
       const existing = this.peerManager.peers.get(id);
       if (existing && (existing.isConnected || (existing as any).isConnecting)) continue;
-      if (this.peerManager.degree >= RING_MESH.MAX_DEGREE) break;
+      // 次数に空きがあるか、自分で選んだ (outbound) 接続が目標に満たない間は張りに行く。
+      // 後者は枠が埋まっていても行う (検証後に inbound と入れ替わる)。
+      const outbound = this.peerManager.outboundCount ?? 0;
+      if (this.peerManager.degree >= RING_MESH.MAX_DEGREE && outbound >= RING_MESH.OUTBOUND_TARGET) break;
 
       // position は渡さない。PeerManager が peerId から導出する。
       this.peerManager.connect(id, true, senderPeerId);
