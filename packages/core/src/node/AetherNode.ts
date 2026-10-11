@@ -165,6 +165,17 @@ export class AetherNode {
     const db = config.db || new IndexedDBStore();
     await db.init();
     await db.unlock(passphrase, config.vaultParams);
+    try {
+      return await AetherNode.wire(db, passphrase, config);
+    } catch (err) {
+      // 起動が途中で失敗したら鍵をメモリに残さない。残すと、次の試行が
+      // パスワードを照合せずに「解除済み」として通ってしまう。
+      db.lock();
+      throw err;
+    }
+  }
+
+  private static async wire(db: IndexedDBStore, passphrase: string, config: AetherNodeConfig): Promise<AetherNode> {
 
     // 2. Bound Identity
     const nodeIdentity = config.identityMode === 'persistent'
