@@ -4,7 +4,7 @@ import { KeyManager, type BoardRecord } from '@aether/core';
 import { DEFAULT_BOARD_ID, newBoardId, parseShareCode } from '@/lib/boardKeys';
 
 export function AppHeader() {
-  const { node, identity, db, panicWipe } = useP2P();
+  const { node, identity, db, panicWipe, lock } = useP2P();
   const [peerCount, setPeerCount] = useState(0);
   const [boards, setBoards] = useState<BoardRecord[]>([]);
   const [showImport, setShowImport] = useState(false);
@@ -123,6 +123,15 @@ export function AppHeader() {
             Trip: <span style={{ color: '#d1a65d' }}>{identity.tripDisplay || '名無し'}</span>
           </div>
         )}
+
+        <button
+          className="btn"
+          onClick={() => { void lock(); }}
+          title="通信を止め、パスワード画面に戻ります (データは消えません)"
+          style={{ padding: '3px 10px', fontSize: '11px' }}
+        >
+          ロック
+        </button>
 
         <button
           className="btn"

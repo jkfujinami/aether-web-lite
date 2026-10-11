@@ -148,6 +148,7 @@ function setupHarness() {
       unlock: async () => {},
       resetAll: async () => {},
       panicWipe: async () => {},
+      lock: async () => {},
     },
     dispatcher,
     hintRouter,

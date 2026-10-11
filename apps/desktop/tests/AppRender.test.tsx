@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import React from 'react';
 import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react';
 import sodium from 'libsodium-wrappers-sumo';
 
 import { AppHeader } from '../src/components/AppHeader';
@@ -25,6 +25,7 @@ function readyContext(): any {
     unlock: async () => {},
     resetAll: async () => {},
     panicWipe: async () => {},
+    lock: async () => {},
   };
 }
 import { KeyManager, Identity } from '@aether/core';
@@ -79,6 +80,19 @@ describe('Desktop UI Rendering & Workflows (AETHER Specification)', () => {
         </P2PProvider>,
       );
       expect((screen.getByText('+ 秘密の板を作る') as HTMLButtonElement).disabled).toBe(true);
+    });
+
+    it('ロックボタンで lock が呼ばれる (データは消さない)', async () => {
+      const lock = vi.fn().mockResolvedValue(undefined);
+      const panicWipe = vi.fn();
+      render(
+        <P2PContextForTest.Provider value={{ ...readyContext(), lock, panicWipe }}>
+          <AppHeader />
+        </P2PContextForTest.Provider>,
+      );
+      fireEvent.click(screen.getByText('ロック'));
+      await waitFor(() => expect(lock).toHaveBeenCalledTimes(1));
+      expect(panicWipe).not.toHaveBeenCalled();
     });
 
     it('緊急消去は 2 回押さないと実行されない', async () => {
@@ -198,6 +212,23 @@ describe('Desktop UI Rendering & Workflows (AETHER Specification)', () => {
         expect(screen.getByText('パスワードを設定')).toBeTruthy();
       });
       expect(screen.queryByText('板: vip')).toBeNull();
+    });
+
+    it('トレイからのロック命令でパスワード画面に戻る', async () => {
+      let send: ((c: string) => void) | null = null;
+      (window as any).electronAPI = {
+        onCommand: (cb: (c: string) => void) => { send = cb; return () => { send = null; }; },
+      };
+      try {
+        render(<App />);
+        await waitFor(() => screen.getByText('パスワードを設定'));
+        expect(send).not.toBeNull();
+
+        await act(async () => { send!('lock'); });
+        await waitFor(() => expect(screen.getByText('ロックを解除')).toBeTruthy());
+      } finally {
+        delete (window as any).electronAPI;
+      }
     });
 
     it('初回設定では短いパスワードと確認の不一致を弾く', async () => {

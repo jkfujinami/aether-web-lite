@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, Tray, nativeImage, ipcMain } from 'electron';
+import { app, BrowserWindow, Menu, Tray, nativeImage, dialog, Notification } from 'electron';
 import path from 'node:path';
 
 const APP_ROOT = app.getAppPath();
@@ -8,6 +8,29 @@ const VITE_DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
+let hideNoticeShown = false;
+
+/** レンダラーへ操作を依頼する (preload の onCommand で受ける) */
+function sendCommand(command: 'lock' | 'panic-wipe') {
+  mainWindow?.webContents.send('aether:command', command);
+}
+
+/**
+ * 緊急消去。誤操作を防ぐため、既定の選択を「キャンセル」にした確認を挟む。
+ * 通知や確認文に投稿内容などは含めない。
+ */
+async function confirmPanicWipe() {
+  const { response } = await dialog.showMessageBox({
+    type: 'warning',
+    buttons: ['キャンセル', '全消去する'],
+    defaultId: 0,
+    cancelId: 0,
+    title: '緊急消去',
+    message: 'この端末の AETHER のデータをすべて消去します。',
+    detail: '通信を止め、データを読めなくしてから削除します。元に戻せません。',
+  });
+  if (response === 1) sendCommand('panic-wipe');
+}
 
 function createTrayIcon(): Electron.NativeImage {
   const size = 16;
@@ -39,6 +62,15 @@ function createTray() {
     {
       label: 'キャッシュノード: 稼働中',
       enabled: false,
+    },
+    { type: 'separator' },
+    {
+      label: 'ロック (通信を止めてパスワード画面へ)',
+      click: () => sendCommand('lock'),
+    },
+    {
+      label: '緊急消去...',
+      click: () => { void confirmPanicWipe(); },
     },
     { type: 'separator' },
     {
@@ -94,6 +126,17 @@ function createWindow() {
     if (!isQuitting) {
       event.preventDefault();
       mainWindow?.hide();
+      // ★ 閉じてもノードは動き続ける (cover traffic を流し続けることで、
+      //   オンラインの時間帯と投稿の相関を弱める)。終了したと誤解されないよう
+      //   最初の 1 回だけ知らせる。文面には投稿内容などを含めない。
+      if (!hideNoticeShown && Notification.isSupported()) {
+        hideNoticeShown = true;
+        new Notification({
+          title: 'AETHER',
+          body: 'バックグラウンドで動作しています。終了はトレイのメニューから行えます。',
+          silent: true,
+        }).show();
+      }
     }
   });
 

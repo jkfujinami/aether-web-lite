@@ -44,6 +44,8 @@ interface P2PContextType {
   resetAll: () => Promise<void>;
   /** 緊急消去: 通信を止め、全データを即座に読めなくしてから消す */
   panicWipe: () => Promise<void>;
+  /** ロック: データは消さずに通信を止め、メモリ上の鍵を消してパスワード画面に戻る */
+  lock: () => Promise<void>;
 }
 
 const noop = async () => {};
@@ -61,6 +63,7 @@ export const P2PContext = createContext<P2PContextType>({
   unlock: noop,
   resetAll: noop,
   panicWipe: noop,
+  lock: noop,
 });
 
 export const P2PContextForTest = P2PContext;
@@ -157,6 +160,25 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
     setLockState('setup');
   }, []);
 
+  const lock = useCallback(async () => {
+    const current = nodeRef.current;
+    nodeRef.current = null;
+    setNode(null);
+    await current?.stop().catch(() => {}); // stop() はメモリ上のデータ鍵も消す
+    storeRef.current?.lock();
+    setLockState('locked');
+  }, []);
+
+  // トレイ (Electron のメインプロセス) からのロック / 緊急消去
+  useEffect(() => {
+    const api = (typeof window !== 'undefined' ? (window as any).electronAPI : undefined);
+    if (!api?.onCommand) return;
+    return api.onCommand((command: 'lock' | 'panic-wipe') => {
+      if (command === 'lock') void lock();
+      else void panicWipe();
+    });
+  }, [lock, panicWipe]);
+
   return (
     <P2PContext.Provider
       value={{
@@ -172,6 +194,7 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
         unlock,
         resetAll,
         panicWipe,
+        lock,
       }}
     >
       {children}
