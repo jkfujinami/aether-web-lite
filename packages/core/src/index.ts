@@ -110,3 +110,20 @@ export { SyncProtocol } from './network/mailbox/SyncProtocol';
 export { SecretVault, VAULT_PARAMS, VAULT_PARAMS_FAST, type SealedSecret, type VaultParams } from './storage/SecretVault';
 export { IndexedDBStore, type MailboxEntry, type PostEntry, type BoardRecord } from './storage/IndexedDBStore';
 export { DataVault, WrongPassphraseError } from './storage/DataVault';
+
+// Trusted guards
+export {
+  createGuardString,
+  parseGuardString,
+  signGuardList,
+  verifyGuardList,
+  maintainerKeyId,
+  keyFingerprint,
+  GUARD_STRING_PREFIX,
+  GUARD_LIST_PREFIX,
+  TRUSTED_GUARD_LIMITS,
+  type MaintainerKeySet,
+  type TrustedGuard,
+  type GuardListContent,
+  type GuardListResult,
+} from './trust/TrustedGuards';
