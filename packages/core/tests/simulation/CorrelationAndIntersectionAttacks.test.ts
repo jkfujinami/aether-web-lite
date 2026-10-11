@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import sodium from 'libsodium-wrappers-sumo';
 import { RingPosition } from '../../src/network/RingPosition';
 import { RING_MESH } from '../../src/constants';
-import { OnionRouter, type OnionHop } from '../../src/crypto/OnionRouter';
+import { OnionRouter, SEALED_EXIT_LAYER_SIZE, type OnionHop } from '../../src/crypto/OnionRouter';
 import { PacketBuilder } from '../../src/crypto/PacketBuilder';
 import { derivePacketId, verifyPow } from '../../src/crypto/PowPolicy';
 import type { GossipPacket } from '../../src/types';
@@ -136,21 +136,24 @@ describe('AETHER Web Lite 総合セキュリティ監査・相関/交差攻撃�
       { peerId: node3.id, pubkey: node3.pubkey },
     ];
 
-    // 現行のオニオン回路は、ホップ数にかかわらず全セルを CELL_SIZE の固定長にする
-    // (可変長モードは存在しない)。各段で剥いた後のセルも同じ長さであることを、
-    // 出口層まで実際に剥いて確かめる。
+    // 現行のオニオン回路は、ホップ数にかかわらず外側のセルを CELL_SIZE の固定長にする
+    // (可変長モードは存在しない)。
     const exit = { type: 'exit_fluff' as const, zoneId: 0, packet };
     const outer = [hops3, hops2, hops1].map((h) => OnionRouter.wrapCircuit(exit, h).length);
 
+    // 実運用の回路 (Guard → 出口の 2 段) を、中継と同じ手順で剥いていく。
+    // 中継は剥いた中身 (封印された出口層。長さは常に SEALED_EXIT_LAYER_SIZE) を
+    // CELL_SIZE に詰め直して送る (OnionCircuit.relay)。網上に見えるのは常に同じ長さ。
     const layers: number[] = [];
-    let cell = OnionRouter.wrapCircuit(exit, hops3);
-    for (const node of [node1, node2, node3]) {
-      layers.push(cell.length);
-      const peeled: any = OnionRouter.unwrap(cell, node.pubkey, node.privkey);
-      expect(peeled).not.toBeNull();
-      if (peeled.type !== 'relay') break;
-      cell = peeled.innerOnion;
-    }
+    const guardCell = OnionRouter.wrapCircuit(exit, hops2);
+    layers.push(guardCell.length);
+    const peeled: any = OnionRouter.unwrap(guardCell, node2.pubkey, node2.privkey);
+    expect(peeled?.type).toBe('relay');
+    expect(peeled.innerOnion.length).toBe(SEALED_EXIT_LAYER_SIZE);
+    const exitCell = OnionRouter.padCell(peeled.innerOnion);
+    layers.push(exitCell.length);
+    const atExit: any = OnionRouter.unwrap(exitCell, node3.pubkey, node3.privkey);
+    expect(atExit?.type).toBe('exit_fluff');
 
     console.log('\n================================================================================');
     console.log('🔬 監査1: パケットサイズ指紋解析 (Size Fingerprinting Analysis)');
