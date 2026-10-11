@@ -3,11 +3,19 @@
   "version": "1.0.0",
   "description": "AETHER P2P Anonymity Hardened Core Protocol Library",
   "main": "dist/index.js",
-  "module": "dist/index.mjs",
+  "module": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
+    "test:sim": "vitest run tests/simulation",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
   },

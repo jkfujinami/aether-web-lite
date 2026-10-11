@@ -31,6 +31,11 @@ export enum WireType {
    * 発信元を隣人から隠すために存在する (Gossip の STEM と同じ役割)。
    */
   HINT_STEM     = 0x43,
+  /**
+   * 多段オニオン暗号化された Stem パケット (Onion Stem Routing)。
+   * 中継ノードは平文パケットIDも内容も読めず、全ホップ共謀時以外特定不能。
+   */
+  ONION_STEM    = 0x44,
 
   // DHT Mailbox (0x5x)
   DHT_PUT       = 0x50,

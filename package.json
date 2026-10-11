@@ -4,14 +4,20 @@
   "private": true,
   "workspaces": [
     "packages/*",
+    "apps/*",
     "web",
     "server"
   ],
   "scripts": {
     "dev": "npm --workspace=web run dev",
-    "test": "npm --workspace=web test",
-    "test:all": "npm test --workspaces --if-present",
-    "build:core": "npm --workspace=@aether/core run build"
+    "dev:desktop": "npm --workspace=@aether/desktop run dev",
+    "test": "npm --workspace=@aether/core test && npm --workspace=web test && npm --workspace=@aether/desktop test",
+    "test:all": "npm test",
+    "test:core": "npm --workspace=@aether/core test",
+    "test:web": "npm --workspace=web test",
+    "test:desktop": "npm --workspace=@aether/desktop test",
+    "build:core": "npm --workspace=@aether/core run build",
+    "build:desktop": "npm --workspace=@aether/desktop run build"
   },
   "devDependencies": {
     "jsdom": "^29.1.1"

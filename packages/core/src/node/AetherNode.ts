@@ -24,13 +24,14 @@ import { RingMaintainer } from '../network/RingMaintainer';
 import { Heartbeat } from '../network/Heartbeat';
 import { BoardOrchestrator } from '../logic/BoardOrchestrator';
 import { ThreadOrchestrator } from '../logic/ThreadOrchestrator';
-import type { IPoWEngine, IKeyManager } from '../types';
+import type { IPoWEngine, IKeyManager, ISignalingClient } from '../types';
 import { createLogger } from '../common/Logger';
 
 const log = createLogger('node.facade');
 
 export interface AetherNodeConfig {
   signalingUrl?: string;
+  signalingClient?: ISignalingClient;
   turnstileToken?: string;
   releaseMode?: ReleaseMode;
   db?: IndexedDBStore;
@@ -53,7 +54,7 @@ export class AetherNode {
   public readonly powEngine: IPoWEngine;
 
   public readonly dispatcher: MessageDispatcher;
-  public readonly signaling: SignalingClient;
+  public readonly signaling: ISignalingClient;
   public readonly rateLimiter: RateLimiter;
   public readonly peerManager: PeerManager;
   public readonly zoneManager: ZoneManager;
@@ -82,7 +83,7 @@ export class AetherNode {
       keyManager: IKeyManager;
       powEngine: IPoWEngine;
       dispatcher: MessageDispatcher;
-      signaling: SignalingClient;
+      signaling: ISignalingClient;
       rateLimiter: RateLimiter;
       peerManager: PeerManager;
       zoneManager: ZoneManager;
@@ -154,7 +155,7 @@ export class AetherNode {
 
     // 4. 通信・ルーティング
     const dispatcher = new MessageDispatcher();
-    const signaling = new SignalingClient(config.signalingUrl);
+    const signaling = config.signalingClient || new SignalingClient(config.signalingUrl);
     const rateLimiter = new RateLimiter();
     const peerManager = new PeerManager(nodeIdentity, dispatcher, signaling, { rateLimiter });
     const zoneManager = new ZoneManager(peerManager);
@@ -249,7 +250,14 @@ export class AetherNode {
     this.isStarted = true;
 
     this.schrodinger.startReflood();
-    await this.peerManager.start();
+    this.heartbeat.start();
+    this.replicationManager.executeRebalance();
+
+    try {
+      await this.peerManager.start();
+    } catch (err) {
+      log.warn('Could not connect to signaling tracker on start, continuing in local/p2p mode', err);
+    }
     log.info(() => `AetherNode started. PeerId: ${this.nodeIdentity.peerId}`);
   }
 

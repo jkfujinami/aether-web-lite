@@ -1,6 +1,8 @@
 import type { IPeerManager, PeerId, GossipPacket, StemPacket } from '../../types';
 import { WireType } from '../wire/WireTypes';
 import { createLogger } from '../../common/Logger';
+import { OnionRouter, type OnionHop } from '../../crypto/OnionRouter';
+import { Encoding } from '../../common/Encoding';
 
 const log = createLogger('net.dandelion');
 
@@ -41,6 +43,7 @@ export const DANDELION_CONFIG = {
   EPOCH_DURATION: 10 * 60 * 1000,
   ECHO_TIMEOUT: 5000,
   MAX_RETRIES: 2,
+  GUARD_PIN_DURATION: 15 * 60 * 1000,
 };
 
 /** エコー待ちのジッタ幅 (±20%) */
@@ -57,8 +60,10 @@ export const ECHO_TIMEOUT_JITTER = 0.2;
  */
 export function jitteredEchoTimeout(): number {
   const base = DANDELION_CONFIG.ECHO_TIMEOUT;
-  const spread = base * ECHO_TIMEOUT_JITTER;
-  return Math.round(base - spread + Math.random() * spread * 2);
+  const rand = Math.random() || 0.001;
+  const expOffset = -500 * Math.log(rand);
+  const jitter = (Math.random() < 0.5 ? -1 : 1) * Math.min(1500, expOffset);
+  return Math.round(Math.max(3000, Math.min(7500, base + jitter)));
 }
 
 type EchoCallback = () => void;
@@ -66,6 +71,8 @@ type EchoCallback = () => void;
 export class DandelionRouter {
   private stemTarget: PeerId | null = null;
   private stemTargetExpiry: number = 0;
+  private pinnedGuardId: PeerId | null = null;
+  private pinnedGuardExpiry: number = 0;
   private listeners: Map<string, Array<EchoCallback>> = new Map();
   private peerManager: IPeerManager;
 
@@ -74,14 +81,118 @@ export class DandelionRouter {
   }
 
   /**
-   * 自己発信パケットのステム送信開始
+   * 自己発信パケットのステム送信開始 (Onion Stem 優先)
    */
   public async publish(packet: GossipPacket, useDandelion: boolean = true): Promise<boolean> {
+    const peersWithKeys = (this.peerManager as any)?.verifiedPeersWithKeys as OnionHop[] | undefined;
+    if (useDandelion && peersWithKeys && peersWithKeys.length >= 2) {
+      return this.publishOnion(packet, 2);
+    }
+
     return this.publishVia(
       packet.packet_id,
       (target) => this.sendToPeer(target, { type: 'stem', zoneId: packet.zone_id, packet }),
       useDandelion,
     );
+  }
+
+  /**
+   * 多段オニオン暗号化 (Onion Stem Routing) によるパケット発信
+   *
+   * 経路上の全ノードが共謀スパイでない限り、発信元IPとパケットID・内容の紐付けが不可能。
+   */
+  /**
+   * 多段オニオン暗号化 (Onion Stem Routing) によるパケット発信
+   *
+   * 1. Guard Sticky Pinning: 第1ホップをエポック単位で固定し、長期統計的交差攻撃を遮断。
+   * 2. Retransmission Guard Affinity: 出口ドロップ等の再送時も同一 Guard を維持し、Exit のみ交代。
+   * 3. Fresh Ephemeral Re-wrapping: 試行ごとに新しい X25519 鍵で 3800B セルをゼロから再生成。
+   *    ワイヤ上の暗号文はビットレベルで完全な無相関乱数となり、同一 Guard やスパイ網から
+   *    「再送パケット」であること自体を不可視化する。
+   */
+  public async publishOnion(
+    packet: GossipPacket,
+    hopsCount: number = 2,
+    explicitHops?: OnionHop[],
+  ): Promise<boolean> {
+    const directNeighbors = ((this.peerManager as any)?.verifiedPeersWithKeys as OnionHop[]) || [];
+    if (!explicitHops && directNeighbors.length === 0) return false;
+
+    // 第1ホップ (Guard Node) の選定
+    let guardHop: OnionHop;
+    if (explicitHops && explicitHops.length > 0) {
+      guardHop = explicitHops[0];
+    } else {
+      const pinned = this.getPinnedGuard(directNeighbors);
+      if (!pinned) return false;
+      guardHop = pinned;
+    }
+
+    const triedExits = new Set<PeerId>();
+
+    for (let attempt = 0; attempt < DANDELION_CONFIG.MAX_RETRIES; attempt++) {
+      let selectedHops: OnionHop[];
+
+      if (explicitHops && explicitHops.length > 0) {
+        selectedHops = explicitHops;
+      } else {
+        // ★ Retransmission Guard Affinity:
+        // 再送時も Guard は変更しない (Guard が生存している限り同一の隣人を維持)。
+        // Guard が切断された場合のみフォールバック再選定する。
+        if (!this.peerManager.peers.has(guardHop.peerId)) {
+          const freshNeighbors = ((this.peerManager as any)?.verifiedPeersWithKeys as OnionHop[]) || [];
+          const newGuard = this.getPinnedGuard(freshNeighbors);
+          if (!newGuard) return false;
+          guardHop = newGuard;
+        }
+
+        selectedHops = [guardHop];
+
+        // 第2ホップ以降 (Relay / Exit) は、Guard 以外の候補から選定。
+        // 再送時は前回試した Exit と異なるノードを優先して選択する。
+        if (hopsCount > 1) {
+          const exitCandidates = directNeighbors.filter(
+            p => p.peerId !== guardHop.peerId && !triedExits.has(p.peerId)
+          );
+          const pool = exitCandidates.length > 0
+            ? exitCandidates
+            : directNeighbors.filter(p => p.peerId !== guardHop.peerId);
+
+          if (pool.length > 0) {
+            const exitHop = pool[Math.floor(Math.random() * pool.length)];
+            triedExits.add(exitHop.peerId);
+            selectedHops.push(exitHop);
+          }
+        }
+      }
+
+      // ★ Fresh Ephemeral Re-wrapping:
+      // 試行ごとに新しい X25519 エフェメラル暗号化キーでセルをゼロから再ラッピング。
+      // これにより、同一の Guard や同一の Exit を通過したとしても、
+      // ワイヤ上の 3800B セルはビットレベルで完全な新規ランダム値となる。
+      // 外部スパイや Guard ノードはこれが「再送パケット」であること自体を検知できない。
+      const onionBytes = OnionRouter.wrapStem(packet, selectedHops);
+
+      log.trace(() => `onion-stemming attempt ${attempt + 1}/${DANDELION_CONFIG.MAX_RETRIES} for ${packet.packet_id.substring(0, 8)} to guard ${guardHop.peerId.substring(0, 8)} (${selectedHops.length} hops)`);
+
+      const echoPromise = this.waitForEcho(packet.packet_id);
+      this.peerManager.sendMessage(guardHop.peerId, WireType.ONION_STEM, {
+        onionBytes,
+      });
+
+      const echoed = await echoPromise;
+      if (echoed) {
+        log.debug(() => `onion-stem echo confirmed for ${packet.packet_id.substring(0, 8)} (attempt ${attempt + 1})`);
+        return true;
+      }
+
+      log.debug(() => `onion-stem echo timeout for ${packet.packet_id.substring(0, 8)} (attempt ${attempt + 1}), retrying via fresh circuit`);
+      // ★ 誣告攻撃 (Framing Attack) の遮断:
+      // 多段オニオン暗号化経路では途中の Exit が故意破棄した場合でも Guard の過失に見えるため、
+      // Guard にペナルティを課さない。
+    }
+
+    return false;
   }
 
   /**
@@ -136,6 +247,10 @@ export class DandelionRouter {
       }
 
       log.debug(() => `echo timeout for ${id.substring(0, 8)}, retrying`);
+      // Stem委託先がパケットをドロップした疑いがあるためペナルティを加算
+      if ((this.peerManager as any)?.misbehavior?.recordViolation) {
+        (this.peerManager as any).misbehavior.recordViolation(target, 25, 'Stem packet dropped (echo timeout)');
+      }
       this.resetTarget();
     }
 
@@ -255,17 +370,55 @@ export class DandelionRouter {
     return this.stemTarget;
   }
 
+  /** テストまたは特定環境向けのエコータイムアウト上書き (ms) */
+  public echoTimeoutMs?: number;
+
   private resetTarget() {
     this.stemTarget = null;
   }
 
+  /**
+   * Guard Sticky Pinning:
+   * 直結隣人から第1ホップ (Guard) を選定し、エポック期間 (または切断されるまで) 固定する。
+   * これにより、同一ノードから連続投稿した際の Guard 接触頻度の偏りによる
+   * 長期統計的交差攻撃 (Statistical Disclosure / Intersection Attack) を防護する。
+   */
+  public getPinnedGuard(candidates: OnionHop[]): OnionHop | null {
+    const now = Date.now();
+    const isLive =
+      this.pinnedGuardId !== null &&
+      now < this.pinnedGuardExpiry &&
+      this.peerManager.peers.has(this.pinnedGuardId) &&
+      candidates.some(c => c.peerId === this.pinnedGuardId);
+
+    if (isLive) {
+      return candidates.find(c => c.peerId === this.pinnedGuardId)!;
+    }
+
+    if (candidates.length === 0) return null;
+    const selected = candidates[Math.floor(Math.random() * candidates.length)];
+    this.pinnedGuardId = selected.peerId;
+    this.pinnedGuardExpiry = now + DANDELION_CONFIG.GUARD_PIN_DURATION;
+    return selected;
+  }
+
+  public getPinnedGuardId(): PeerId | null {
+    return this.pinnedGuardId;
+  }
+
+  public resetPinnedGuard(): void {
+    this.pinnedGuardId = null;
+    this.pinnedGuardExpiry = 0;
+  }
+
   private async waitForEcho(packetId: string): Promise<boolean> {
     const key = `echo:${packetId}`;
+    const timeoutDuration = this.echoTimeoutMs ?? jitteredEchoTimeout();
     return new Promise((resolve) => {
       const timeout = setTimeout(() => {
         this.listeners.delete(key);
         resolve(false);
-      }, jitteredEchoTimeout());
+      }, timeoutDuration);
 
       const callback = () => {
         clearTimeout(timeout);

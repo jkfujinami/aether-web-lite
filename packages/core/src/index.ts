@@ -22,6 +22,7 @@ export {
 } from './common/Logger';
 
 // ── Crypto & Identity ──
+export { default as sodium, sodiumReady } from './crypto/sodium';
 export { CryptoEngine } from './crypto/CryptoEngine';
 export { Identity } from './crypto/Identity';
 export { KeyManager } from './crypto/KeyManager';
@@ -61,11 +62,13 @@ export { MessageDispatcher } from './network/MessageDispatcher';
 export { ZoneManager } from './network/ZoneManager';
 export { ZoneGossipRouter } from './network/gossip/ZoneGossipRouter';
 export { DandelionRouter, DANDELION_CONFIG } from './network/gossip/DandelionRouter';
+export { OnionRouter, type OnionHop, type OnionPayload } from './crypto/OnionRouter';
 export { SeenCache } from './network/gossip/SeenCache';
 export { PEXHandler } from './network/PEXHandler';
 export { Heartbeat } from './network/Heartbeat';
 export { RingMaintainer } from './network/RingMaintainer';
 export { RateLimiter } from './network/RateLimiter';
+export { PeerMisbehaviorManager, ViolationType } from './network/PeerMisbehaviorManager';
 export { PacketValidator } from './network/gossip/PacketValidator';
 
 // ── Mailbox & Schrödinger Hint System ──
@@ -96,6 +99,10 @@ export {
 // ── Logic & Orchestration ──
 export { BoardOrchestrator } from './logic/BoardOrchestrator';
 export { ThreadOrchestrator } from './logic/ThreadOrchestrator';
+export { ThreadRanker } from './logic/ThreadRanker';
+export { ThreadDAGManager, type DAGPost } from './logic/ThreadDAGManager';
+export type { ThreadMeta, BoardStatus, ThreadStatus } from './logic/types';
+export { BOARD_META_THREAD_ID } from './logic/types';
 export { SyncProtocol } from './network/mailbox/SyncProtocol';
 
 // ── Storage ──

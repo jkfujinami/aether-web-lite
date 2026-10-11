@@ -126,6 +126,7 @@ export interface IMessageDispatcher {
 
 // ── Signaling Client ──
 export interface ISignalingClient {
+  readonly isConnected?: boolean;
   connect(options: { claim: WireNodeClaim; turnstileToken?: string }): Promise<void>;
   sendRelay(targetPeerId: PeerId, payload: any): void;
   disconnect(): void;

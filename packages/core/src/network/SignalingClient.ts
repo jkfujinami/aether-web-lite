@@ -14,15 +14,18 @@ export class SignalingClient implements ISignalingClient {
   private onRelayCb?: RelayCallback;
   private url: string;
   constructor(url: string = TRACKER.URL) {
-    // ブラウザ環境かつデフォルトURLの場合、現在のホスト名から推測する (ngrok対応)
-    if (typeof window !== 'undefined' && (url === 'ws://localhost:3000' || url === TRACKER.URL)) {
+    if (typeof window !== 'undefined' && window.location && window.location.host && (url === 'ws://localhost:3000' || url === TRACKER.URL)) {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const host = window.location.host;
       this.url = `${protocol}//${host}/ws`;
     } else {
-      this.url = url;
+      this.url = url.endsWith('/ws') ? url : `${url}/ws`;
     }
     log.debug(`Tracker URL configured as: ${this.url}`);
+  }
+
+  public get isConnected(): boolean {
+    return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
   }
 
   public async connect(options: { claim: WireNodeClaim; turnstileToken?: string }): Promise<void> {

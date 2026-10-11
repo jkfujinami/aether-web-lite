@@ -19,8 +19,10 @@ export interface PostEntry {
 export class IndexedDBStore {
   private db!: IDBPDatabase;
 
+  constructor(private readonly dbName: string = 'AetherLiteDB') {}
+
   public async init() {
-    this.db = await openDB('AetherLiteDB', 6, {
+    this.db = await openDB(this.dbName, 6, {
       upgrade(db: any, oldVersion: number, _newVersion: number | null, transaction: any) {
         // Mailbox (Raw Packets)
         if (!db.objectStoreNames.contains('mailbox')) {

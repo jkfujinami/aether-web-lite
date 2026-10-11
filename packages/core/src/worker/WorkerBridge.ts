@@ -23,7 +23,7 @@ export class WorkerBridge {
 
   static getWorker(): Worker {
     if (!this.worker) {
-      this.worker = new Worker(new URL('./pow.worker.ts', import.meta.url), { type: 'module' });
+      this.worker = new Worker(new URL('./pow.worker.js', import.meta.url), { type: 'module' });
       this.worker.onmessage = (e) => this.handleMessage(e);
       this.worker.onerror = (err) => {
         log.error('Worker error:', err);

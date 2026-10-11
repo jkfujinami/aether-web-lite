@@ -12,6 +12,7 @@ import { RING_MESH } from '../constants';
 import { WireCodec } from './wire/WireCodec';
 import { WireType } from './wire/WireTypes';
 import { RateLimiter } from './RateLimiter';
+import { PeerMisbehaviorManager, ViolationType } from './PeerMisbehaviorManager';
 import {
   NodeIdentity,
   NODE_ID_POW,
@@ -32,6 +33,7 @@ const RATE_CATEGORY: Partial<Record<WireType, string>> = {
   [WireType.JOIN]: 'handshake',
   [WireType.GOSSIP]: 'gossip',
   [WireType.STEM]: 'gossip',
+  [WireType.ONION_STEM]: 'gossip',
   [WireType.DHT_PUT]: 'dhtPut',
   [WireType.DHT_GET]: 'dhtGet',
   [WireType.DHT_RES]: 'dhtGet',
@@ -57,6 +59,8 @@ export class PeerManager implements IPeerManager {
   private rateLimiter: RateLimiter;
   private powParams: NodeIdPowParams;
   private identity: NodeIdentity;
+  public readonly misbehavior: PeerMisbehaviorManager;
+  private reannounceTimer: any = null;
 
   public readonly myPeerId: PeerId;
   public readonly myPosition: number;
@@ -67,7 +71,11 @@ export class PeerManager implements IPeerManager {
     identity: NodeIdentity,
     dispatcher: IMessageDispatcher,
     signaling: ISignalingClient,
-    options: { rateLimiter?: RateLimiter; powParams?: NodeIdPowParams } = {},
+    options: {
+      rateLimiter?: RateLimiter;
+      powParams?: NodeIdPowParams;
+      misbehavior?: PeerMisbehaviorManager;
+    } = {},
   ) {
     this.identity = identity;
     this.myPeerId = identity.peerId;
@@ -76,6 +84,7 @@ export class PeerManager implements IPeerManager {
     this.signaling = signaling;
     this.rateLimiter = options.rateLimiter ?? new RateLimiter();
     this.powParams = options.powParams ?? NODE_ID_POW;
+    this.misbehavior = options.misbehavior ?? new PeerMisbehaviorManager();
 
     this.registerInternalHandlers();
 
@@ -157,17 +166,19 @@ export class PeerManager implements IPeerManager {
       log.warn(
         `[PeerManager] JOIN identity mismatch: connection=${peerId.substring(0, 8)} claimed=${String(claim.peerId).substring(0, 8)}`,
       );
+      this.misbehavior.recordViolation(peerId, ViolationType.MALFORMED_WIRE, 'Identity mismatch in JOIN');
       this.disconnect(peerId);
       return;
     }
 
     if (!NodeIdentity.verifySignedClaim(claim, expected, this.powParams)) {
       log.warn(`JOIN verification failed for ${peerId.substring(0, 8)} — dropping peer`);
+      this.misbehavior.recordViolation(peerId, ViolationType.INVALID_SIGNATURE, 'JOIN verification failed');
       this.disconnect(peerId);
       return;
     }
 
-    peer.markVerified();
+    peer.markVerified(claim.pubkey);
     log.debug(
       `[PeerManager] Peer ${peerId.substring(0, 8)} verified (bound position: ${peer.position.toFixed(6)})`,
     );
@@ -195,6 +206,17 @@ export class PeerManager implements IPeerManager {
     return Array.from(this._peers.values()).filter((p) => p.isConnected && p.isVerified);
   }
 
+  /** 公開鍵が判明している検証済みピアのリスト (Onion Circuit 構築用) */
+  public get verifiedPeersWithKeys(): Array<{ peerId: PeerId; pubkey: Uint8Array }> {
+    return this.verifiedPeers
+      .filter((p): p is WebRTCPeer & { pubkey: Uint8Array } => p.pubkey !== null)
+      .map((p) => ({ peerId: p.peerId, pubkey: p.pubkey }));
+  }
+
+  public get nodeIdentity(): NodeIdentity {
+    return this.identity;
+  }
+
   public async start(): Promise<void> {
     log.debug(`Starting as ${this.myPeerId} (bound position: ${this.myPosition.toFixed(6)})`);
 
@@ -206,6 +228,28 @@ export class PeerManager implements IPeerManager {
       log.debug(`Detaching from Tracker Server! Entering Fully Decentralized Mode.`);
       this.signaling.disconnect();
     }, 15_000);
+
+    // 接続数低下時または孤立防止の動的再アナウンス (Adaptive Re-announce)
+    if (this.reannounceTimer) clearInterval(this.reannounceTimer);
+    this.reannounceTimer = setInterval(() => {
+      if (this.degree < 4 && !this.signaling.isConnected) {
+        log.info(`Degree dropped to ${this.degree} (< 4). Reconnecting to tracker for network repair.`);
+        this.signaling.connect({ claim: this.identity.claim() }).catch((err) => {
+          log.warn(`Adaptive tracker reconnect failed: ${err}`);
+        });
+      }
+    }, 30_000);
+  }
+
+  public stop(): void {
+    if (this.reannounceTimer) {
+      clearInterval(this.reannounceTimer);
+      this.reannounceTimer = null;
+    }
+    this.signaling.disconnect();
+    for (const peerId of Array.from(this._peers.keys())) {
+      this.disconnect(peerId);
+    }
   }
 
   private handleTrackerPeers(peers: Array<{ peerId: PeerId }>): void {
@@ -224,6 +268,9 @@ export class PeerManager implements IPeerManager {
   }
 
   private handleRelay(senderId: PeerId, msg: any): void {
+    if (this.misbehavior.isBanned(senderId)) {
+      return;
+    }
     if (!PEER_ID_RE.test(senderId)) {
       log.warn(`Rejecting relay from malformed peerId`);
       return;
@@ -285,6 +332,11 @@ export class PeerManager implements IPeerManager {
   }
 
   public connect(peerId: PeerId, initiator: boolean = true, viaPeerId?: PeerId): WebRTCPeer | undefined {
+    if (this.misbehavior.isBanned(peerId)) {
+      log.warn(`Refusing connection to banned peer ${peerId.substring(0, 8)}`);
+      return undefined;
+    }
+
     // Bound Identity なので peerId の形式は固定。壊れた ID は座標計算も
     // 壊れるため、ここで確実に落とす。
     if (!PEER_ID_RE.test(peerId)) {
@@ -387,18 +439,27 @@ export class PeerManager implements IPeerManager {
    * を掛けてからディスパッチする。
    */
   private handleData(peerId: PeerId, data: Uint8Array | string): void {
+    if (this.misbehavior.isBanned(peerId)) {
+      this.disconnect(peerId);
+      return;
+    }
+
     const decoded = (data instanceof Uint8Array)
       ? WireCodec.decode(data)
       : WireCodec.decode(new TextEncoder().encode(data));
 
     if (decoded.type === WireType.UNKNOWN) {
       log.warn(`Dropped unknown wire message from ${peerId.substring(0, 8)}`);
+      this.misbehavior.recordViolation(peerId, ViolationType.MALFORMED_WIRE, 'Unknown wire message');
+      this.disconnect(peerId);
       return;
     }
 
     const category = RATE_CATEGORY[decoded.type];
     if (category && !this.rateLimiter.allow(peerId, category)) {
-      // 意図的に静かに捨てる。ログを出すと、そのログ自体が増幅路になる。
+      if (this.misbehavior.recordViolation(peerId, ViolationType.RATE_LIMIT_EXCEEDED, 'Rate limit exceeded')) {
+        this.disconnect(peerId);
+      }
       return;
     }
 

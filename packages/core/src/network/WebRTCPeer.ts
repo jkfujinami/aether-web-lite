@@ -33,6 +33,7 @@ export class WebRTCPeer implements IPeerConnection {
   private _connected = false;
   private _connecting = true;
   private _verified = false;
+  private _pubkey: Uint8Array | null = null;
   /** 相手に送ったチャレンジ。JOIN の署名検証に使う */
   private _challenge: Uint8Array | null = null;
   private opts: WebRTCPeerOptions;
@@ -48,6 +49,11 @@ export class WebRTCPeer implements IPeerConnection {
   /** HELLO/JOIN のハンドシェイクで Bound Identity を検証済みか */
   public get isVerified(): boolean {
     return this._verified;
+  }
+
+  /** 検証済みの Ed25519 公開鍵 */
+  public get pubkey(): Uint8Array | null {
+    return this._pubkey;
   }
 
   public get challenge(): Uint8Array | null {
@@ -208,8 +214,9 @@ export class WebRTCPeer implements IPeerConnection {
   }
 
   /** Bound Identity の検証に成功した印を付ける */
-  public markVerified() {
+  public markVerified(pubkey?: Uint8Array) {
     this._verified = true;
+    if (pubkey) this._pubkey = pubkey;
   }
 
   public close(): void {
