@@ -53,8 +53,18 @@ export class ReplicationManager {
   /**
    * 現在保持している全トピックを、現在の最新K最近接ノードへコピーする
    */
-  public async executeRebalance() {
-    if (this.peerManager.degree === 0) return;
+  public async executeRebalance(): Promise<void> {
+    // ★ タイマーや起動時から投げっぱなしで呼ばれる。停止・ロック後に保管庫が例外を
+    //   投げても、未処理の reject にしない。
+    try {
+      await this.rebalanceOnce();
+    } catch (err) {
+      if (!this.destroyed) log.warn(`rebalance failed: ${(err as Error)?.message ?? err}`);
+    }
+  }
+
+  private async rebalanceOnce(): Promise<void> {
+    if (this.destroyed || this.peerManager.degree === 0) return;
 
     const allTopicHashes = await this.store.getAllTopicHashes();
     if (allTopicHashes.length === 0) return;
@@ -62,6 +72,7 @@ export class ReplicationManager {
     log.debug(`Starting rebalance for ${allTopicHashes.length} topics...`);
 
     for (const topicHash of allTopicHashes) {
+      if (this.destroyed) return;
       const topicPos = this.hashToPosition(topicHash);
       const nearestPeers = this.findKNearestExcludingMe(topicPos, this.K_REPLICATION);
       

@@ -50,6 +50,8 @@ export interface OpenedHint {
 export class HintRouter {
   /** 全隣人へ中継済みか。フラッディングの増幅を止める。 */
   private flooded = new SeenCache();
+  /** 網から受け取った Hint の id (同じ Hint の 2 通目以降を数えない・溜めないため) */
+  private received = new SeenCache();
   /** 復号して通知済みか。中継の可否とは独立に判定する。 */
   private delivered = new SeenCache();
 
@@ -68,6 +70,8 @@ export class HintRouter {
    *   中身は復号していないので、これを持つこと自体は何も意味しない。
    */
   private recentHints: HintPacket[] = [];
+  /** recentHints に入っている Hint の id (同じ Hint を 2 つ溜めない) */
+  private recentIds = new Set<string>();
   private listeners: Array<(hint: OpenedHint) => void> = [];
   private anyHintListeners: Array<() => void> = [];
 
@@ -257,6 +261,18 @@ export class HintRouter {
 
     // エコー通知は何よりも先に。ここで発信元の再送が止まる。
     this.dandelion.notifyEcho(id);
+
+    // ★ 同じ Hint は隣人の数だけ届く。旧実装は 2 通目以降も
+    //   - 観測した Hint の流量 (anyHintListeners → HintRelease) に数え、
+    //   - 開き直し用のバッファに溜めていた。
+    //   流量の水増しで放流の遅延が縮み (匿名性の状態表示が実際より良く見える)、
+    //   正当な Hint 1 つ (PoW 1 回分) の再送だけでバッファを埋めて、他の Hint を
+    //   後から開けなくすることもできた。初めて受け取ったものだけを扱う。
+    if (this.received.has(id)) {
+      log.trace(() => `HINT duplicate ${id.substring(0, 8)}`);
+      return;
+    }
+    this.received.add(id);
     for (const cb of this.anyHintListeners) cb();
 
     // 1. ローカルでの試行復号。中継状態とは独立に必ず試みる。
@@ -291,9 +307,16 @@ export class HintRouter {
 
   /** 開けなかった Hint も後で開き直せるよう手元に残す (上限つき) */
   private remember(hint: HintPacket): void {
+    // ★ どの経路 (網・出口・保管した Slot) から来ても、同じ Hint は 1 つだけ溜める。
+    //   重複を溜めると、正当な Hint 1 つの使い回しでバッファを埋め、他の Hint を
+    //   後から開けなくできてしまう。
+    const id = hintId(hint);
+    if (this.recentIds.has(id)) return;
+    this.recentIds.add(id);
     this.recentHints.push(hint);
     if (this.recentHints.length > RECENT_HINT_BUFFER) {
-      this.recentHints.splice(0, this.recentHints.length - RECENT_HINT_BUFFER);
+      const evicted = this.recentHints.splice(0, this.recentHints.length - RECENT_HINT_BUFFER);
+      for (const old of evicted) this.recentIds.delete(hintId(old));
     }
   }
 
@@ -326,10 +349,12 @@ export class HintRouter {
 
   public destroy(): void {
     this.flooded.destroy();
+    this.received.destroy();
     this.delivered.destroy();
     this.keys.clear();
     this.listeners = [];
     this.anyHintListeners = [];
     this.recentHints = [];
+    this.recentIds.clear();
   }
 }

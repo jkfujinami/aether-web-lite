@@ -39,6 +39,8 @@ export class ThreadOrchestrator {
 
   private currentBoardId: string | null = null;
   private currentBoardKey: Uint8Array | null = null;
+  /** 開いている板・スレッドのゾーンの購読を外す */
+  private unwatchZone: (() => void) | null = null;
   private currentThreadId: string | null = null;
   private currentThreadKey: Uint8Array | null = null;
   private currentThreadTopicHash: Uint8Array | null = null;
@@ -250,6 +252,8 @@ export class ThreadOrchestrator {
       // スレッド鍵とハッシュの導出 (useThread L48-49を再現)
       this.currentThreadKey = this.keyMgr.deriveThreadKey(boardKey, threadId);
       this.currentThreadTopicHash = this.keyMgr.deriveTopicHash(this.currentThreadKey);
+      // 開いているスレッドのゾーンを購読に加える (ローカルな判断。網には出ない)
+      this.unwatchZone = this.zm.watchTopic?.(this.currentThreadTopicHash) ?? null;
       this.dag = new ThreadDAGManager(threadId);
 
     }
@@ -395,7 +399,6 @@ export class ThreadOrchestrator {
     this.updateStatus('submitting', 'PoW計算中...', true, 20);
 
     try {
-      const currentZoneId = this.keyMgr.computeZoneId(this.currentThreadTopicHash, this.zm.depth);
 
       // 網共通の固定値。端末の閲覧状況から計算した値をヘッダに載せない (PowPolicy 参照)
       const powDifficulty = POW_POLICY.NETWORK_DIFFICULTY;
@@ -411,7 +414,7 @@ export class ThreadOrchestrator {
       const packet = await PacketBuilder.build(
         text, this.currentThreadKey, this.identity, this.cryptoEng,
         this.powEng, this.keyMgr, this.currentBoardId, this.currentThreadId,
-        postNumber, null, powDifficulty, currentZoneId, 0,
+        postNumber, null, powDifficulty, this.zm.depth, 0,
         tips, this.currentThreadId, nextWeight
       );
 
@@ -515,6 +518,8 @@ export class ThreadOrchestrator {
       this.isListening = false;
     }
 
+    this.unwatchZone?.();
+    this.unwatchZone = null;
     this.dag = new ThreadDAGManager('');
     this.seenPacketIds.clear();
     this.currentBoardId = null;

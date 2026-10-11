@@ -40,6 +40,8 @@ export class BoardOrchestrator {
 
   private currentBoardId: string | null = null;
   private currentBoardKey: Uint8Array | null = null;
+  /** 開いている板・スレッドのゾーンの購読を外す */
+  private unwatchZone: (() => void) | null = null;
   private isListening: boolean = false;
   /** 実行中の fullSync。多重起動を防ぐ */
   private syncInFlight: Promise<void> | null = null;
@@ -415,11 +417,16 @@ export class BoardOrchestrator {
    * 板の同期を活性化する
    */
   public async activate(boardId: string, boardKey: Uint8Array) {
-    // 1. 板が切り替わった場合はリセット
-    if (this.currentBoardId !== boardId) {
+    // 1. 板が切り替わった場合はリセット (同じ板 ID でも鍵が違えば別の板として扱う)
+    const sameKey = this.currentBoardKey !== null &&
+      this.currentBoardKey.length === boardKey.length &&
+      this.currentBoardKey.every((b, i) => b === boardKey[i]);
+    if (this.currentBoardId !== boardId || !sameKey) {
       this.clear();
       this.currentBoardId = boardId;
       this.currentBoardKey = boardKey;
+      // 開いている板のゾーンを購読に加える (ローカルな判断。網には出ない)
+      this.unwatchZone = this.zm.watchTopic?.(KeyManager.deriveTopicHash(boardKey)) ?? null;
     }
 
     // 2. リスナーの登録（一度だけ）
@@ -472,9 +479,10 @@ export class BoardOrchestrator {
       const threadId = CryptoUtils.generateId(10);
       const threadKey = KeyManager.deriveThreadKey(boardKey, threadId);
       
-      // 🌟 板のメタデータ（スレッド作成通知）なので、スレッドのゾーンではなく「板のゾーン」にブロードキャストする
-      const boardTopicHash = KeyManager.cryptoHash(boardKey);
-      const boardZoneId = KeyManager.computeZoneId(boardTopicHash, this.zm.depth);
+      // 板のメタデータ (スレッド作成通知) なので、板の鍵のゾーンへ流す。
+      // zone_id は PacketBuilder が鍵と depth から計算する。
+      // ★ 旧実装はここで計算した zone_id を depth の引数に渡しており、depth > 0 で
+      //   存在しないゾーン番号 (例: depth 4 で 31860) が載っていた。
 
       // 網共通の固定値。端末の閲覧状況から計算した値をヘッダに載せない (PowPolicy 参照)
       const powDifficulty = POW_POLICY.NETWORK_DIFFICULTY;
@@ -482,7 +490,7 @@ export class BoardOrchestrator {
       const packet = await PacketBuilder.build(
         title, boardKey, this.identity, this.cryptoEng,
         this.powEng, this.keyMgr, boardId, threadId,
-        0, null, powDifficulty, boardZoneId, 1,
+        0, null, powDifficulty, this.zm.depth, 1,
         [], threadId, powDifficulty
       );
 
@@ -584,6 +592,8 @@ export class BoardOrchestrator {
       this.isListening = false;
     }
 
+    this.unwatchZone?.();
+    this.unwatchZone = null;
     this.currentBoardId = null;
     this.currentBoardKey = null;
     this.threads.clear();

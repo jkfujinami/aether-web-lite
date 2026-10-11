@@ -109,9 +109,15 @@ export class IndexedDBStore {
    */
   public async unlock(passphrase: string, params: VaultParams = VAULT_PARAMS): Promise<void> {
     await this.init();
-    if (this.isUnlocked) return;
-
     const record = await this.db.get('identity', DEK_SLOT);
+    if (this.isUnlocked) {
+      // ★ 解除済みでもパスワードは照合する。旧実装はここで何もせず成功を返したので、
+      //   同じインスタンスでの再認証 (画面のロック解除など) がどんなパスワードでも通った。
+      if (!record?.sealed) throw new WrongPassphraseError();
+      DataVault.open(record.sealed as SealedSecret, passphrase).wipe();
+      return;
+    }
+
     if (record?.sealed) {
       this.vault = DataVault.open(record.sealed as SealedSecret, passphrase);
     } else {

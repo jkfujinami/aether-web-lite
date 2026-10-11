@@ -1,3 +1,4 @@
+import { WrongPassphraseError } from '../storage/DataVault';
 import sodium from './sodium';
 import { NodeIdentity, NODE_ID_POW, type NodeIdPowParams } from './NodeIdentity';
 import { SecretVault, VAULT_PARAMS, type VaultParams } from '../storage/SecretVault';
@@ -50,6 +51,9 @@ export class NodeIdentityStore {
    *
    * @param passphrase 封印のパスフレーズ (空文字は不可)
    */
+  /**
+   * @throws WrongPassphraseError 保存済みの identity がこのパスワードで開けないとき (何も書き換えない)
+   */
   static async loadOrMine(
     store: SealedStore,
     passphrase: string,
@@ -84,13 +88,17 @@ export class NodeIdentityStore {
     passphrase: string,
     params: NodeIdPowParams,
   ): Promise<NodeIdentity | null> {
-    const record = await store.getSealed(NODE_SLOT).catch(() => undefined);
+    // 読み出しの失敗は伝える。「無かった」と扱うと、一時的な失敗で採掘し直した
+    // identity が保存済みのものを上書きしてしまう。
+    const record = await store.getSealed(NODE_SLOT);
     if (!record) return null;
 
     const secret = SecretVault.open(record.sealed, passphrase);
     if (!secret) {
-      log.warn(`Could not unseal node identity.`);
-      return null;
+      // ★ 旧実装はここで null を返し、呼び出し側が新しい identity を採掘して
+      //   同じ場所へ (間違ったパスワードで封印して) 上書きしていた。
+      //   打ち間違い 1 回で元の鍵が永久に失われた。開けないなら何も書き換えない。
+      throw new WrongPassphraseError();
     }
 
     const skBytes = sodium.crypto_sign_SECRETKEYBYTES;

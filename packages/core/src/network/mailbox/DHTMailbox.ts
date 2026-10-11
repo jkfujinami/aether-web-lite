@@ -42,7 +42,16 @@ const FETCH_GRACE_MS = 300;
  */
 const PUT_ACCEPT_SLACK = 3;
 
+/** エントリの同一性 (保管側の重複排除と同じく、バイト列そのもの) */
+function entryKey(e: Uint8Array): string {
+  let out = '';
+  for (let i = 0; i < e.length; i++) out += e[i].toString(16).padStart(2, '0');
+  return out;
+}
+
 export class DHTMailbox implements IMailbox {
+  /** acceptForStorage を直列化するための鎖 */
+  private storageQueue: Promise<void> = Promise.resolve();
   private store: IndexedDBStore;
   private pendingRequests = new Map<
     string,
@@ -182,6 +191,15 @@ export class DHTMailbox implements IMailbox {
    * @returns 実際に保管したエントリ
    */
   private async acceptForStorage(topicHash: string, entries: Uint8Array[], source: PeerId): Promise<Uint8Array[]> {
+    // ★ 1 件ずつ順に処理する。読み (既存エントリ・使用量) と書きの間に await があるので、
+    //   重なった PUT が同じ古い値を見て、使用量の更新が失われ (総量の上限を超えられる)、
+    //   トピックあたりの件数の上限を破り、同じエントリを何度も受け入れて通知していた。
+    const run = this.storageQueue.then(() => this.acceptForStorageNow(topicHash, entries, source));
+    this.storageQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private async acceptForStorageNow(topicHash: string, entries: Uint8Array[], source: PeerId): Promise<Uint8Array[]> {
     const existing = (await this.store.get(topicHash)) ?? [];
     if (existing.length >= MAILBOX_LIMITS.MAX_ENTRIES_PER_TOPIC) {
       log.debug(() => `store rejected for ${topicHash.substring(0, 8)}: topic is full`);
@@ -195,8 +213,22 @@ export class DHTMailbox implements IMailbox {
       }
     }
 
+    // ★ 既に持っているエントリは数えない。旧実装は同じエントリの再 PUT (複製の
+    //   定期送信で正当なノードも 5 分ごとに行う) のたびに使用量と送り主の割当を
+    //   加算していた。保管側では重複は捨てられるので、使用量だけが実際より膨らみ、
+    //   いずれ上限に達して全ての保管を断るようになった。
+    const have = new Set(existing.map(entryKey));
+    const fresh: Uint8Array[] = [];
+    for (const e of entries) {
+      const k = entryKey(e);
+      if (have.has(k)) continue;
+      have.add(k);
+      fresh.push(e);
+    }
+    if (fresh.length === 0) return [];
+
     const room = MAILBOX_LIMITS.MAX_ENTRIES_PER_TOPIC - existing.length;
-    const candidates = entries.slice(0, room);
+    const candidates = fresh.slice(0, room);
     const bytes = candidates.reduce((n, e) => n + e.byteLength, 0);
 
     const usage = await this.currentUsage();
