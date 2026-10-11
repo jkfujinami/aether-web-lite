@@ -51,6 +51,11 @@ export class DHTMailbox implements IMailbox {
 
   private peerManager: IPeerManager;
   private slotListeners: Array<(entry: Uint8Array, topicHash: string) => void> = [];
+  /** 保管の総バイト数 (遅延計算してから増分で追う) */
+  private usageBytes: number | null = null;
+  /** 送り主ごとの 1 時間あたりの受け入れ量 */
+  private peerQuota = new Map<PeerId, { windowStart: number; bytes: number }>();
+  private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     peerManager: IPeerManager,
@@ -163,6 +168,91 @@ export class DHTMailbox implements IMailbox {
     await this.putToKNearest(topicHashHex, entry);
   }
 
+  /**
+   * 保管の可否を決めて書き込む。保管経路 (PUT / RES / 出口の自分宛て) はすべてここを通す。
+   *
+   * 上限 (H7):
+   *   - トピックあたりの件数・トピック数
+   *   - 保管の総バイト数
+   *   - 送り主ごとの 1 時間あたりの受け入れ量 (1 人の隣人が枠を食い潰せないように)
+   *
+   * @returns 実際に保管したエントリ
+   */
+  private async acceptForStorage(topicHash: string, entries: Uint8Array[], source: PeerId): Promise<Uint8Array[]> {
+    const existing = (await this.store.get(topicHash)) ?? [];
+    if (existing.length >= MAILBOX_LIMITS.MAX_ENTRIES_PER_TOPIC) {
+      log.debug(() => `store rejected for ${topicHash.substring(0, 8)}: topic is full`);
+      return [];
+    }
+    if (existing.length === 0) {
+      const topicCount = (await this.store.getAllTopicHashes()).length;
+      if (topicCount >= MAILBOX_LIMITS.MAX_TOPICS) {
+        log.warn(`store rejected: topic capacity reached (${topicCount})`);
+        return [];
+      }
+    }
+
+    const room = MAILBOX_LIMITS.MAX_ENTRIES_PER_TOPIC - existing.length;
+    const candidates = entries.slice(0, room);
+    const bytes = candidates.reduce((n, e) => n + e.byteLength, 0);
+
+    const usage = await this.currentUsage();
+    if (usage + bytes > MAILBOX_LIMITS.MAX_TOTAL_BYTES) {
+      log.warn(`store rejected: total capacity reached (${usage}B)`);
+      return [];
+    }
+    if (source !== this.peerManager.myPeerId && !this.chargePeerQuota(source, bytes)) {
+      log.warn(`store rejected: hourly quota exceeded for ${source.substring(0, 8)}`);
+      return [];
+    }
+
+    await this.store.put(topicHash, candidates);
+    this.usageBytes = usage + bytes;
+    return candidates;
+  }
+
+  private async currentUsage(): Promise<number> {
+    if (this.usageBytes === null) {
+      this.usageBytes = await this.store.mailboxUsageBytes().catch(() => 0);
+    }
+    return this.usageBytes;
+  }
+
+  private chargePeerQuota(peerId: PeerId, bytes: number): boolean {
+    const now = Date.now();
+    let q = this.peerQuota.get(peerId);
+    if (!q || now - q.windowStart > 60 * 60 * 1000) {
+      q = { windowStart: now, bytes: 0 };
+      this.peerQuota.set(peerId, q);
+    }
+    if (q.bytes + bytes > MAILBOX_LIMITS.MAX_BYTES_PER_PEER_PER_HOUR) return false;
+    q.bytes += bytes;
+    return true;
+  }
+
+  /** 保持期限を過ぎたトピックを消す。起動時と 1 時間ごとに走らせる */
+  public async pruneExpired(now: number = Date.now()): Promise<void> {
+    const { topics, bytes } = await this.store.pruneMailbox(now - MAILBOX_LIMITS.RETENTION_MS).catch(() => ({ topics: 0, bytes: 0 }));
+    if (topics > 0) {
+      log.info(`pruned ${topics} expired topic(s), ${bytes}B`);
+      this.usageBytes = null;
+    }
+    for (const [peerId, q] of this.peerQuota) {
+      if (now - q.windowStart > 60 * 60 * 1000) this.peerQuota.delete(peerId);
+    }
+  }
+
+  public startMaintenance(): void {
+    this.stopMaintenance();
+    void this.pruneExpired();
+    this.maintenanceTimer = setInterval(() => void this.pruneExpired(), 60 * 60 * 1000);
+  }
+
+  public stopMaintenance(): void {
+    if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
+    this.maintenanceTimer = null;
+  }
+
   /** 実際に K-nearest へ配る (出口が作者の代わりに行う) */
   private async putToKNearest(topicHashHex: string, data: Uint8Array): Promise<void> {
     const topicPos = this.hashToPosition(topicHashHex);
@@ -177,7 +267,7 @@ export class DHTMailbox implements IMailbox {
       }
     }
     if (nearest.includes(this.peerManager.myPeerId)) {
-      await this.store.put(topicHashHex, [data]);
+      await this.acceptForStorage(topicHashHex, [data], this.peerManager.myPeerId);
     }
   }
 
@@ -337,23 +427,8 @@ export class DHTMailbox implements IMailbox {
     if (accepted.length === 0) return;
 
     try {
-      const existing = (await this.store.get(topicHash)) ?? [];
-      if (existing.length >= MAILBOX_LIMITS.MAX_ENTRIES_PER_TOPIC) {
-        log.warn(`PUT rejected for ${topicHash.substring(0, 8)}: topic is full`);
-        return;
-      }
-
-      if (existing.length === 0) {
-        const topicCount = (await this.store.getAllTopicHashes()).length;
-        if (topicCount >= MAILBOX_LIMITS.MAX_TOPICS) {
-          log.warn(`PUT rejected: topic capacity reached (${topicCount})`);
-          return;
-        }
-      }
-
-      const room = MAILBOX_LIMITS.MAX_ENTRIES_PER_TOPIC - existing.length;
-      const toStore = accepted.slice(0, room);
-      await this.store.put(topicHash, toStore);
+      const toStore = await this.acceptForStorage(topicHash, accepted, peerId);
+      if (toStore.length === 0) return;
       // 保管した Slot は、鍵を持っていればその場で開ける
       for (const entry of toStore) {
         for (const cb of this.slotListeners) cb(entry, topicHash);
@@ -423,9 +498,12 @@ export class DHTMailbox implements IMailbox {
     req.resolve(accepted);
 
     if (accepted.length > 0 && this.isResponsibleFor(req.topicHash)) {
-      // 検証済みのものだけをローカルにも保管する
-      this.store.put(req.topicHash, accepted).catch(e => log.error(e));
-      for (const entry of accepted) {
+      // 検証済みのものだけを、保管の上限の範囲でローカルにも保管する
+      const stored = await this.acceptForStorage(req.topicHash, accepted, peerId).catch((e) => {
+        log.error(e);
+        return [] as Uint8Array[];
+      });
+      for (const entry of stored) {
         for (const cb of this.slotListeners) cb(entry, req.topicHash);
       }
     }

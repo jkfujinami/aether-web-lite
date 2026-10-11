@@ -104,6 +104,38 @@ export class IndexedDBStore {
     await tx.done;
   }
 
+  /** Mailbox が占めている総バイト数 (エントリ本体の合計) */
+  public async mailboxUsageBytes(): Promise<number> {
+    if (!this.db) return 0;
+    let total = 0;
+    let cursor = await this.db.transaction('mailbox', 'readonly').store.openCursor();
+    while (cursor) {
+      for (const e of (cursor.value as MailboxEntry).entries ?? []) total += e?.byteLength ?? 0;
+      cursor = await cursor.continue();
+    }
+    return total;
+  }
+
+  /**
+   * lastUpdated が cutoff より古いトピックを消す。
+   * @returns 消したトピック数と解放したバイト数
+   */
+  public async pruneMailbox(cutoff: number): Promise<{ topics: number; bytes: number }> {
+    if (!this.db) return { topics: 0, bytes: 0 };
+    const tx = this.db.transaction('mailbox', 'readwrite');
+    let topics = 0;
+    let bytes = 0;
+    let cursor = await tx.store.index('lastUpdated').openCursor(IDBKeyRange.upperBound(cutoff, true));
+    while (cursor) {
+      for (const e of (cursor.value as MailboxEntry).entries ?? []) bytes += e?.byteLength ?? 0;
+      await cursor.delete();
+      topics++;
+      cursor = await cursor.continue();
+    }
+    await tx.done;
+    return { topics, bytes };
+  }
+
   public async getAllTopicHashes(): Promise<string[]> {
     if (!this.db) return [];
     return this.db.getAllKeys('mailbox') as Promise<string[]>;

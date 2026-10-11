@@ -281,6 +281,7 @@ export class AetherNode {
     this.heartbeat.start();
     // cover traffic は投稿の有無に関係なく起動直後から流す (OnionCircuit.start 参照)
     this.circuit.start();
+    this.mailbox.startMaintenance();
     this.replicationManager.executeRebalance();
 
     try {
@@ -314,6 +315,7 @@ export class AetherNode {
     this.heartbeat.stop();
     this.maintainer.destroy();
     this.replicationManager.destroy();
+    this.mailbox.stopMaintenance();
     this.zoneManager.destroy();
     this.gossipRouter.destroy();
     this.hintRouter.destroy();
