@@ -150,7 +150,6 @@ export interface DAGMetadata {
 export interface IPostStore {
   save(post: { boardId: string; threadId: string; payload: Uint8Array; dag?: DAGMetadata }): Promise<void>;
   getPosts(boardId: string, threadId: string): Promise<any[]>;
-  getRecentTimestamps(count: number): Promise<number[]>;
 }
 
 // ── Key Management ──

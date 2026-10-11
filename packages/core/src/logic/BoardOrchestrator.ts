@@ -7,7 +7,7 @@ import type { IPeerManager, IZoneManager, IPoWEngine, IKeyManager } from '../typ
 import type { ThreadMeta } from './types';
 import { PacketBuilder } from '../crypto/PacketBuilder';
 import { KeyManager } from '../crypto/KeyManager';
-import { DifficultyEstimator } from '../crypto/DifficultyEstimator';
+import { POW_POLICY } from '../crypto/PowPolicy';
 import { BOARD_META_THREAD_ID, BoardStatus } from './types';
 import { createLogger } from '../common/Logger';
 import type { SchrodingerMailbox } from '../network/hint/SchrodingerMailbox';
@@ -474,8 +474,8 @@ export class BoardOrchestrator {
       const boardTopicHash = KeyManager.cryptoHash(boardKey);
       const boardZoneId = KeyManager.computeZoneId(boardTopicHash, this.zm.depth);
 
-      const timestamps = await this.db.getRecentTimestamps(DifficultyEstimator.WINDOW);
-      const powDifficulty = DifficultyEstimator.compute(timestamps);
+      // 網共通の固定値。端末の閲覧状況から計算した値をヘッダに載せない (PowPolicy 参照)
+      const powDifficulty = POW_POLICY.NETWORK_DIFFICULTY;
 
       const packet = await PacketBuilder.build(
         title, boardKey, this.identity, this.cryptoEng,

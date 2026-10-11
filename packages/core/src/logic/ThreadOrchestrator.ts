@@ -10,7 +10,7 @@ import { ThreadStatus } from './types';
 import { JsonBinary } from '../common/JsonBinary';
 import { PacketBuilder } from '../crypto/PacketBuilder';
 import { KeyManager } from '../crypto/KeyManager';
-import { DifficultyEstimator } from '../crypto/DifficultyEstimator';
+import { POW_POLICY } from '../crypto/PowPolicy';
 import { createLogger } from '../common/Logger';
 import type { SchrodingerMailbox } from '../network/hint/SchrodingerMailbox';
 import type { OpenedHint } from '../network/hint/HintRouter';
@@ -396,8 +396,8 @@ export class ThreadOrchestrator {
     try {
       const currentZoneId = this.keyMgr.computeZoneId(this.currentThreadTopicHash, this.zm.depth);
 
-      const timestamps = await this.db.getRecentTimestamps(DifficultyEstimator.WINDOW);
-      const powDifficulty = DifficultyEstimator.compute(timestamps);
+      // 網共通の固定値。端末の閲覧状況から計算した値をヘッダに載せない (PowPolicy 参照)
+      const powDifficulty = POW_POLICY.NETWORK_DIFFICULTY;
 
       const tips = this.dag.getTips();
       const currentWeight = this.dag.getMaxCumulativePow();

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import 'fake-indexeddb/auto';
 import { sodiumReady } from '../../src/crypto/sodium';
 import { IndexedDBStore } from '../../src/storage/IndexedDBStore';
+import { VAULT_PARAMS_FAST } from '../../src/storage/SecretVault';
 import { DHTMailbox } from '../../src/network/mailbox/DHTMailbox';
 import { MAILBOX_LIMITS } from '../../src/network/mailbox/MailboxEntry';
 import { MessageDispatcher } from '../../src/network/MessageDispatcher';
@@ -15,6 +16,7 @@ const PEER = 'b'.repeat(32);
 async function setup() {
   const store = new IndexedDBStore(`limits_${Date.now()}_${Math.random()}`);
   await store.init();
+  await store.unlock('test-passphrase', VAULT_PARAMS_FAST);
   // 隣人が居ないので、どのトピックでも自分が K-nearest になる
   const pm: any = {
     peers: new Map(), myPeerId: ME, myPosition: 0, degree: 0,
@@ -53,7 +55,8 @@ describe('DHT 保管の上限 (H7)', () => {
   it('保持期限を過ぎたトピックは消える', async () => {
     const { store, mailbox } = await setup();
     await store.put(TOPIC, [entry(1)]);
-    await mailbox.pruneExpired(Date.now() + MAILBOX_LIMITS.RETENTION_MS + 1000);
+    // 保管日は日単位に丸めて記録するので、境界から 2 日ずらして判定する
+    await mailbox.pruneExpired(Date.now() + MAILBOX_LIMITS.RETENTION_MS + 2 * 24 * 60 * 60 * 1000);
     expect(await store.get(TOPIC)).toBeUndefined();
   });
 });

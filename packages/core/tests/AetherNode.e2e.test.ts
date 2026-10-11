@@ -4,6 +4,7 @@ import 'fake-indexeddb/auto';
 
 import { AetherNode } from '../src/node/AetherNode';
 import { IndexedDBStore } from '../src/storage/IndexedDBStore';
+import { VAULT_PARAMS_FAST } from '../src/storage/SecretVault';
 import { KeyManager } from '../src/crypto/KeyManager';
 import { installFakeWebRTC, resetFakeWebRTC } from './helpers/webrtc';
 import { SignalingHub, HubSignalingClient } from './helpers/fakes';
@@ -29,6 +30,8 @@ describe('AetherNode Multi-Node End-to-End P2P Integration', () => {
       db,
       releaseMode: 'disabled',
       autoStart: false,
+      passphrase: `${name}-passphrase`,
+      vaultParams: VAULT_PARAMS_FAST,
       // テスト用に cover traffic と混合遅延を縮める (既定は数秒単位)
       circuit: { coverIntervalMs: 20, relayDelayMs: 1, exitDelayMs: 5, echoTimeoutMs: 3000 },
     });

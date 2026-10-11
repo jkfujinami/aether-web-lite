@@ -107,5 +107,6 @@ export { BOARD_META_THREAD_ID } from './logic/types';
 export { SyncProtocol } from './network/mailbox/SyncProtocol';
 
 // ── Storage ──
-export { SecretVault, type SealedSecret } from './storage/SecretVault';
-export { IndexedDBStore, type MailboxEntry, type PostEntry } from './storage/IndexedDBStore';
+export { SecretVault, VAULT_PARAMS, VAULT_PARAMS_FAST, type SealedSecret, type VaultParams } from './storage/SecretVault';
+export { IndexedDBStore, type MailboxEntry, type PostEntry, type BoardRecord } from './storage/IndexedDBStore';
+export { DataVault, WrongPassphraseError } from './storage/DataVault';

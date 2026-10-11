@@ -1,5 +1,6 @@
 import sodium, { sodiumReady } from '../crypto/sodium';
 import { IndexedDBStore } from '../storage/IndexedDBStore';
+import type { VaultParams } from '../storage/SecretVault';
 import { NodeIdentityStore } from '../crypto/NodeIdentityStore';
 import type { NodeIdentity } from '../crypto/NodeIdentity';
 import { CryptoEngine } from '../crypto/CryptoEngine';
@@ -48,10 +49,14 @@ export interface AetherNodeConfig {
    */
   identityMode?: 'ephemeral' | 'persistent';
   /**
-   * 端末に保存する秘密 (ノード鍵・トリップ鍵) の封印に使うパスフレーズ。
-   * 空文字では何も永続化しない。
+   * 端末に保存する全データ (投稿・スレッド統計・板の鍵・保管中の Slot・ノード鍵・トリップ鍵)
+   * の暗号化に使うパスワード。**必須**。
+   *
+   * 忘れた場合の復元手段は無い。{@link IndexedDBStore.wipeAll} で全消去して作り直す。
    */
   passphrase?: string;
+  /** パスワードからの鍵導出 (Argon2id) のパラメータ。テストで軽くするときだけ指定する */
+  vaultParams?: VaultParams;
 }
 
 /**
@@ -152,14 +157,16 @@ export class AetherNode {
   public static async create(config: AetherNodeConfig = {}): Promise<AetherNode> {
     await sodiumReady;
 
-    // 1. ストレージ
-    const db = config.db || new IndexedDBStore();
-    if (!config.db) {
-      await db.init();
+    // 1. ストレージ (パスワード必須。ロックを解除しない限りデータは読み書きできない)
+    const passphrase = config.passphrase ?? '';
+    if (passphrase.length === 0) {
+      throw new RangeError('AetherNode.create: a non-empty passphrase is required (local data is encrypted with it)');
     }
+    const db = config.db || new IndexedDBStore();
+    await db.init();
+    await db.unlock(passphrase, config.vaultParams);
 
     // 2. Bound Identity
-    const passphrase = config.passphrase ?? '';
     const nodeIdentity = config.identityMode === 'persistent'
       ? await NodeIdentityStore.loadOrMine(db, passphrase)
       : await NodeIdentityStore.mineEphemeral(db);
@@ -320,7 +327,19 @@ export class AetherNode {
     this.gossipRouter.destroy();
     this.hintRouter.destroy();
     this.peerManager.stop(); // 再アナウンス停止・トラッカー切断・全ピア切断
+    this.db.lock(); // メモリ上のデータ鍵を消す
     log.info(() => 'AetherNode stopped');
+  }
+
+  /**
+   * 緊急消去 (パニックワイプ)。
+   *
+   * 通信を止め、データ鍵の封印を消してからデータベースごと削除する。
+   * 鍵の封印を消した時点で、残りのデータは誰にも読めなくなる。元には戻せない。
+   */
+  public async panicWipe(): Promise<void> {
+    await this.stop();
+    await this.db.wipeAll();
   }
 
   public get peerId(): string {

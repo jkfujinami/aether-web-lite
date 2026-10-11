@@ -111,27 +111,21 @@ export class ZoneManager {
 
   /**
    * K=16 匿名購読セットの初期化 (§4.1)
+   *
+   * ★ 購読セットは端末に保存しない。
+   *   旧実装は localStorage に平文で永続化していた。購読は今や「UI に渡すか」の
+   *   完全にローカルな判断で網には一切申告しない (Broadcast Veil) ので、
+   *   セッションを跨いで固定する利点は無く、押収時の痕跡が増えるだけだった。
+   *   旧版が残した値は消す。
    */
   private initSubscribedZones() {
-    // セッション中（または永続的に）固定するために localStorage を使用 (§7.2)
-    let saved: string | null = null;
     try {
-      if (typeof localStorage !== 'undefined') {
-        saved = localStorage.getItem('aether_subscribed_zones');
-      }
+      if (typeof localStorage !== 'undefined') localStorage.removeItem('aether_subscribed_zones');
     } catch {}
-    if (saved) {
-      try {
-        const list = JSON.parse(saved) as number[];
-        // depth が変わっている可能性があるので、現在の depth で正規化が必要
-        this._subscribedZones = new Set(list.map(z => this.normalizeZone(z)));
-        if (this._subscribedZones.size >= RING_MESH_ZONE.SUBSCRIBE_COUNT) return;
-      } catch (e) {}
-    }
 
     const zones = new Set<number>();
     const totalZones = 1 << this._depth;
-    
+
     // 全ゾーン数 ≤ 16 なら全部購読
     if (totalZones <= RING_MESH_ZONE.SUBSCRIBE_COUNT) {
         for (let i = 0; i < totalZones; i++) zones.add(i);
@@ -143,7 +137,6 @@ export class ZoneManager {
     }
 
     this._subscribedZones = zones;
-    this.saveSubscribedZones();
   }
 
   /**
@@ -171,19 +164,5 @@ export class ZoneManager {
     }
 
     this._subscribedZones = newZones;
-    this.saveSubscribedZones();
-  }
-
-  private normalizeZone(zone: number): number {
-    const totalZones = 1 << this._depth;
-    return zone % (totalZones || 1);
-  }
-
-  private saveSubscribedZones() {
-    try {
-      if (typeof localStorage !== 'undefined') {
-        localStorage.setItem('aether_subscribed_zones', JSON.stringify(Array.from(this._subscribedZones)));
-      }
-    } catch {}
   }
 }
