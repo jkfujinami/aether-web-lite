@@ -18,7 +18,8 @@ describe('OnionRouter (3-Hop Onion Stem 暗号化・多段復号)', () => {
     };
   }
 
-  const dummyPacket: GossipPacket = {
+  // 経路の暗号化だけを見るので、中身は検証を通らない形でよい (型は合わせない)
+  const dummyPacket = {
     packet_id: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
     zone_id: 1,
     timestamp: Date.now(),
@@ -31,7 +32,7 @@ describe('OnionRouter (3-Hop Onion Stem 暗号化・多段復号)', () => {
       content: 'Aether Onion Anonymous Message',
       author: 'vip',
     },
-  };
+  } as unknown as GossipPacket;
 
   it('1ホップ (直接暗号化) のラップとアンラップが正しく動作する', () => {
     const exitNode = createMockNode('exit');

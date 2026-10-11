@@ -136,32 +136,29 @@ describe('AETHER Web Lite 総合セキュリティ監査・相関/交差攻撃�
       { peerId: node3.id, pubkey: node3.pubkey },
     ];
 
-    const rawSize3 = OnionRouter.wrapStem(packet, hops3, false).length;
-    const rawSize2 = OnionRouter.wrapStem(packet, hops2, false).length;
-    const rawSize1 = OnionRouter.wrapStem(packet, hops1, false).length;
+    // 現行のオニオン回路は、ホップ数にかかわらず全セルを CELL_SIZE の固定長にする
+    // (可変長モードは存在しない)。各段で剥いた後のセルも同じ長さであることを、
+    // 出口層まで実際に剥いて確かめる。
+    const exit = { type: 'exit_fluff' as const, zoneId: 0, packet };
+    const outer = [hops3, hops2, hops1].map((h) => OnionRouter.wrapCircuit(exit, h).length);
 
-    const paddedSize3 = OnionRouter.wrapStem(packet, hops3, true).length;
-    const paddedSize2 = OnionRouter.wrapStem(packet, hops2, true).length;
-    const paddedSize1 = OnionRouter.wrapStem(packet, hops1, true).length;
+    const layers: number[] = [];
+    let cell = OnionRouter.wrapCircuit(exit, hops3);
+    for (const node of [node1, node2, node3]) {
+      layers.push(cell.length);
+      const peeled: any = OnionRouter.unwrap(cell, node.pubkey, node.privkey);
+      expect(peeled).not.toBeNull();
+      if (peeled.type !== 'relay') break;
+      cell = peeled.innerOnion;
+    }
 
     console.log('\n================================================================================');
     console.log('🔬 監査1: パケットサイズ指紋解析 (Size Fingerprinting Analysis)');
     console.log('================================================================================');
-    console.log(`平文パケットサイズ (MsgPack): ${JSON.stringify(packet).length} バイト`);
-    console.log(`[パディング前] Hop 1 (最外殻: 3段ラップ時):    ${rawSize3} バイト`);
-    console.log(`[パディング前] Hop 2 (中間層: 2段ラップ時):    ${rawSize2} バイト`);
-    console.log(`[パディング前] Hop 3 (出口層: 1段ラップ時):    ${rawSize1} バイト`);
-    console.log(`段ごとの生サイズ差分:             Hop1-Hop2 = ${rawSize3 - rawSize2}B, Hop2-Hop3 = ${rawSize2 - rawSize1}B`);
+    console.log(`回路の外側セル (3/2/1 段): ${outer.join('B / ')}B`);
+    console.log(`各段で観測されるセル長: ${layers.join('B → ')}B`);
 
-    const rawLeaksHopDistance = rawSize3 !== rawSize2 && rawSize2 !== rawSize1;
-    console.log(`\n[脆弱性判定] パディングなし時のホップ距離漏洩: ${rawLeaksHopDistance ? '⚠️ 漏洩あり (確度 100%)' : '✅ 保護'}`);
-
-    // 固定長セルパディング (OnionRouter.CELL_SIZE = 3800B 単一フレーム) を適用した実測値
-    const paddedProtected = (paddedSize3 === paddedSize2) && (paddedSize2 === paddedSize1) && (paddedSize1 === OnionRouter.CELL_SIZE);
-    console.log(`[対抗策] 固定長セルパディング (${OnionRouter.CELL_SIZE}B Single-Frame Cell) 導入時: ${paddedSize3}B = ${paddedSize2}B = ${paddedSize1}B -> ${paddedProtected ? '✅ 完全遮断 (相関不能・全ホップ均一・SCTPチャンキング0)' : '⚠️ 漏洩'}`);
-
-    expect(rawLeaksHopDistance).toBe(true);
-    expect(paddedProtected).toBe(true);
+    for (const size of [...outer, ...layers]) expect(size).toBe(OnionRouter.CELL_SIZE);
   });
 
   // ─────────────────────────────────────────────────────────────────────────────

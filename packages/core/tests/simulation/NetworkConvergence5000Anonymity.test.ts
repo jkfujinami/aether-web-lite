@@ -2,7 +2,11 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import sodium from 'libsodium-wrappers-sumo';
 import { RingPosition } from '../../src/network/RingPosition';
 import { RING_MESH } from '../../src/constants';
-import { DANDELION_CONFIG } from '../../src/network/gossip/DandelionRouter';
+/**
+ * 比較用の「旧方式 (平文 Stem の Dandelion++)」のモデル。実装からは撤去済みで、
+ * 新しい方式 (オニオン回路) との比較の基準としてだけ使う。
+ */
+const LEGACY_DANDELION_FLUFF_PROBABILITY = 0.3;
 
 interface SimNode {
   id: string;
@@ -381,8 +385,8 @@ class NetworkSimulation5000 {
         }
       }
 
-      // 次のホップで Fluff に移行するか？ (DANDELION_CONFIG.FLUFF_PROBABILITY = 0.3)
-      if (stemHop > 0 && Math.random() < DANDELION_CONFIG.FLUFF_PROBABILITY) {
+      // 次のホップで Fluff に移行するか？ (LEGACY_DANDELION_FLUFF_PROBABILITY = 0.3)
+      if (stemHop > 0 && Math.random() < LEGACY_DANDELION_FLUFF_PROBABILITY) {
         isFluff = true;
         break;
       }

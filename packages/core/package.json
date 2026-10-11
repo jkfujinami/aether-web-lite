@@ -15,9 +15,9 @@
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
-    "test:sim": "vitest run tests/simulation",
+    "test:sim": "RUN_SIM=1 vitest run tests/simulation",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
     "build:cli": "esbuild src/cli/guardMaintainerMain.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist-cli/guard-maintainer.cjs",
     "guard-maintainer": "npm run build:cli --silent && node dist-cli/guard-maintainer.cjs"
   },

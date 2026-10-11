@@ -26,7 +26,7 @@ describe('PeerManager 要塞化 (Hardening Integration Tests)', () => {
     };
 
     peerManagerA = new PeerManager(identityA, dispatcherA, mockSignaling, {
-      powParams: { timeCost: 1, memoryCostKiB: 64, parallelism: 1, difficultyBits: 0 },
+      powParams: { difficulty: 0, opsLimit: 1, memLimit: 8192 },
     });
   });
 
