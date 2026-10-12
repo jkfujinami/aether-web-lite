@@ -10,6 +10,9 @@ import {
   type Identity,
   type PeerManager,
   createLogger,
+  type AnonymityLevel,
+  ANONYMITY_LEVELS,
+  DEFAULT_ANONYMITY_LEVEL,
 } from '@aether/core';
 
 import { loadTrackerUrl, saveTrackerUrl } from '../lib/trackerSetting';
@@ -57,6 +60,10 @@ interface P2PContextType {
   trackerUrl: string | null;
   /** トラッカーを設定する (null で消す)。暗号化 DB に保存し、すぐ接続し直す */
   setTrackerUrl: (url: string | null) => Promise<TrackerSaveResult>;
+  /** オニオン回路の匿名性レベル ('standard' | 'safer' | 'safest') */
+  anonymityLevel: AnonymityLevel;
+  /** 匿名性レベルを変更する */
+  setAnonymityLevel: (level: AnonymityLevel) => Promise<void>;
 }
 
 const noop = async () => {};
@@ -77,6 +84,8 @@ export const P2PContext = createContext<P2PContextType>({
   lock: noop,
   trackerUrl: null,
   setTrackerUrl: async () => ({ ok: false, error: 'ロックを解除してください' }),
+  anonymityLevel: 'standard',
+  setAnonymityLevel: noop,
 });
 
 export const P2PContextForTest = P2PContext;
@@ -103,6 +112,7 @@ export function P2PProvider({
   const [lockState, setLockState] = useState<LockState>('checking');
   const [unlockError, setUnlockError] = useState<string | null>(null);
   const [trackerUrl, setTrackerUrlState] = useState<string | null>(null);
+  const [anonymityLevel, setAnonymityLevelState] = useState<AnonymityLevel>(DEFAULT_ANONYMITY_LEVEL);
   const storeRef = useRef<IndexedDBStore | null>(null);
   const nodeRef = useRef<AetherNode | null>(null);
 
@@ -142,6 +152,13 @@ export function P2PProvider({
         // トラッカーの設定は暗号化 DB にあるので、ロック解除後に読んでから起動する
         const url = await loadTrackerUrl(aether.db, defaultTrackerUrl);
         if (url) await aether.setTrackerUrl(url);
+
+        // 匿名レベルの設定も暗号化 DB から復元
+        const savedLevel = await aether.db.getSetting<AnonymityLevel>('anonymityLevel');
+        const levelToUse: AnonymityLevel = (savedLevel && ANONYMITY_LEVELS[savedLevel]) ? savedLevel : DEFAULT_ANONYMITY_LEVEL;
+        aether.setAnonymityLevel(levelToUse);
+        setAnonymityLevelState(levelToUse);
+
         await aether.start();
       } catch (err) {
         await aether.stop().catch(() => {});
@@ -195,6 +212,7 @@ export function P2PProvider({
     const current = nodeRef.current;
     nodeRef.current = null;
     setNode(null);
+    setAnonymityLevelState(DEFAULT_ANONYMITY_LEVEL);
     await current?.stop().catch(() => {}); // stop() はメモリ上のデータ鍵も消す
     storeRef.current?.lock();
     setLockState('locked');
@@ -219,6 +237,16 @@ export function P2PProvider({
     }
     setTrackerUrlState(current.trackerUrl);
     return { ok: true };
+  }, []);
+
+  const setAnonymityLevel = useCallback(async (level: AnonymityLevel): Promise<void> => {
+    if (!ANONYMITY_LEVELS[level]) return;
+    setAnonymityLevelState(level);
+    const current = nodeRef.current;
+    if (current) {
+      current.setAnonymityLevel(level);
+      await current.db.setSetting('anonymityLevel', level).catch(() => {});
+    }
   }, []);
 
   // トレイ (Electron のメインプロセス) からのロック / 緊急消去
@@ -249,6 +277,8 @@ export function P2PProvider({
         lock,
         trackerUrl: node ? trackerUrl : null,
         setTrackerUrl,
+        anonymityLevel,
+        setAnonymityLevel,
       }}
     >
       {children}

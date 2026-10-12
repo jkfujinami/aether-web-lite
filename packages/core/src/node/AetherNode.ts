@@ -14,7 +14,7 @@ import { RateLimiter } from '../network/RateLimiter';
 import { PeerManager } from '../network/PeerManager';
 import { ZoneManager } from '../network/ZoneManager';
 import { DandelionRouter } from '../network/gossip/DandelionRouter';
-import { OnionCircuit, type OnionCircuitOptions } from '../network/onion/OnionCircuit';
+import { OnionCircuit, type OnionCircuitOptions, type AnonymityLevel } from '../network/onion/OnionCircuit';
 import { ZoneGossipRouter } from '../network/gossip/ZoneGossipRouter';
 import { DHTMailbox } from '../network/mailbox/DHTMailbox';
 import { ReplicationManager } from '../network/mailbox/ReplicationManager';
@@ -44,6 +44,8 @@ export interface AetherNodeConfig {
   releaseMode?: ReleaseMode;
   db?: IndexedDBStore;
   autoStart?: boolean;
+  /** オニオン回路の匿名性レベル ('standard' | 'safer' | 'safest') */
+  anonymityLevel?: AnonymityLevel;
   /** オニオン回路のパラメータ (テスト用に遅延を縮めるときなど) */
   circuit?: OnionCircuitOptions;
   /**
@@ -218,7 +220,11 @@ export class AetherNode {
     await identity.initTrip(db, passphrase);
 
     const dandelion = new DandelionRouter(peerManager);
-    const circuit = new OnionCircuit(peerManager, dispatcher, dandelion, config.circuit);
+    const circuitOptions: OnionCircuitOptions = {
+      level: config.anonymityLevel,
+      ...config.circuit,
+    };
+    const circuit = new OnionCircuit(peerManager, dispatcher, dandelion, circuitOptions);
     const mailbox = new DHTMailbox(peerManager, dispatcher, db, circuit);
     const replicationManager = new ReplicationManager(mailbox, peerManager, db);
     const syncProtocol = new SyncProtocol(mailbox, cryptoEngine, keyManager, db);
@@ -408,5 +414,15 @@ export class AetherNode {
     }
     this.signaling.setUrl(normalized);
     if (this.isStarted && normalized) await this.peerManager.reconnectTracker();
+  }
+
+  /** 現在のオニオン回路匿名レベル (standard / safer / safest) */
+  public getAnonymityLevel(): AnonymityLevel {
+    return this.circuit.getLevel();
+  }
+
+  /** オニオン回路の匿名レベルを変更する (Tor 準拠) */
+  public setAnonymityLevel(level: AnonymityLevel): void {
+    this.circuit.setLevel(level);
   }
 }

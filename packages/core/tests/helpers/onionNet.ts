@@ -34,7 +34,7 @@ export interface SimNode {
   inbox: Array<{ from: string; type: number; payload: any }>;
 }
 
-export async function createSimNode(name: string): Promise<SimNode> {
+export async function createSimNode(name: string, circuitOptions?: any): Promise<SimNode> {
   const identity = await NodeIdentity.mine(FAST_POW);
   const dispatcher = new MessageDispatcher();
   const signaling: any = {
@@ -54,7 +54,7 @@ export async function createSimNode(name: string): Promise<SimNode> {
 
   const zoneManager: any = { isSubscribed: () => true, depth: 0 };
   const dandelion = new DandelionRouter(peerManager);
-  const circuit = new OnionCircuit(peerManager, dispatcher, dandelion, {
+  const circuit = new OnionCircuit(peerManager, dispatcher, dandelion, circuitOptions ?? {
     coverIntervalMs: 15,
     relayDelayMs: 1,
     exitDelayMs: 1,
@@ -110,7 +110,7 @@ export function startAll(nodes: SimNode[]): void {
 
 export function stopAll(nodes: SimNode[]): void {
   for (const n of nodes) {
-    n.circuit.destroy();
+    n.circuit.stop();
     n.gossip.destroy();
     n.hints.destroy();
   }

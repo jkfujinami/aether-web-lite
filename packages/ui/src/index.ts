@@ -19,6 +19,7 @@ export { AppHeader } from './components/AppHeader';
 export { default as BoardView } from './components/BoardView';
 export { default as ThreadView } from './components/ThreadView';
 export { SecurityInfo } from './components/SecurityInfo';
+export { SecurityLevelSettings } from './components/SecurityLevelSettings';
 export { TrackerSettings } from './components/TrackerSettings';
 export { UnlockScreen } from './components/UnlockScreen';
 export { useBoard } from './hooks/useBoard';

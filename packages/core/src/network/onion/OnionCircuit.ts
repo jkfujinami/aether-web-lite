@@ -13,24 +13,79 @@ const log = createLogger('net.onion');
 
 const PEER_ID_RE = /^[0-9a-f]{32}$/;
 
+export type AnonymityLevel = 'standard' | 'safer' | 'safest';
+
+export interface AnonymityLevelConfig {
+  level: AnonymityLevel;
+  name: string;
+  label: string;
+  description: string;
+  coverIntervalMs: number;
+  relayDelayMs: number;
+  exitDelayMs: number;
+  exitDelayMaxMs: number;
+  echoTimeoutMs: number;
+}
+
+/**
+ * Tor Browser のセキュリティレベルに準拠した段階設定。
+ * 既定は最低レベル ('standard') で即時性を確保し、利用者の判断で引き上げる。
+ */
+export const ANONYMITY_LEVELS: Record<AnonymityLevel, AnonymityLevelConfig> = {
+  standard: {
+    level: 'standard',
+    name: 'Standard',
+    label: '標準 (Standard - 最低/最速)',
+    description: '高速配信重視 (約0.5〜1.5秒)。リアルタイムな会話を最優先します。',
+    coverIntervalMs: 300,
+    relayDelayMs: 40,
+    exitDelayMs: 500,
+    exitDelayMaxMs: 2_000,
+    echoTimeoutMs: 5_000,
+  },
+  safer: {
+    level: 'safer',
+    name: 'Safer',
+    label: 'より安全 (Safer - バランス)',
+    description: '即時性とトラフィック混合のバランス型 (約2〜4秒)。',
+    coverIntervalMs: 1_000,
+    relayDelayMs: 80,
+    exitDelayMs: 1_500,
+    exitDelayMaxMs: 5_000,
+    echoTimeoutMs: 15_000,
+  },
+  safest: {
+    level: 'safest',
+    name: 'Safest',
+    label: '最も安全 (Safest - 最高匿名性)',
+    description: '匿名性最優先 (約4〜8秒)。ダミー通信と出口遅延を厚くし、タイミング相関攻撃への耐性を最大化します。',
+    coverIntervalMs: 2_000,
+    relayDelayMs: 120,
+    exitDelayMs: 2_500,
+    exitDelayMaxMs: 10_000,
+    echoTimeoutMs: 30_000,
+  },
+};
+
+export const DEFAULT_ANONYMITY_LEVEL: AnonymityLevel = 'standard';
+
 /**
  * 回路の既定パラメータ。
  *
  * レイテンシの内訳 (平均): cover の空き待ち COVER_INTERVAL/2 + 中継遅延 + 出口の混合遅延。
- * 既定値で投稿が網に現れるまで平均 3〜4 秒。掲示板としては許容範囲で、
- * 匿名性はこの遅延の大きさにほぼ比例して効く。
+ * 既定の最低レベル (standard) で投稿が網に現れるまで約 1〜1.5 秒。
  */
 export const CIRCUIT_CONFIG = {
   /** cover traffic の平均送出間隔 (ms, 指数分布 = ポアソン過程) */
-  COVER_INTERVAL_MS: 2000,
+  COVER_INTERVAL_MS: ANONYMITY_LEVELS.standard.coverIntervalMs,
   /** 中継ホップでの遅延の平均 (ms, 指数分布) */
-  RELAY_DELAY_MS: 40,
+  RELAY_DELAY_MS: ANONYMITY_LEVELS.standard.relayDelayMs,
   /** 出口での混合遅延の平均 (ms, 指数分布) */
-  EXIT_DELAY_MS: 2500,
+  EXIT_DELAY_MS: ANONYMITY_LEVELS.standard.exitDelayMs,
   /** 混合遅延の上限 (ms) */
-  EXIT_DELAY_MAX_MS: 15_000,
+  EXIT_DELAY_MAX_MS: ANONYMITY_LEVELS.standard.exitDelayMaxMs,
   /** エコー待ちの上限 (ms)。cover 待ち + 混合遅延 + 伝播を十分に覆う値 */
-  ECHO_TIMEOUT_MS: 45_000,
+  ECHO_TIMEOUT_MS: ANONYMITY_LEVELS.standard.echoTimeoutMs,
   /** 1 つの発信に使う出口の数 (同じ Guard のまま出口だけ替える) */
   MAX_ATTEMPTS: 2,
   /** Guard に隣人表 (PEX) を問い合わせる間隔 (ms) */
@@ -45,9 +100,11 @@ export const CIRCUIT_CONFIG = {
 };
 
 export interface OnionCircuitOptions {
+  level?: AnonymityLevel;
   coverIntervalMs?: number;
   relayDelayMs?: number;
   exitDelayMs?: number;
+  exitDelayMaxMs?: number;
   echoTimeoutMs?: number;
 }
 
@@ -106,10 +163,13 @@ export function exponentialDelay(mean: number, max: number = Number.POSITIVE_INF
  *     攻撃者が得る機会そのものを減らすため。
  */
 export class OnionCircuit {
-  private readonly coverIntervalMs: number;
-  private readonly relayDelayMs: number;
-  private readonly exitDelayMs: number;
-  public readonly echoTimeoutMs: number;
+  private coverIntervalMs: number;
+  private relayDelayMs: number;
+  private exitDelayMs: number;
+  private exitDelayMaxMs: number;
+  public echoTimeoutMs: number;
+  private currentLevel: AnonymityLevel = DEFAULT_ANONYMITY_LEVEL;
+  private levelListeners: Set<(level: AnonymityLevel) => void> = new Set();
 
   private exitHandlers = new Map<ExitType, Set<ExitHandler>>();
   private queue: QueuedCell[] = [];
@@ -131,10 +191,14 @@ export class OnionCircuit {
     private dandelion: DandelionRouter,
     options: OnionCircuitOptions = {},
   ) {
-    this.coverIntervalMs = options.coverIntervalMs ?? CIRCUIT_CONFIG.COVER_INTERVAL_MS;
-    this.relayDelayMs = options.relayDelayMs ?? CIRCUIT_CONFIG.RELAY_DELAY_MS;
-    this.exitDelayMs = options.exitDelayMs ?? CIRCUIT_CONFIG.EXIT_DELAY_MS;
-    this.echoTimeoutMs = options.echoTimeoutMs ?? CIRCUIT_CONFIG.ECHO_TIMEOUT_MS;
+    const level = options.level ?? DEFAULT_ANONYMITY_LEVEL;
+    const baseConfig = ANONYMITY_LEVELS[level] ?? ANONYMITY_LEVELS.standard;
+    this.currentLevel = level;
+    this.coverIntervalMs = options.coverIntervalMs ?? baseConfig.coverIntervalMs;
+    this.relayDelayMs = options.relayDelayMs ?? baseConfig.relayDelayMs;
+    this.exitDelayMs = options.exitDelayMs ?? baseConfig.exitDelayMs;
+    this.exitDelayMaxMs = options.exitDelayMaxMs ?? baseConfig.exitDelayMaxMs;
+    this.echoTimeoutMs = options.echoTimeoutMs ?? baseConfig.echoTimeoutMs;
 
     dispatcher.register(WireType.ONION_STEM, (senderId, msg) => this.handleCell(senderId, msg));
     dispatcher.register(WireType.PEX_RESPONSE, (senderId, msg) => this.handleGuardPex(senderId, msg));
@@ -144,6 +208,38 @@ export class OnionCircuit {
       this.guardNeighbors.clear();
       if (guard && this.running) this.requestGuardNeighbors();
     });
+  }
+
+  // ── 匿名レベルの動的制御 (Tor 準拠) ──
+
+  public getLevel(): AnonymityLevel {
+    return this.currentLevel;
+  }
+
+  public getLevelConfig(): AnonymityLevelConfig {
+    return ANONYMITY_LEVELS[this.currentLevel] ?? ANONYMITY_LEVELS.standard;
+  }
+
+  public setLevel(level: AnonymityLevel): void {
+    const config = ANONYMITY_LEVELS[level];
+    if (!config) return;
+    this.currentLevel = level;
+    this.coverIntervalMs = config.coverIntervalMs;
+    this.relayDelayMs = config.relayDelayMs;
+    this.exitDelayMs = config.exitDelayMs;
+    this.exitDelayMaxMs = config.exitDelayMaxMs;
+    this.echoTimeoutMs = config.echoTimeoutMs;
+    if (this.running) {
+      this.scheduleCover();
+    }
+    for (const cb of this.levelListeners) {
+      try { cb(level); } catch {}
+    }
+  }
+
+  public onLevelChange(cb: (level: AnonymityLevel) => void): () => void {
+    this.levelListeners.add(cb);
+    return () => { this.levelListeners.delete(cb); };
   }
 
   // ── 出口ハンドラ ──
@@ -240,6 +336,7 @@ export class OnionCircuit {
 
   private scheduleCover(): void {
     if (!this.running) return;
+    if (this.coverTimer) clearTimeout(this.coverTimer);
     const delay = Math.max(1, exponentialDelay(this.coverIntervalMs, this.coverIntervalMs * 10));
     this.coverTimer = setTimeout(() => {
       this.emitCell();
@@ -403,7 +500,7 @@ export class OnionCircuit {
     if (result.type === 'drop') return;
 
     // 出口: 混合遅延を置いてから処理する。セルの到着と Fluff の時刻を切り離す。
-    this.defer(senderId, exponentialDelay(this.exitDelayMs, CIRCUIT_CONFIG.EXIT_DELAY_MAX_MS), () => {
+    this.defer(senderId, exponentialDelay(this.exitDelayMs, this.exitDelayMaxMs), () => {
       const handlers = this.exitHandlers.get(result.type);
       if (!handlers) return;
       for (const h of handlers) {

@@ -74,7 +74,15 @@ export { ZoneManager } from './network/ZoneManager';
 export { ZoneGossipRouter } from './network/gossip/ZoneGossipRouter';
 export { DandelionRouter, DANDELION_CONFIG } from './network/gossip/DandelionRouter';
 export { OnionRouter, type OnionHop, type OnionPayload, type ExitPayload } from './crypto/OnionRouter';
-export { OnionCircuit, CIRCUIT_CONFIG, type OnionCircuitOptions } from './network/onion/OnionCircuit';
+export {
+  OnionCircuit,
+  CIRCUIT_CONFIG,
+  ANONYMITY_LEVELS,
+  DEFAULT_ANONYMITY_LEVEL,
+  type AnonymityLevel,
+  type AnonymityLevelConfig,
+  type OnionCircuitOptions,
+} from './network/onion/OnionCircuit';
 export { SeenCache } from './network/gossip/SeenCache';
 export { PEXHandler } from './network/PEXHandler';
 export { Heartbeat } from './network/Heartbeat';

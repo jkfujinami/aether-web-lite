@@ -562,7 +562,11 @@ export class BoardOrchestrator {
         this.updateStatus('error', '匿名経路で送信できませんでした (平文での送信は行っていません)。隣人が増えてから再度お試しください。');
         return;
       }
-      await this.schrodinger.releaseHint(slot.hint, bodyBytes);
+      // 会話パケットは Exit ノードから全網へ即時 Fluff されるため、
+      // 保持者用 Hint 放流は非同期で実行し、UI と反映速度をブロックしない
+      void this.schrodinger.releaseHint(slot.hint, bodyBytes).catch((e: any) => {
+        log.debug(() => `background hint release completed/dropped: ${e?.message ?? e}`);
+      });
     })().catch((err: any) => {
       log.error('[BoardOrchestrator] anonymous send failed:', err);
     });

@@ -3,11 +3,12 @@ import { useP2P } from '../providers/P2PProvider';
 import { KeyManager, type BoardRecord } from '@aether/core';
 import { DEFAULT_BOARD_ID, newBoardId, parseShareCode } from '../lib/boardKeys';
 import { SecurityInfo } from './SecurityInfo';
+import { SecurityLevelSettings } from './SecurityLevelSettings';
 import { TrackerSettings } from './TrackerSettings';
 import { useAppConfig } from '../providers/AppConfig';
 
 export function AppHeader() {
-  const { node, identity, db, panicWipe, lock, trackerUrl } = useP2P();
+  const { node, identity, db, panicWipe, lock, trackerUrl, anonymityLevel } = useP2P();
   const { badge } = useAppConfig();
   const [peerCount, setPeerCount] = useState(0);
   const [boards, setBoards] = useState<BoardRecord[]>([]);
@@ -17,6 +18,7 @@ export function AppHeader() {
   const [confirmWipe, setConfirmWipe] = useState(false);
   const [showSecurity, setShowSecurity] = useState(false);
   const [showTracker, setShowTracker] = useState(false);
+  const [showSecurityLevel, setShowSecurityLevel] = useState(false);
 
   useEffect(() => {
     if (!node) return;
@@ -141,7 +143,42 @@ export function AppHeader() {
 
         <button
           className="btn"
-          onClick={() => setShowTracker((v) => !v)}
+          onClick={() => {
+            setShowSecurityLevel((v) => !v);
+            setShowTracker(false);
+            setShowSecurity(false);
+          }}
+          disabled={!node}
+          title="オニオン回路のセキュリティ・匿名レベル (Tor 準拠)"
+          style={{
+            padding: '3px 10px',
+            fontSize: '11px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '5px',
+          }}
+        >
+          <span
+            style={{
+              display: 'inline-block',
+              width: '7px',
+              height: '7px',
+              borderRadius: '50%',
+              background: anonymityLevel === 'safest' ? '#10b981' : anonymityLevel === 'safer' ? '#3b82f6' : '#a855f7',
+            }}
+          />
+          <span>
+            {anonymityLevel === 'safest' ? '最も安全' : anonymityLevel === 'safer' ? 'より安全' : '標準'}
+          </span>
+        </button>
+
+        <button
+          className="btn"
+          onClick={() => {
+            setShowTracker((v) => !v);
+            setShowSecurityLevel(false);
+            setShowSecurity(false);
+          }}
           disabled={!node}
           title={trackerUrl ? 'トラッカーの設定' : 'トラッカーが未設定です'}
           style={{ padding: '3px 10px', fontSize: '11px', ...(node && !trackerUrl ? { borderColor: '#eab308', color: '#eab308' } : {}) }}
@@ -151,7 +188,11 @@ export function AppHeader() {
 
         <button
           className="btn"
-          onClick={() => setShowSecurity((v) => !v)}
+          onClick={() => {
+            setShowSecurity((v) => !v);
+            setShowSecurityLevel(false);
+            setShowTracker(false);
+          }}
           style={{ padding: '3px 10px', fontSize: '11px' }}
         >
           安全性について
@@ -188,6 +229,12 @@ export function AppHeader() {
       {showTracker && (
         <div className="card" style={{ position: 'absolute', top: '50px', right: '15px', zIndex: 10, width: '420px' }}>
           <TrackerSettings onClose={() => setShowTracker(false)} />
+        </div>
+      )}
+
+      {showSecurityLevel && (
+        <div className="card" style={{ position: 'absolute', top: '50px', right: '15px', zIndex: 10, width: '440px' }}>
+          <SecurityLevelSettings onClose={() => setShowSecurityLevel(false)} />
         </div>
       )}
 
